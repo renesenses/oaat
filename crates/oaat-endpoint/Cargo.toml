@@ -21,6 +21,9 @@ hostname = { workspace = true }
 cpal = { workspace = true, optional = true }
 ringbuf = { workspace = true, optional = true }
 
+symphonia = { workspace = true, optional = true }
+
 [features]
-default = ["audio-output"]
+default = ["audio-output", "flac"]
 audio-output = ["dep:cpal", "dep:ringbuf"]
+flac = ["dep:symphonia"]

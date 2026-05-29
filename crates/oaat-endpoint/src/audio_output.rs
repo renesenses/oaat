@@ -131,7 +131,24 @@ impl CpalOutput {
         let Some(producer) = self.producer.as_mut() else {
             return 0;
         };
-        let samples = convert_to_f32(self.format, data);
+
+        let samples = if self.format == AudioFormat::Flac {
+            #[cfg(feature = "flac")]
+            {
+                match crate::flac_decoder::decode_flac_to_f32(data) {
+                    Ok(s) => s,
+                    Err(_) => return 0,
+                }
+            }
+            #[cfg(not(feature = "flac"))]
+            {
+                warn!("FLAC data received but flac feature not enabled");
+                return 0;
+            }
+        } else {
+            convert_to_f32(self.format, data)
+        };
+
         producer.push_slice(&samples) / self.channels.max(1) as usize
     }
 
