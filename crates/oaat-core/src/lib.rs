@@ -1,0 +1,24 @@
+pub mod format;
+pub mod wire;
+pub mod message;
+pub mod session;
+pub mod capability;
+pub mod error;
+
+pub use format::{AudioFormat, ChannelLayout, DsdRate, SampleRateFamily};
+pub use wire::{AudioPacketHeader, ClockSyncPacket, PacketFlags};
+pub use message::Message;
+pub use session::SessionState;
+pub use capability::Capabilities;
+pub use error::OaatError;
+
+pub const PROTOCOL_VERSION: u32 = 1;
+pub const DEFAULT_CONTROL_PORT: u16 = 9740;
+pub const DEFAULT_AUDIO_PORT: u16 = 9741;
+pub const DEFAULT_CLOCK_PORT: u16 = 9742;
+pub const SERVICE_TYPE: &str = "_oaat._tcp";
+pub const CTRL_SERVICE_TYPE: &str = "_oaat-ctrl._tcp";
+pub const AUDIO_HEADER_SIZE: usize = 32;
+pub const MAX_AUDIO_PAYLOAD: usize = 1440;
+pub const DEFAULT_SINGLE_PLAY_DELAY_MS: u64 = 200;
+pub const DEFAULT_MULTIROOM_PLAY_DELAY_MS: u64 = 500;

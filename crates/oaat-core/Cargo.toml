@@ -1,0 +1,17 @@
+[package]
+name = "oaat-core"
+description = "Core types, wire format, and protocol messages for OAAT (Open Advanced Audio Transport)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+zerocopy = { workspace = true }
+bytes = { workspace = true }
+uuid = { workspace = true }
+bitflags = "2"
