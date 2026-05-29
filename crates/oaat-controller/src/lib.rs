@@ -1,4 +1,4 @@
 pub mod discovery;
+pub mod transport;
 
-// Controller implementation - Phase 1 scaffold.
-// Full implementation follows the endpoint MVP.
+pub use transport::{ControllerConfig, ConnectedEndpoint};

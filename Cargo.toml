@@ -4,6 +4,7 @@ members = [
     "crates/oaat-core",
     "crates/oaat-endpoint",
     "crates/oaat-controller",
+    "tests",
 ]
 
 [workspace.package]

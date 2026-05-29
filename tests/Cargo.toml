@@ -1,0 +1,13 @@
+[package]
+name = "oaat-tests"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+oaat-core = { workspace = true }
+oaat-endpoint = { path = "../crates/oaat-endpoint" }
+oaat-controller = { path = "../crates/oaat-controller" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

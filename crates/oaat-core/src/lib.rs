@@ -3,6 +3,8 @@ pub mod wire;
 pub mod message;
 pub mod session;
 pub mod capability;
+pub mod codec;
+pub mod clock;
 pub mod error;
 
 pub use format::{AudioFormat, ChannelLayout, DsdRate, SampleRateFamily};
@@ -10,6 +12,8 @@ pub use wire::{AudioPacketHeader, ClockSyncPacket, PacketFlags};
 pub use message::Message;
 pub use session::SessionState;
 pub use capability::Capabilities;
+pub use codec::FrameCodec;
+pub use clock::ClockState;
 pub use error::OaatError;
 
 pub const PROTOCOL_VERSION: u32 = 1;

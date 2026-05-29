@@ -57,20 +57,6 @@ impl Capabilities {
         })
     }
 
-    pub fn to_string(&self) -> String {
-        let mut s = format!("pcm:{}/{}", self.pcm_max_rate_khz, self.pcm_max_bits);
-        if let Some(dsd) = self.dsd_max_multiplier {
-            s.push_str(&format!(",dsd:{dsd}"));
-        }
-        if self.flac {
-            s.push_str(",flac");
-        }
-        if self.opus {
-            s.push_str(",opus");
-        }
-        s
-    }
-
     pub fn pcm_max_rate_hz(&self) -> u32 {
         self.pcm_max_rate_khz * 1000
     }
@@ -78,7 +64,17 @@ impl Capabilities {
 
 impl std::fmt::Display for Capabilities {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.to_string())
+        write!(f, "pcm:{}/{}", self.pcm_max_rate_khz, self.pcm_max_bits)?;
+        if let Some(dsd) = self.dsd_max_multiplier {
+            write!(f, ",dsd:{dsd}")?;
+        }
+        if self.flac {
+            write!(f, ",flac")?;
+        }
+        if self.opus {
+            write!(f, ",opus")?;
+        }
+        Ok(())
     }
 }
 
