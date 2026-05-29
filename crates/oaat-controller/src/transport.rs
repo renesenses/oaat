@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info};
 
 use oaat_core::clock::ClockState;
@@ -18,6 +18,16 @@ pub struct ControllerConfig {
     pub clock_port: u16,
 }
 
+/// A control-plane response received from the endpoint.
+#[derive(Debug, Clone)]
+pub enum EndpointResponse {
+    FormatAccept(FormatAccept),
+    FormatCounter(FormatCounter),
+    FormatReject(FormatReject),
+    NextTrackReady(NextTrackReady),
+    NextTrackReformat(NextTrackReformat),
+}
+
 pub struct ConnectedEndpoint {
     writer: tokio::io::WriteHalf<TcpStream>,
     pub info: HelloAck,
@@ -27,6 +37,7 @@ pub struct ConnectedEndpoint {
     clock_target: SocketAddr,
     clock_state: Arc<Mutex<ClockState>>,
     sequence: u16,
+    pub response_rx: mpsc::Receiver<EndpointResponse>,
 }
 
 impl ConnectedEndpoint {
@@ -85,6 +96,9 @@ impl ConnectedEndpoint {
         let audio_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
         let clock_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
 
+        // Channel for forwarding format negotiation responses to the caller
+        let (response_tx, response_rx) = mpsc::channel::<EndpointResponse>(32);
+
         // Spawn reader task for control messages (responses, errors, etc.)
         tokio::spawn(async move {
             let mut buf = [0u8; 8192];
@@ -97,7 +111,61 @@ impl ConnectedEndpoint {
                     Ok(n) => {
                         codec.feed(&buf[..n]);
                         while let Ok(Some(msg)) = codec.decode_next() {
-                            debug!("received: {:?}", std::mem::discriminant(&msg));
+                            match msg {
+                                Message::FormatAccept(fa) => {
+                                    debug!(stream_id = %fa.stream_id, "format accepted");
+                                    let _ = response_tx
+                                        .send(EndpointResponse::FormatAccept(fa))
+                                        .await;
+                                }
+                                Message::FormatCounter(fc) => {
+                                    debug!(
+                                        stream_id = %fc.stream_id,
+                                        rate = fc.sample_rate,
+                                        bits = fc.bits_per_sample,
+                                        "format counter-proposed"
+                                    );
+                                    let _ = response_tx
+                                        .send(EndpointResponse::FormatCounter(fc))
+                                        .await;
+                                }
+                                Message::FormatReject(fr) => {
+                                    debug!(
+                                        stream_id = %fr.stream_id,
+                                        reason = %fr.reason,
+                                        "format rejected"
+                                    );
+                                    let _ = response_tx
+                                        .send(EndpointResponse::FormatReject(fr))
+                                        .await;
+                                }
+                                Message::NextTrackReady(ntr) => {
+                                    debug!(
+                                        stream_id = %ntr.stream_id,
+                                        "next track ready (gapless)"
+                                    );
+                                    let _ = response_tx
+                                        .send(EndpointResponse::NextTrackReady(ntr))
+                                        .await;
+                                }
+                                Message::NextTrackReformat(ntf) => {
+                                    debug!(
+                                        stream_id = %ntf.stream_id,
+                                        format = %ntf.format,
+                                        rate = ntf.sample_rate,
+                                        "next track reformat"
+                                    );
+                                    let _ = response_tx
+                                        .send(EndpointResponse::NextTrackReformat(ntf))
+                                        .await;
+                                }
+                                other => {
+                                    debug!(
+                                        "received: {:?}",
+                                        std::mem::discriminant(&other)
+                                    );
+                                }
+                            }
                         }
                     }
                     Err(e) => {
@@ -117,6 +185,7 @@ impl ConnectedEndpoint {
             clock_target,
             clock_state: Arc::new(Mutex::new(ClockState::new())),
             sequence: 0,
+            response_rx,
         })
     }
 
@@ -194,6 +263,29 @@ impl ConnectedEndpoint {
     pub async fn send_metadata(&mut self, track: TrackMetadata) -> Result<(), OaatError> {
         self.send_message(&Message::Metadata(Metadata { track }))
             .await
+    }
+
+    /// Inform the endpoint about the next track's format so it can decide
+    /// whether gapless playback is possible (same format) or a reformat is
+    /// needed (different format / sample rate).
+    pub async fn prepare_next_track(
+        &mut self,
+        stream_id: &str,
+        format: oaat_core::AudioFormat,
+        sample_rate: u32,
+        channels: u8,
+        channel_layout: oaat_core::ChannelLayout,
+        bits_per_sample: u8,
+    ) -> Result<(), OaatError> {
+        let msg = Message::NextTrackPrepare(NextTrackPrepare {
+            stream_id: stream_id.to_owned(),
+            format,
+            sample_rate,
+            channels,
+            channel_layout,
+            bits_per_sample,
+        });
+        self.send_message(&msg).await
     }
 
     /// Run clock sync exchange. Returns (offset_ns, rtt_ns) after this sample.

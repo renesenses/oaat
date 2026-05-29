@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use oaat_core::codec::FrameCodec;
+use oaat_core::format::SampleRateFamily;
 use oaat_core::message::*;
 use oaat_core::wire::{AudioPacketHeader, ClockSyncPacket, ClockSyncType, AUDIO_HEADER_SIZE};
 use oaat_core::{Message, OaatError, PROTOCOL_VERSION};
@@ -26,6 +27,13 @@ pub enum EndpointEvent {
         controller_name: String,
     },
     FormatProposed(FormatPropose),
+    FormatAccepted {
+        stream_id: String,
+    },
+    FormatRejected {
+        stream_id: String,
+        reason: String,
+    },
     AudioPacket {
         header: AudioPacketHeader,
         payload: Vec<u8>,
@@ -33,6 +41,14 @@ pub enum EndpointEvent {
     Playback(PlaybackCommand),
     Metadata(Metadata),
     Volume(VolumeCommand),
+    NextTrackReady {
+        stream_id: String,
+    },
+    NextTrackReformat {
+        stream_id: String,
+        format: oaat_core::format::AudioFormat,
+        sample_rate: u32,
+    },
     Disconnected,
     Error(OaatError),
 }
@@ -86,6 +102,8 @@ impl EndpointTransport {
             audio_port: actual_audio_port,
             clock_port: actual_clock_port,
             buffer_size_ms: config.buffer_size_ms,
+            current_format: None,
+            current_sample_rate: None,
         };
 
         tokio::spawn(async move {
@@ -109,11 +127,31 @@ struct EndpointSession {
     audio_port: u16,
     clock_port: u16,
     buffer_size_ms: u32,
+    /// Currently negotiated format (set after FormatAccept).
+    current_format: Option<oaat_core::format::AudioFormat>,
+    /// Currently negotiated sample rate (set after FormatAccept).
+    current_sample_rate: Option<u32>,
 }
 
 impl EndpointSession {
-    async fn run(mut self) -> Result<(), OaatError> {
-        let (mut reader, mut writer) = self.stream.split();
+    async fn run(self) -> Result<(), OaatError> {
+        // Destructure to get owned fields -- avoids borrow conflicts after into_split().
+        let EndpointSession {
+            stream,
+            audio_socket,
+            clock_socket,
+            event_tx,
+            endpoint_id,
+            endpoint_name,
+            capabilities,
+            audio_port,
+            clock_port,
+            buffer_size_ms,
+            mut current_format,
+            mut current_sample_rate,
+        } = self;
+
+        let (mut reader, mut writer) = stream.into_split();
         let mut codec = FrameCodec::new();
         let mut read_buf = [0u8; 8192];
 
@@ -121,7 +159,7 @@ impl EndpointSession {
         let hello = loop {
             let n = reader.read(&mut read_buf).await?;
             if n == 0 {
-                let _ = self.event_tx.send(EndpointEvent::Disconnected).await;
+                let _ = event_tx.send(EndpointEvent::Disconnected).await;
                 return Ok(());
             }
             codec.feed(&read_buf[..n]);
@@ -143,8 +181,7 @@ impl EndpointSession {
             });
         }
 
-        let _ = self
-            .event_tx
+        let _ = event_tx
             .send(EndpointEvent::Connected {
                 controller_id: hello.controller_id.clone(),
                 controller_name: hello.controller_name.clone(),
@@ -154,12 +191,12 @@ impl EndpointSession {
         // Send HelloAck
         let ack = Message::HelloAck(HelloAck {
             protocol_version: PROTOCOL_VERSION,
-            endpoint_id: self.endpoint_id.clone(),
-            endpoint_name: self.endpoint_name.clone(),
-            capabilities: self.capabilities.clone(),
-            audio_port: self.audio_port,
-            clock_port: self.clock_port,
-            buffer_size_ms: self.buffer_size_ms,
+            endpoint_id,
+            endpoint_name,
+            capabilities: capabilities.clone(),
+            audio_port,
+            clock_port,
+            buffer_size_ms,
         });
         writer.write_all(&FrameCodec::encode(&ack)).await?;
 
@@ -169,23 +206,21 @@ impl EndpointSession {
         );
 
         // Spawn clock sync responder
-        let clock_sock = self.clock_socket.clone();
         tokio::spawn(async move {
-            Self::clock_sync_loop(clock_sock).await;
+            Self::clock_sync_loop(clock_socket).await;
         });
 
         // Spawn audio receiver
-        let audio_sock = self.audio_socket.clone();
-        let audio_tx = self.event_tx.clone();
+        let audio_tx = event_tx.clone();
         tokio::spawn(async move {
-            Self::audio_receive_loop(audio_sock, audio_tx).await;
+            Self::audio_receive_loop(audio_socket, audio_tx).await;
         });
 
         // Main control message loop
         loop {
             let n = reader.read(&mut read_buf).await?;
             if n == 0 {
-                let _ = self.event_tx.send(EndpointEvent::Disconnected).await;
+                let _ = event_tx.send(EndpointEvent::Disconnected).await;
                 break;
             }
             codec.feed(&read_buf[..n]);
@@ -193,32 +228,93 @@ impl EndpointSession {
             while let Some(msg) = codec.decode_next()? {
                 match msg {
                     Message::FormatPropose(fp) => {
-                        let _ = self
-                            .event_tx
+                        let response = negotiate_format(&capabilities, &fp);
+                        writer.write_all(&FrameCodec::encode(&response)).await?;
+
+                        match &response {
+                            Message::FormatAccept(_) => {
+                                current_format = Some(fp.format);
+                                current_sample_rate = Some(fp.sample_rate);
+                                let _ = event_tx
+                                    .send(EndpointEvent::FormatAccepted {
+                                        stream_id: fp.stream_id.clone(),
+                                    })
+                                    .await;
+                            }
+                            Message::FormatReject(r) => {
+                                let _ = event_tx
+                                    .send(EndpointEvent::FormatRejected {
+                                        stream_id: fp.stream_id.clone(),
+                                        reason: r.reason.clone(),
+                                    })
+                                    .await;
+                            }
+                            _ => {}
+                        }
+
+                        let _ = event_tx
                             .send(EndpointEvent::FormatProposed(fp))
                             .await;
                     }
+                    Message::NextTrackPrepare(ntp) => {
+                        let same_format = current_format == Some(ntp.format)
+                            && current_sample_rate == Some(ntp.sample_rate);
+
+                        if same_format {
+                            info!(
+                                stream_id = %ntp.stream_id,
+                                "next track: same format, gapless ready"
+                            );
+                            let response = Message::NextTrackReady(NextTrackReady {
+                                stream_id: ntp.stream_id.clone(),
+                            });
+                            writer.write_all(&FrameCodec::encode(&response)).await?;
+                            let _ = event_tx
+                                .send(EndpointEvent::NextTrackReady {
+                                    stream_id: ntp.stream_id,
+                                })
+                                .await;
+                        } else {
+                            info!(
+                                stream_id = %ntp.stream_id,
+                                new_format = %ntp.format,
+                                new_rate = ntp.sample_rate,
+                                "next track: format change, reformat needed"
+                            );
+                            let response = Message::NextTrackReformat(NextTrackReformat {
+                                stream_id: ntp.stream_id.clone(),
+                                format: ntp.format,
+                                sample_rate: ntp.sample_rate,
+                            });
+                            writer.write_all(&FrameCodec::encode(&response)).await?;
+                            current_format = Some(ntp.format);
+                            current_sample_rate = Some(ntp.sample_rate);
+                            let _ = event_tx
+                                .send(EndpointEvent::NextTrackReformat {
+                                    stream_id: ntp.stream_id,
+                                    format: ntp.format,
+                                    sample_rate: ntp.sample_rate,
+                                })
+                                .await;
+                        }
+                    }
                     Message::Play(p) => {
-                        let _ = self
-                            .event_tx
+                        let _ = event_tx
                             .send(EndpointEvent::Playback(PlaybackCommand::Play(p.stream_id)))
                             .await;
                     }
                     Message::Pause(p) => {
-                        let _ = self
-                            .event_tx
+                        let _ = event_tx
                             .send(EndpointEvent::Playback(PlaybackCommand::Pause(p.stream_id)))
                             .await;
                     }
                     Message::Stop(s) => {
-                        let _ = self
-                            .event_tx
+                        let _ = event_tx
                             .send(EndpointEvent::Playback(PlaybackCommand::Stop(s.stream_id)))
                             .await;
                     }
                     Message::Seek(s) => {
-                        let _ = self
-                            .event_tx
+                        let _ = event_tx
                             .send(EndpointEvent::Playback(PlaybackCommand::Seek(
                                 s.stream_id,
                                 s.position_ms,
@@ -226,23 +322,20 @@ impl EndpointSession {
                             .await;
                     }
                     Message::Metadata(m) => {
-                        let _ = self.event_tx.send(EndpointEvent::Metadata(m)).await;
+                        let _ = event_tx.send(EndpointEvent::Metadata(m)).await;
                     }
                     Message::VolumeSet(v) => {
-                        let _ = self
-                            .event_tx
+                        let _ = event_tx
                             .send(EndpointEvent::Volume(VolumeCommand::Set(v.level)))
                             .await;
                     }
                     Message::VolumeGet(_) => {
-                        let _ = self
-                            .event_tx
+                        let _ = event_tx
                             .send(EndpointEvent::Volume(VolumeCommand::Get))
                             .await;
                     }
                     Message::Mute(m) => {
-                        let _ = self
-                            .event_tx
+                        let _ = event_tx
                             .send(EndpointEvent::Volume(VolumeCommand::Mute(m.muted)))
                             .await;
                     }
@@ -309,7 +402,8 @@ impl EndpointSession {
             if n < AUDIO_HEADER_SIZE {
                 continue;
             }
-            let header_bytes: &[u8; AUDIO_HEADER_SIZE] = buf[..AUDIO_HEADER_SIZE].try_into().unwrap();
+            let header_bytes: &[u8; AUDIO_HEADER_SIZE] =
+                buf[..AUDIO_HEADER_SIZE].try_into().unwrap();
             let header = match AudioPacketHeader::decode(header_bytes) {
                 Ok(h) => h,
                 Err(_) => continue,
@@ -319,6 +413,74 @@ impl EndpointSession {
                 .send(EndpointEvent::AudioPacket { header, payload })
                 .await;
         }
+    }
+}
+
+/// Decide whether to accept, counter-propose, or reject a format proposal.
+fn negotiate_format(caps: &EndpointCapabilities, fp: &FormatPropose) -> Message {
+    // Check if the format is supported at all
+    if !caps.formats.contains(&fp.format) {
+        return Message::FormatReject(FormatReject {
+            stream_id: fp.stream_id.clone(),
+            reason: format!("unsupported format: {}", fp.format),
+        });
+    }
+
+    // For PCM formats, check sample rate and bit depth
+    if fp.format.is_pcm() {
+        let rate_ok = fp.sample_rate <= caps.pcm_max_rate;
+        let bits_ok = fp.bits_per_sample <= caps.pcm_max_bits;
+
+        if rate_ok && bits_ok {
+            return Message::FormatAccept(FormatAccept {
+                stream_id: fp.stream_id.clone(),
+            });
+        }
+
+        // Counter-propose: stay in the same sample rate family
+        let counter_rate = if rate_ok {
+            fp.sample_rate
+        } else {
+            best_rate_in_family(fp.sample_rate, caps.pcm_max_rate)
+        };
+
+        let counter_bits = if bits_ok {
+            fp.bits_per_sample
+        } else {
+            caps.pcm_max_bits
+        };
+
+        return Message::FormatCounter(FormatCounter {
+            stream_id: fp.stream_id.clone(),
+            format: fp.format,
+            sample_rate: counter_rate,
+            channels: fp.channels,
+            channel_layout: fp.channel_layout,
+            bits_per_sample: counter_bits,
+            dsd_rate: fp.dsd_rate,
+        });
+    }
+
+    // For non-PCM formats (DSD, compressed) that are in the supported list, accept
+    Message::FormatAccept(FormatAccept {
+        stream_id: fp.stream_id.clone(),
+    })
+}
+
+/// Find the highest sample rate in the same family that does not exceed `max_rate`.
+fn best_rate_in_family(proposed_rate: u32, max_rate: u32) -> u32 {
+    if let Some(family) = SampleRateFamily::of(proposed_rate) {
+        // Pick the highest rate in the family that is <= max_rate
+        family
+            .rates()
+            .iter()
+            .rev()
+            .copied()
+            .find(|&r| r <= max_rate)
+            .unwrap_or(family.rates()[0])
+    } else {
+        // Unknown family -- just clamp to max
+        max_rate
     }
 }
 

@@ -5,7 +5,7 @@ use oaat_core::format::AudioFormat;
 use oaat_core::message::EndpointCapabilities;
 use oaat_core::wire::PacketFlags;
 use oaat_core::ChannelLayout;
-use oaat_controller::{ConnectedEndpoint, ControllerConfig};
+use oaat_controller::{ConnectedEndpoint, ControllerConfig, EndpointResponse};
 use oaat_endpoint::{EndpointConfig, EndpointEvent, EndpointTransport};
 
 fn init_tracing() {
@@ -174,6 +174,19 @@ async fn controller_sends_format_propose_and_audio() {
         .await
         .unwrap();
 
+    // Drain FormatAccepted event (endpoint auto-accepts this format)
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    match event {
+        EndpointEvent::FormatAccepted { stream_id } => {
+            assert_eq!(stream_id, "stream-1");
+        }
+        _ => panic!("expected FormatAccepted event"),
+    }
+
+    // Then FormatProposed
     let event = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
         .await
         .unwrap()
@@ -279,4 +292,395 @@ async fn clock_sync_bootstrap() {
         offset.abs() < 10_000_000, // 10ms tolerance for CI
         "clock offset should be small on localhost, got {offset}ns"
     );
+}
+
+/// Helper: spin up endpoint + connect controller, return (endpoint_handle, event_rx, connected_endpoint).
+async fn setup_endpoint_and_controller(
+    caps: EndpointCapabilities,
+) -> (mpsc::Receiver<EndpointEvent>, ConnectedEndpoint) {
+    let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let actual_control = tcp_listener.local_addr().unwrap();
+    let udp_audio = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let actual_audio = udp_audio.local_addr().unwrap();
+    let udp_clock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let actual_clock = udp_clock.local_addr().unwrap();
+    drop(tcp_listener);
+    drop(udp_audio);
+    drop(udp_clock);
+
+    let ep_config = EndpointConfig {
+        endpoint_id: "test-ep-fmt".into(),
+        endpoint_name: "Format Test Endpoint".into(),
+        control_addr: actual_control,
+        audio_addr: actual_audio,
+        clock_addr: actual_clock,
+        capabilities: caps,
+        buffer_size_ms: 1000,
+    };
+
+    let (event_tx, mut event_rx) = mpsc::channel(64);
+    let (_ctrl_tx, ctrl_rx) = mpsc::channel(32);
+
+    tokio::spawn(async move {
+        EndpointTransport::run(ep_config, event_tx, ctrl_rx)
+            .await
+            .ok();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let ctrl_config = ControllerConfig {
+        controller_id: "ctrl-fmt".into(),
+        controller_name: "Format Controller".into(),
+        features: vec![],
+        clock_port: 9742,
+    };
+
+    let endpoint = ConnectedEndpoint::connect(&ctrl_config, actual_control)
+        .await
+        .unwrap();
+
+    // Drain the Connected event
+    let _ = event_rx.recv().await;
+
+    (event_rx, endpoint)
+}
+
+#[tokio::test]
+async fn format_accept_when_supported() {
+    init_tracing();
+
+    let (mut event_rx, mut endpoint) = setup_endpoint_and_controller(test_capabilities()).await;
+
+    // Propose PCM S24LE at 96kHz/24-bit -- within capabilities (max 192kHz/24-bit)
+    endpoint
+        .propose_format(
+            "stream-accept",
+            AudioFormat::PcmS24le,
+            96000,
+            2,
+            ChannelLayout::Stereo,
+            24,
+        )
+        .await
+        .unwrap();
+
+    // Controller should receive FormatAccept
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        endpoint.response_rx.recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    match resp {
+        EndpointResponse::FormatAccept(fa) => {
+            assert_eq!(fa.stream_id, "stream-accept");
+        }
+        other => panic!("expected FormatAccept, got {:?}", other),
+    }
+
+    // Endpoint should also emit FormatAccepted + FormatProposed events
+    let ev = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    match ev {
+        EndpointEvent::FormatAccepted { stream_id } => {
+            assert_eq!(stream_id, "stream-accept");
+        }
+        _ => panic!("expected FormatAccepted event"),
+    }
+
+    let ev = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    match ev {
+        EndpointEvent::FormatProposed(fp) => {
+            assert_eq!(fp.stream_id, "stream-accept");
+        }
+        _ => panic!("expected FormatProposed event"),
+    }
+}
+
+#[tokio::test]
+async fn format_counter_when_rate_too_high() {
+    init_tracing();
+
+    let (mut event_rx, mut endpoint) = setup_endpoint_and_controller(test_capabilities()).await;
+
+    // Propose PCM S24LE at 384kHz -- exceeds max 192kHz. Same 48k family.
+    endpoint
+        .propose_format(
+            "stream-counter",
+            AudioFormat::PcmS24le,
+            384000,
+            2,
+            ChannelLayout::Stereo,
+            24,
+        )
+        .await
+        .unwrap();
+
+    // Controller should receive FormatCounter
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        endpoint.response_rx.recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    match resp {
+        EndpointResponse::FormatCounter(fc) => {
+            assert_eq!(fc.stream_id, "stream-counter");
+            assert_eq!(fc.format, AudioFormat::PcmS24le);
+            // Should counter with 192000 (highest in 48k family <= 192000)
+            assert_eq!(fc.sample_rate, 192000);
+            assert_eq!(fc.bits_per_sample, 24);
+        }
+        other => panic!("expected FormatCounter, got {:?}", other),
+    }
+
+    // Endpoint should emit FormatProposed event (no FormatAccepted/FormatRejected for counter)
+    let ev = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    match ev {
+        EndpointEvent::FormatProposed(fp) => {
+            assert_eq!(fp.stream_id, "stream-counter");
+            assert_eq!(fp.sample_rate, 384000);
+        }
+        _ => panic!("expected FormatProposed event"),
+    }
+}
+
+#[tokio::test]
+async fn format_reject_when_unsupported() {
+    init_tracing();
+
+    let (mut event_rx, mut endpoint) = setup_endpoint_and_controller(test_capabilities()).await;
+
+    // Propose Flac -- not in test_capabilities().formats (which is S16LE, S24LE, S32LE only)
+    endpoint
+        .propose_format(
+            "stream-reject",
+            AudioFormat::Flac,
+            44100,
+            2,
+            ChannelLayout::Stereo,
+            16,
+        )
+        .await
+        .unwrap();
+
+    // Controller should receive FormatReject
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        endpoint.response_rx.recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    match resp {
+        EndpointResponse::FormatReject(fr) => {
+            assert_eq!(fr.stream_id, "stream-reject");
+            assert!(fr.reason.contains("unsupported format"));
+        }
+        other => panic!("expected FormatReject, got {:?}", other),
+    }
+
+    // Endpoint should emit FormatRejected + FormatProposed events
+    let ev = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    match ev {
+        EndpointEvent::FormatRejected { stream_id, reason } => {
+            assert_eq!(stream_id, "stream-reject");
+            assert!(reason.contains("unsupported format"));
+        }
+        _ => panic!("expected FormatRejected event"),
+    }
+
+    let ev = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    match ev {
+        EndpointEvent::FormatProposed(fp) => {
+            assert_eq!(fp.stream_id, "stream-reject");
+        }
+        _ => panic!("expected FormatProposed event"),
+    }
+}
+
+#[tokio::test]
+async fn gapless_same_format_returns_next_track_ready() {
+    init_tracing();
+
+    let (mut event_rx, mut endpoint) = setup_endpoint_and_controller(test_capabilities()).await;
+
+    // First, establish a format via FormatPropose so the endpoint tracks it
+    endpoint
+        .propose_format(
+            "stream-gapless",
+            AudioFormat::PcmS16le,
+            44100,
+            2,
+            ChannelLayout::Stereo,
+            16,
+        )
+        .await
+        .unwrap();
+
+    // Drain FormatAccept response on controller side
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        endpoint.response_rx.recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    match resp {
+        EndpointResponse::FormatAccept(fa) => {
+            assert_eq!(fa.stream_id, "stream-gapless");
+        }
+        other => panic!("expected FormatAccept, got {:?}", other),
+    }
+
+    // Drain endpoint-side events (FormatAccepted + FormatProposed)
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv()).await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv()).await;
+
+    // Now send NextTrackPrepare with the SAME format
+    endpoint
+        .prepare_next_track(
+            "stream-gapless-next",
+            AudioFormat::PcmS16le,
+            44100,
+            2,
+            ChannelLayout::Stereo,
+            16,
+        )
+        .await
+        .unwrap();
+
+    // Controller should receive NextTrackReady
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        endpoint.response_rx.recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    match resp {
+        EndpointResponse::NextTrackReady(ntr) => {
+            assert_eq!(ntr.stream_id, "stream-gapless-next");
+        }
+        other => panic!("expected NextTrackReady, got {:?}", other),
+    }
+
+    // Endpoint should emit NextTrackReady event
+    let ev = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    match ev {
+        EndpointEvent::NextTrackReady { stream_id } => {
+            assert_eq!(stream_id, "stream-gapless-next");
+        }
+        _ => panic!("expected NextTrackReady event"),
+    }
+}
+
+#[tokio::test]
+async fn gapless_different_format_returns_next_track_reformat() {
+    init_tracing();
+
+    let (mut event_rx, mut endpoint) = setup_endpoint_and_controller(test_capabilities()).await;
+
+    // Establish PCM S16LE at 44100Hz
+    endpoint
+        .propose_format(
+            "stream-reformat",
+            AudioFormat::PcmS16le,
+            44100,
+            2,
+            ChannelLayout::Stereo,
+            16,
+        )
+        .await
+        .unwrap();
+
+    // Drain FormatAccept response on controller side
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        endpoint.response_rx.recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    match resp {
+        EndpointResponse::FormatAccept(fa) => {
+            assert_eq!(fa.stream_id, "stream-reformat");
+        }
+        other => panic!("expected FormatAccept, got {:?}", other),
+    }
+
+    // Drain endpoint-side events (FormatAccepted + FormatProposed)
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv()).await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv()).await;
+
+    // Now send NextTrackPrepare with a DIFFERENT sample rate (96000 instead of 44100)
+    endpoint
+        .prepare_next_track(
+            "stream-reformat-next",
+            AudioFormat::PcmS16le,
+            96000,
+            2,
+            ChannelLayout::Stereo,
+            16,
+        )
+        .await
+        .unwrap();
+
+    // Controller should receive NextTrackReformat
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        endpoint.response_rx.recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    match resp {
+        EndpointResponse::NextTrackReformat(ntf) => {
+            assert_eq!(ntf.stream_id, "stream-reformat-next");
+            assert_eq!(ntf.format, AudioFormat::PcmS16le);
+            assert_eq!(ntf.sample_rate, 96000);
+        }
+        other => panic!("expected NextTrackReformat, got {:?}", other),
+    }
+
+    // Endpoint should emit NextTrackReformat event
+    let ev = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    match ev {
+        EndpointEvent::NextTrackReformat {
+            stream_id,
+            format,
+            sample_rate,
+        } => {
+            assert_eq!(stream_id, "stream-reformat-next");
+            assert_eq!(format, AudioFormat::PcmS16le);
+            assert_eq!(sample_rate, 96000);
+        }
+        _ => panic!("expected NextTrackReformat event"),
+    }
 }

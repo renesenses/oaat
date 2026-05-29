@@ -167,6 +167,12 @@ async fn run_endpoint(name: String, port: u16) {
             } => {
                 println!("Connected to controller '{controller_name}' ({controller_id})");
             }
+            EndpointEvent::FormatAccepted { stream_id } => {
+                println!("Format accepted: {stream_id}");
+            }
+            EndpointEvent::FormatRejected { stream_id, reason } => {
+                eprintln!("Format rejected: {stream_id} — {reason}");
+            }
             EndpointEvent::FormatProposed(fp) => {
                 println!(
                     "Format: {} {}Hz {}ch {}bit",
@@ -219,6 +225,23 @@ async fn run_endpoint(name: String, port: u16) {
                 );
                 if let Some(ref fmt) = m.track.format {
                     println!("  Format: {fmt}");
+                }
+            }
+            EndpointEvent::NextTrackReady { stream_id } => {
+                println!("Gapless ready: {stream_id} (same format, seamless transition)");
+            }
+            EndpointEvent::NextTrackReformat {
+                stream_id,
+                format,
+                sample_rate,
+            } => {
+                println!(
+                    "Reformat needed: {stream_id} -> {format} {sample_rate}Hz (reconfiguring output)"
+                );
+                // Reconfigure audio output for the new format (assume stereo for demo)
+                match audio.configure(format, sample_rate, 2) {
+                    Ok(()) => println!("Audio output reconfigured for next track"),
+                    Err(e) => eprintln!("Audio reconfigure error: {e}"),
                 }
             }
             EndpointEvent::Volume(cmd) => match cmd {
@@ -374,13 +397,107 @@ async fn run_controller(name: String, target: Option<SocketAddr>, freq: f64, dur
         }
     }
 
+    // -- Gapless transition: prepare a second tone (880Hz) with the same format --
+    let freq2 = 880.0;
+    let gapless_stream_id = "sine-gapless";
+    println!("\nPreparing gapless transition to {freq2}Hz...");
     endpoint
-        .send_audio(1, format, (duration as f64 * 1e9) as u64, sample_offset, &[], PacketFlags::LAST_PACKET)
+        .prepare_next_track(gapless_stream_id, format, sample_rate, channels, ChannelLayout::Stereo, bits)
         .await
         .unwrap();
 
-    endpoint.send_stop(stream_id).await.unwrap();
-    println!("\nDone. {sample_offset} samples sent.");
+    // Give endpoint time to respond (NextTrackReady expected for same format)
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Drain response from endpoint
+    if let Ok(Some(resp)) = tokio::time::timeout(
+        Duration::from_millis(500),
+        endpoint.response_rx.recv(),
+    )
+    .await
+    {
+        match resp {
+            oaat_controller::EndpointResponse::NextTrackReady(ntr) => {
+                println!("Endpoint ready for gapless: {}", ntr.stream_id);
+            }
+            oaat_controller::EndpointResponse::NextTrackReformat(ntf) => {
+                println!(
+                    "Endpoint needs reformat: {} -> {} {}Hz",
+                    ntf.stream_id, ntf.format, ntf.sample_rate
+                );
+            }
+            other => {
+                println!("Unexpected response: {other:?}");
+            }
+        }
+    }
+
+    // Stream the second tone seamlessly (shorter duration: 2s)
+    let duration2 = 2u64;
+    let total_samples2 = sample_rate as u64 * duration2;
+    let mut sample_offset2: u64 = 0;
+    let start2 = std::time::Instant::now();
+
+    endpoint
+        .send_metadata(TrackMetadata {
+            title: format!("{freq2}Hz Sine Wave"),
+            artist: "OAAT Demo".into(),
+            album: "Gapless Test".into(),
+            duration_ms: duration2 * 1000,
+            artwork_url: None,
+            format: Some(format!("PCM {bits}/{}", sample_rate / 1000)),
+        })
+        .await
+        .unwrap();
+
+    println!("Streaming {freq2}Hz for {duration2}s (gapless)...\n");
+
+    while sample_offset2 < total_samples2 {
+        let chunk = samples_per_packet.min((total_samples2 - sample_offset2) as usize);
+        let mut payload = Vec::with_capacity(chunk * bytes_per_sample);
+
+        for i in 0..chunk {
+            // Continue the sample timeline from the first track for seamless audio
+            let t = (sample_offset + sample_offset2 + i as u64) as f64 / sample_rate as f64;
+            let sample = (0.8 * (2.0 * PI * freq2 * t).sin() * i16::MAX as f64) as i16;
+            payload.extend_from_slice(&sample.to_le_bytes());
+            payload.extend_from_slice(&sample.to_le_bytes());
+        }
+
+        let pts_ns = ((sample_offset + sample_offset2) as f64 / sample_rate as f64 * 1e9) as u64;
+        let flags = if sample_offset2 == 0 {
+            PacketFlags::FIRST_PACKET
+        } else {
+            PacketFlags::empty()
+        };
+
+        endpoint
+            .send_audio(2, format, pts_ns, sample_offset + sample_offset2, &payload, flags)
+            .await
+            .unwrap();
+
+        sample_offset2 += chunk as u64;
+
+        let expected = Duration::from_nanos((sample_offset2 as f64 / sample_rate as f64 * 1e9) as u64);
+        let elapsed = start2.elapsed();
+        if expected > elapsed {
+            tokio::time::sleep(expected - elapsed).await;
+        }
+
+        if sample_offset2.is_multiple_of(sample_rate as u64) || sample_offset2 >= total_samples2 {
+            let secs = sample_offset2 / sample_rate as u64;
+            let pct = (sample_offset2 as f64 / total_samples2 as f64 * 100.0) as u32;
+            println!("  {secs}s / {duration2}s ({pct}%)");
+        }
+    }
+
+    let total_offset = sample_offset + sample_offset2;
+    endpoint
+        .send_audio(2, format, (total_offset as f64 / sample_rate as f64 * 1e9) as u64, total_offset, &[], PacketFlags::LAST_PACKET)
+        .await
+        .unwrap();
+
+    endpoint.send_stop(gapless_stream_id).await.unwrap();
+    println!("\nDone. {} + {} = {} total samples sent (gapless).", sample_offset, sample_offset2, total_offset);
 }
 
 fn run_discover(timeout: u64) {
