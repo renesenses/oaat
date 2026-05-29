@@ -7,10 +7,10 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use oaat_controller::{ConnectedEndpoint, ControllerConfig, ControllerDiscovery};
+use oaat_core::ChannelLayout;
 use oaat_core::format::AudioFormat;
 use oaat_core::message::{EndpointCapabilities, TrackMetadata};
 use oaat_core::wire::PacketFlags;
-use oaat_core::ChannelLayout;
 use oaat_endpoint::discovery::EndpointAnnouncement;
 use oaat_endpoint::transport::{PlaybackCommand, VolumeCommand};
 use oaat_endpoint::{CpalOutput, EndpointConfig, EndpointEvent, EndpointTransport};
@@ -49,7 +49,7 @@ enum Command {
         tls: bool,
     },
 
-    /// Start an OAAT controller and stream a sine wave
+    /// Start an OAAT controller and stream audio (file or sine wave)
     Controller {
         /// Controller display name
         #[arg(short, long, default_value = "OAAT Controller")]
@@ -57,10 +57,13 @@ enum Command {
         /// Connect directly to this address instead of using mDNS
         #[arg(short, long)]
         target: Option<SocketAddr>,
-        /// Sine wave frequency in Hz
+        /// Audio file to stream (WAV or FLAC)
+        #[arg(short, long)]
+        file: Option<String>,
+        /// Sine wave frequency in Hz (used when no --file)
         #[arg(long, default_value = "440")]
         freq: f64,
-        /// Duration in seconds
+        /// Duration in seconds (sine wave only)
         #[arg(long, default_value = "5")]
         duration: u64,
         /// Enable TLS 1.3 on the control channel (TOFU client)
@@ -109,11 +112,10 @@ async fn main() {
             audio_device,
             tls,
         } => {
-            let file_config = EndpointFileConfig::load(config.as_deref())
-                .unwrap_or_else(|e| {
-                    eprintln!("config error: {e}");
-                    std::process::exit(1);
-                });
+            let file_config = EndpointFileConfig::load(config.as_deref()).unwrap_or_else(|e| {
+                eprintln!("config error: {e}");
+                std::process::exit(1);
+            });
 
             // CLI args override config file values
             let ep_name = name.unwrap_or(file_config.endpoint.name);
@@ -121,15 +123,30 @@ async fn main() {
             let ep_audio_device = audio_device.or(file_config.endpoint.audio_device);
             let ep_tls = tls || file_config.endpoint.tls;
 
-            run_endpoint(ep_name, ep_port, ep_audio_device, daemon, ep_tls, &file_config.capabilities).await
+            run_endpoint(
+                ep_name,
+                ep_port,
+                ep_audio_device,
+                daemon,
+                ep_tls,
+                &file_config.capabilities,
+            )
+            .await
         }
         Command::Controller {
             name,
             target,
+            file,
             freq,
             duration,
             tls,
-        } => run_controller(name, target, freq, duration, tls).await,
+        } => {
+            if let Some(ref path) = file {
+                run_controller_file(name, target, path, tls).await
+            } else {
+                run_controller(name, target, freq, duration, tls).await
+            }
+        }
         Command::Multiroom {
             targets,
             freq,
@@ -465,7 +482,13 @@ async fn run_endpoint(
     }
 }
 
-async fn run_controller(name: String, target: Option<SocketAddr>, freq: f64, duration: u64, tls: bool) {
+async fn run_controller(
+    name: String,
+    target: Option<SocketAddr>,
+    freq: f64,
+    duration: u64,
+    tls: bool,
+) {
     let controller_id = uuid::Uuid::new_v4().to_string();
     let endpoint_addr = match target {
         Some(addr) => {
@@ -536,7 +559,14 @@ async fn run_controller(name: String, target: Option<SocketAddr>, freq: f64, dur
     // Format negotiation
     println!("Format: {format} {sample_rate}Hz {channels}ch {bits}bit");
     endpoint
-        .propose_format(stream_id, format, sample_rate, channels, ChannelLayout::Stereo, bits)
+        .propose_format(
+            stream_id,
+            format,
+            sample_rate,
+            channels,
+            ChannelLayout::Stereo,
+            bits,
+        )
         .await
         .unwrap();
 
@@ -589,7 +619,8 @@ async fn run_controller(name: String, target: Option<SocketAddr>, freq: f64, dur
 
         sample_offset += chunk as u64;
 
-        let expected = Duration::from_nanos((sample_offset as f64 / sample_rate as f64 * 1e9) as u64);
+        let expected =
+            Duration::from_nanos((sample_offset as f64 / sample_rate as f64 * 1e9) as u64);
         let elapsed = start.elapsed();
         if expected > elapsed {
             tokio::time::sleep(expected - elapsed).await;
@@ -607,18 +638,22 @@ async fn run_controller(name: String, target: Option<SocketAddr>, freq: f64, dur
     let gapless_stream_id = "sine-gapless";
     println!("\nPreparing gapless transition to {freq2}Hz...");
     endpoint
-        .prepare_next_track(gapless_stream_id, format, sample_rate, channels, ChannelLayout::Stereo, bits)
+        .prepare_next_track(
+            gapless_stream_id,
+            format,
+            sample_rate,
+            channels,
+            ChannelLayout::Stereo,
+            bits,
+        )
         .await
         .unwrap();
 
     // Give endpoint time to respond (NextTrackReady expected for same format)
     tokio::time::sleep(Duration::from_millis(100)).await;
     // Drain response from endpoint
-    if let Ok(Some(resp)) = tokio::time::timeout(
-        Duration::from_millis(500),
-        endpoint.response_rx.recv(),
-    )
-    .await
+    if let Ok(Some(resp)) =
+        tokio::time::timeout(Duration::from_millis(500), endpoint.response_rx.recv()).await
     {
         match resp {
             oaat_controller::EndpointResponse::NextTrackReady(ntr) => {
@@ -676,13 +711,21 @@ async fn run_controller(name: String, target: Option<SocketAddr>, freq: f64, dur
         };
 
         endpoint
-            .send_audio(2, format, pts_ns, sample_offset + sample_offset2, &payload, flags)
+            .send_audio(
+                2,
+                format,
+                pts_ns,
+                sample_offset + sample_offset2,
+                &payload,
+                flags,
+            )
             .await
             .unwrap();
 
         sample_offset2 += chunk as u64;
 
-        let expected = Duration::from_nanos((sample_offset2 as f64 / sample_rate as f64 * 1e9) as u64);
+        let expected =
+            Duration::from_nanos((sample_offset2 as f64 / sample_rate as f64 * 1e9) as u64);
         let elapsed = start2.elapsed();
         if expected > elapsed {
             tokio::time::sleep(expected - elapsed).await;
@@ -697,12 +740,234 @@ async fn run_controller(name: String, target: Option<SocketAddr>, freq: f64, dur
 
     let total_offset = sample_offset + sample_offset2;
     endpoint
-        .send_audio(2, format, (total_offset as f64 / sample_rate as f64 * 1e9) as u64, total_offset, &[], PacketFlags::LAST_PACKET)
+        .send_audio(
+            2,
+            format,
+            (total_offset as f64 / sample_rate as f64 * 1e9) as u64,
+            total_offset,
+            &[],
+            PacketFlags::LAST_PACKET,
+        )
         .await
         .unwrap();
 
     endpoint.send_stop(gapless_stream_id).await.unwrap();
-    println!("\nDone. {} + {} = {} total samples sent (gapless).", sample_offset, sample_offset2, total_offset);
+    println!(
+        "\nDone. {} + {} = {} total samples sent (gapless).",
+        sample_offset, sample_offset2, total_offset
+    );
+}
+
+async fn run_controller_file(
+    name: String,
+    target: Option<SocketAddr>,
+    path: &str,
+    tls: bool,
+) {
+    use std::io::Read;
+
+    let file_data = std::fs::read(path).unwrap_or_else(|e| {
+        eprintln!("Cannot read {path}: {e}");
+        std::process::exit(1);
+    });
+
+    let is_wav = file_data.len() > 44 && &file_data[0..4] == b"RIFF" && &file_data[8..12] == b"WAVE";
+    if !is_wav {
+        eprintln!("Only WAV files are supported for now (got: {path})");
+        std::process::exit(1);
+    }
+
+    // Parse WAV header
+    let channels = u16::from_le_bytes([file_data[22], file_data[23]]) as u8;
+    let sample_rate = u32::from_le_bytes([file_data[24], file_data[25], file_data[26], file_data[27]]);
+    let bits_per_sample = u16::from_le_bytes([file_data[34], file_data[35]]) as u8;
+
+    // Find data chunk
+    let mut data_offset = 12;
+    let mut data_len = 0usize;
+    while data_offset + 8 < file_data.len() {
+        let chunk_id = &file_data[data_offset..data_offset + 4];
+        let chunk_size = u32::from_le_bytes([
+            file_data[data_offset + 4],
+            file_data[data_offset + 5],
+            file_data[data_offset + 6],
+            file_data[data_offset + 7],
+        ]) as usize;
+        if chunk_id == b"data" {
+            data_offset += 8;
+            data_len = chunk_size.min(file_data.len() - data_offset);
+            break;
+        }
+        data_offset += 8 + chunk_size;
+        if chunk_size % 2 != 0 {
+            data_offset += 1;
+        }
+    }
+
+    if data_len == 0 {
+        eprintln!("No data chunk found in WAV file");
+        std::process::exit(1);
+    }
+
+    let pcm_data = &file_data[data_offset..data_offset + data_len];
+    let bytes_per_sample = (bits_per_sample as usize / 8) * channels as usize;
+    let total_samples = data_len / bytes_per_sample;
+    let duration_s = total_samples as f64 / sample_rate as f64;
+
+    let format = match bits_per_sample {
+        16 => AudioFormat::PcmS16le,
+        24 => AudioFormat::PcmS24le,
+        32 => AudioFormat::PcmS32le,
+        _ => {
+            eprintln!("Unsupported bit depth: {bits_per_sample}");
+            std::process::exit(1);
+        }
+    };
+
+    let filename = std::path::Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(path);
+
+    println!("File: {path}");
+    println!("  {format} {sample_rate}Hz {channels}ch {bits_per_sample}bit");
+    println!("  Duration: {duration_s:.1}s ({total_samples} samples)\n");
+
+    // Connect
+    let controller_id = uuid::Uuid::new_v4().to_string();
+    let endpoint_addr = match target {
+        Some(addr) => {
+            println!("Connecting directly to {addr}...");
+            addr
+        }
+        None => {
+            println!("Discovering OAAT endpoints via mDNS...");
+            let discovery = ControllerDiscovery::new().expect("failed to create mDNS");
+            match discovery.find_first(Duration::from_secs(10)) {
+                Some(ep) => {
+                    println!("Found endpoint '{}' at {}", ep.name, ep.addr);
+                    ep.addr
+                }
+                None => {
+                    eprintln!("No OAAT endpoints found. Use --target to connect directly.");
+                    return;
+                }
+            }
+        }
+    };
+
+    let config = ControllerConfig {
+        controller_id,
+        controller_name: name,
+        features: vec![],
+        clock_port: oaat_core::DEFAULT_CLOCK_PORT,
+        tls,
+    };
+
+    let mut endpoint = match ConnectedEndpoint::connect(&config, endpoint_addr).await {
+        Ok(ep) => ep,
+        Err(e) => {
+            eprintln!("Connection failed: {e}");
+            return;
+        }
+    };
+
+    println!(
+        "Connected to '{}' ({})\n",
+        endpoint.info.endpoint_name, endpoint.info.endpoint_id
+    );
+
+    // Clock sync
+    if let Err(e) = endpoint.clock_sync_bootstrap().await {
+        warn!(error = %e, "clock sync failed");
+    }
+
+    let stream_id = "file-stream";
+    endpoint
+        .propose_format(
+            stream_id,
+            format,
+            sample_rate,
+            channels,
+            ChannelLayout::Stereo,
+            bits_per_sample,
+        )
+        .await
+        .unwrap();
+
+    endpoint
+        .send_metadata(TrackMetadata {
+            title: filename.to_string(),
+            artist: "OAAT File Player".into(),
+            album: String::new(),
+            duration_ms: (duration_s * 1000.0) as u64,
+            artwork_url: None,
+            format: Some(format!("PCM {bits_per_sample}/{}", sample_rate / 1000)),
+        })
+        .await
+        .unwrap();
+
+    endpoint.send_play(stream_id).await.unwrap();
+    println!("Streaming {filename}...\n");
+
+    let samples_per_packet = 360;
+    let packet_bytes = samples_per_packet * bytes_per_sample;
+    let mut offset = 0usize;
+    let mut sample_offset: u64 = 0;
+    let start = std::time::Instant::now();
+    let mut last_print = 0u64;
+
+    while offset < data_len {
+        let chunk_bytes = packet_bytes.min(data_len - offset);
+        let chunk_samples = chunk_bytes / bytes_per_sample;
+        let payload = &pcm_data[offset..offset + chunk_bytes];
+
+        let pts_ns = (sample_offset as f64 / sample_rate as f64 * 1e9) as u64;
+        let flags = if offset == 0 {
+            PacketFlags::FIRST_PACKET
+        } else {
+            PacketFlags::empty()
+        };
+
+        endpoint
+            .send_audio(1, format, pts_ns, sample_offset, payload, flags)
+            .await
+            .unwrap();
+
+        offset += chunk_bytes;
+        sample_offset += chunk_samples as u64;
+
+        // Real-time pacing: sleep until the audio clock catches up
+        let expected =
+            Duration::from_nanos((sample_offset as f64 / sample_rate as f64 * 1e9) as u64);
+        let elapsed = start.elapsed();
+        if expected > elapsed {
+            tokio::time::sleep(expected - elapsed).await;
+        }
+
+        let secs = sample_offset / sample_rate as u64;
+        let total_secs = duration_s as u64;
+        if secs >= last_print + 5 || offset >= data_len {
+            last_print = secs;
+            let pct = (offset as f64 / data_len as f64 * 100.0) as u32;
+            println!("  {secs}s / {total_secs}s ({pct}%)");
+        }
+    }
+
+    endpoint
+        .send_audio(
+            1,
+            format,
+            (sample_offset as f64 / sample_rate as f64 * 1e9) as u64,
+            sample_offset,
+            &[],
+            PacketFlags::LAST_PACKET,
+        )
+        .await
+        .unwrap();
+
+    endpoint.send_stop(stream_id).await.unwrap();
+    println!("\nDone. {sample_offset} samples sent ({duration_s:.1}s).");
 }
 
 async fn run_multiroom(targets: Vec<SocketAddr>, freq: f64, duration: u64) {
@@ -732,8 +997,12 @@ async fn run_multiroom(targets: Vec<SocketAddr>, freq: f64, duration: u64) {
     }
 
     let n = zone.endpoint_count();
-    println!("\nZone '{}': {} endpoint(s), delay={}ms\n",
-        zone.name, n, zone.play_delay_ms());
+    println!(
+        "\nZone '{}': {} endpoint(s), delay={}ms\n",
+        zone.name,
+        n,
+        zone.play_delay_ms()
+    );
 
     let sample_rate = 44100u32;
     let format = AudioFormat::PcmS16le;
@@ -741,9 +1010,16 @@ async fn run_multiroom(targets: Vec<SocketAddr>, freq: f64, duration: u64) {
     let bits = 16u8;
     let stream_id = "multiroom-demo";
 
-    zone.propose_format_all(stream_id, format, sample_rate, channels, ChannelLayout::Stereo, bits)
-        .await
-        .unwrap();
+    zone.propose_format_all(
+        stream_id,
+        format,
+        sample_rate,
+        channels,
+        ChannelLayout::Stereo,
+        bits,
+    )
+    .await
+    .unwrap();
     println!("Format proposed: {format} {sample_rate}Hz {channels}ch {bits}bit");
 
     zone.send_metadata_all(TrackMetadata {
@@ -793,7 +1069,8 @@ async fn run_multiroom(targets: Vec<SocketAddr>, freq: f64, duration: u64) {
 
         sample_offset += chunk as u64;
 
-        let expected = Duration::from_nanos((sample_offset as f64 / sample_rate as f64 * 1e9) as u64);
+        let expected =
+            Duration::from_nanos((sample_offset as f64 / sample_rate as f64 * 1e9) as u64);
         let elapsed = start.elapsed();
         if expected > elapsed {
             tokio::time::sleep(expected - elapsed).await;
@@ -807,8 +1084,12 @@ async fn run_multiroom(targets: Vec<SocketAddr>, freq: f64, duration: u64) {
     }
 
     zone.send_audio_all(
-        1, format, start_ns + (duration as f64 * 1e9) as u64,
-        sample_offset, &[], PacketFlags::LAST_PACKET,
+        1,
+        format,
+        start_ns + (duration as f64 * 1e9) as u64,
+        sample_offset,
+        &[],
+        PacketFlags::LAST_PACKET,
     )
     .await
     .unwrap();
