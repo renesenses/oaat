@@ -1,5 +1,8 @@
 # OAAT — Open Advanced Audio Transport
 
+[![CI](https://github.com/renesenses/oaat/actions/workflows/ci.yml/badge.svg)](https://github.com/renesenses/oaat/actions/workflows/ci.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 An open-source, bit-perfect, multi-room audio streaming protocol.
 
 OAAT is a network audio transport protocol designed as an open alternative to Roon's proprietary RAAT. It provides:

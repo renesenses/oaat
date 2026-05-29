@@ -44,6 +44,9 @@ enum Command {
         /// Select audio output device by name
         #[arg(long)]
         audio_device: Option<String>,
+        /// Enable TLS 1.3 on the control channel (self-signed cert, TOFU)
+        #[arg(long)]
+        tls: bool,
     },
 
     /// Start an OAAT controller and stream a sine wave
@@ -60,6 +63,9 @@ enum Command {
         /// Duration in seconds
         #[arg(long, default_value = "5")]
         duration: u64,
+        /// Enable TLS 1.3 on the control channel (TOFU client)
+        #[arg(long)]
+        tls: bool,
     },
 
     /// Multi-room: stream synchronized audio to multiple endpoints
@@ -101,6 +107,7 @@ async fn main() {
             config,
             daemon,
             audio_device,
+            tls,
         } => {
             let file_config = EndpointFileConfig::load(config.as_deref())
                 .unwrap_or_else(|e| {
@@ -112,15 +119,17 @@ async fn main() {
             let ep_name = name.unwrap_or(file_config.endpoint.name);
             let ep_port = port.unwrap_or(file_config.endpoint.port);
             let ep_audio_device = audio_device.or(file_config.endpoint.audio_device);
+            let ep_tls = tls || file_config.endpoint.tls;
 
-            run_endpoint(ep_name, ep_port, ep_audio_device, daemon, &file_config.capabilities).await
+            run_endpoint(ep_name, ep_port, ep_audio_device, daemon, ep_tls, &file_config.capabilities).await
         }
         Command::Controller {
             name,
             target,
             freq,
             duration,
-        } => run_controller(name, target, freq, duration).await,
+            tls,
+        } => run_controller(name, target, freq, duration, tls).await,
         Command::Multiroom {
             targets,
             freq,
@@ -135,6 +144,7 @@ async fn run_endpoint(
     port: u16,
     _audio_device: Option<String>,
     daemon: bool,
+    tls: bool,
     caps_config: &config::CapabilitiesSection,
 ) {
     let endpoint_id = uuid::Uuid::new_v4().to_string();
@@ -151,11 +161,16 @@ async fn run_endpoint(
     if caps_config.flac {
         formats.push(AudioFormat::Flac);
     }
+    if caps_config.dsd {
+        formats.push(AudioFormat::DsdU8);
+        formats.push(AudioFormat::DsdU16le);
+        formats.push(AudioFormat::DsdU32le);
+    }
 
     let capabilities = EndpointCapabilities {
         pcm_max_rate: caps_config.pcm_max_rate,
         pcm_max_bits: caps_config.pcm_max_bits,
-        dsd_max_rate: None,
+        dsd_max_rate: if caps_config.dsd { Some(64) } else { None },
         channels_max: caps_config.channels_max,
         formats,
         volume: None,
@@ -212,6 +227,7 @@ async fn run_endpoint(
         clock_addr,
         capabilities,
         buffer_size_ms: 1000,
+        tls,
     };
 
     let (event_tx, mut event_rx) = mpsc::channel(256);
@@ -449,7 +465,7 @@ async fn run_endpoint(
     }
 }
 
-async fn run_controller(name: String, target: Option<SocketAddr>, freq: f64, duration: u64) {
+async fn run_controller(name: String, target: Option<SocketAddr>, freq: f64, duration: u64, tls: bool) {
     let controller_id = uuid::Uuid::new_v4().to_string();
     let endpoint_addr = match target {
         Some(addr) => {
@@ -480,9 +496,10 @@ async fn run_controller(name: String, target: Option<SocketAddr>, freq: f64, dur
         controller_name: name.clone(),
         features: vec![],
         clock_port: oaat_core::DEFAULT_CLOCK_PORT,
+        tls,
     };
 
-    println!("Connecting...");
+    println!("Connecting{}...", if tls { " (TLS)" } else { "" });
     let mut endpoint = match ConnectedEndpoint::connect(&config, endpoint_addr).await {
         Ok(ep) => ep,
         Err(e) => {
@@ -698,6 +715,7 @@ async fn run_multiroom(targets: Vec<SocketAddr>, freq: f64, duration: u64) {
         controller_name: "OAAT Multi-Room".into(),
         features: vec![],
         clock_port: oaat_core::DEFAULT_CLOCK_PORT,
+        tls: false,
     };
 
     let mut zone = Zone::new("zone-1".into(), "Demo Zone".into(), config);

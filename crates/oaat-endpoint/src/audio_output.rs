@@ -188,9 +188,63 @@ fn convert_to_f32(format: AudioFormat, data: &[u8]) -> Vec<f32> {
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect(),
+        AudioFormat::DsdU8 | AudioFormat::DsdU16le | AudioFormat::DsdU32le => {
+            dsd_to_f32(data, dsd_rate_multiplier(format))
+        }
         _ => {
             warn!(format = %format, "unsupported format, silence");
             vec![0.0f32; data.len() / 2]
         }
     }
+}
+
+/// Return the DSD rate multiplier for a DSD format (64, 128, or 256).
+/// DSD_U8 = DSD64 (1 byte = 8 bits = 8 DSD samples), DSD_U16LE/U32LE imply
+/// wider container but still DSD64 unless the sample_rate field says otherwise.
+/// The actual multiplier is determined by the negotiated sample rate, but for
+/// the purpose of decimation we use the container width to determine how many
+/// DSD bits per container sample.
+fn dsd_rate_multiplier(format: AudioFormat) -> u32 {
+    match format {
+        AudioFormat::DsdU8 => 64,
+        AudioFormat::DsdU16le => 128,
+        AudioFormat::DsdU32le => 256,
+        _ => 64,
+    }
+}
+
+/// Convert DSD bitstream data to PCM f32 samples.
+///
+/// DSD is a 1-bit format at high sample rates (2.8224 MHz for DSD64, i.e. 64x
+/// 44.1 kHz). For software playback through a PCM DAC, we decimate the
+/// bitstream down to 44.1 kHz by averaging blocks of DSD bits.
+///
+/// For DSD64: 64 bits (8 bytes) produce one PCM sample at 44.1 kHz.
+/// For DSD128: 128 bits (16 bytes) produce one PCM sample at 44.1 kHz.
+/// For DSD256: 256 bits (32 bytes) produce one PCM sample at 44.1 kHz.
+///
+/// Each DSD bit represents +1 or -1 (MSB-first within each byte). Averaging
+/// the bit values over a block gives a crude but functional PCM value. A proper
+/// implementation would use a windowed sinc FIR filter for better frequency
+/// response, but this simple averaging provides adequate playback quality for a
+/// first implementation.
+fn dsd_to_f32(data: &[u8], rate_multiplier: u32) -> Vec<f32> {
+    // Number of DSD bytes that produce one PCM sample at base rate (44.1 kHz).
+    // DSD64: 64 bits / 8 = 8 bytes per sample
+    // DSD128: 128 bits / 8 = 16 bytes per sample
+    // DSD256: 256 bits / 8 = 32 bytes per sample
+    let bytes_per_pcm_sample = (rate_multiplier as usize) / 8;
+    if bytes_per_pcm_sample == 0 {
+        return Vec::new();
+    }
+
+    data.chunks_exact(bytes_per_pcm_sample)
+        .map(|block| {
+            let total_bits = block.len() * 8;
+            let ones: u32 = block.iter().map(|b| b.count_ones()).sum();
+            // Map [0..total_bits] ones to [-1.0..+1.0]
+            // 0 ones = -1.0, all ones = +1.0
+            (2.0 * ones as f32 / total_bits as f32) - 1.0
+        })
+        .collect()
 }

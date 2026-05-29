@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -19,6 +19,8 @@ pub struct EndpointConfig {
     pub clock_addr: SocketAddr,
     pub capabilities: EndpointCapabilities,
     pub buffer_size_ms: u32,
+    /// Enable TLS 1.3 on the control channel (self-signed cert, TOFU).
+    pub tls: bool,
 }
 
 pub enum EndpointEvent {
@@ -81,31 +83,76 @@ impl EndpointTransport {
         let actual_audio_port = audio_socket.local_addr()?.port();
         let actual_clock_port = clock_socket.local_addr()?.port();
 
+        // TLS setup (if enabled)
+        #[cfg(feature = "tls")]
+        let tls_acceptor = if config.tls {
+            let (server_config, _cert_der, fingerprint) =
+                oaat_core::tls::generate_self_signed_cert()
+                    .map_err(|e| OaatError::Io(
+                        std::io::Error::other(format!("TLS cert generation failed: {e}")),
+                    ))?;
+            info!(fingerprint = %fingerprint, "TLS enabled, self-signed certificate generated");
+            Some(tokio_rustls::TlsAcceptor::from(Arc::new(server_config)))
+        } else {
+            None
+        };
+
         info!(
             control = %tcp_listener.local_addr()?,
             audio = actual_audio_port,
             clock = actual_clock_port,
+            tls = config.tls,
             "endpoint listening"
         );
 
         loop {
             let (stream, peer) = tcp_listener.accept().await?;
-            info!(%peer, "controller connected");
+            info!(%peer, tls = config.tls, "controller connected");
 
-            let session = EndpointSession {
+            // Wrap in TLS if configured
+            #[cfg(feature = "tls")]
+            if let Some(ref acceptor) = tls_acceptor {
+                match acceptor.accept(stream).await {
+                    Ok(tls_stream) => {
+                        info!(%peer, "TLS handshake complete");
+                        let session = EndpointSession::new(
+                            tls_stream,
+                            audio_socket.clone(),
+                            clock_socket.clone(),
+                            event_tx.clone(),
+                            config.endpoint_id.clone(),
+                            config.endpoint_name.clone(),
+                            config.capabilities.clone(),
+                            actual_audio_port,
+                            actual_clock_port,
+                            config.buffer_size_ms,
+                        );
+                        if let Err(e) = session.run().await {
+                            warn!(%peer, error = %e, "session ended");
+                        }
+                        info!("waiting for next controller connection...");
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(%peer, error = %e, "TLS handshake failed");
+                        continue;
+                    }
+                }
+            }
+
+            // Plain TCP path (no TLS, or TLS feature disabled)
+            let session = EndpointSession::new(
                 stream,
-                audio_socket: audio_socket.clone(),
-                clock_socket: clock_socket.clone(),
-                event_tx: event_tx.clone(),
-                endpoint_id: config.endpoint_id.clone(),
-                endpoint_name: config.endpoint_name.clone(),
-                capabilities: config.capabilities.clone(),
-                audio_port: actual_audio_port,
-                clock_port: actual_clock_port,
-                buffer_size_ms: config.buffer_size_ms,
-                current_format: None,
-                current_sample_rate: None,
-            };
+                audio_socket.clone(),
+                clock_socket.clone(),
+                event_tx.clone(),
+                config.endpoint_id.clone(),
+                config.endpoint_name.clone(),
+                config.capabilities.clone(),
+                actual_audio_port,
+                actual_clock_port,
+                config.buffer_size_ms,
+            );
 
             // Run session inline — when it ends, loop back to accept
             if let Err(e) = session.run().await {
@@ -116,8 +163,8 @@ impl EndpointTransport {
     }
 }
 
-struct EndpointSession {
-    stream: TcpStream,
+struct EndpointSession<S> {
+    stream: S,
     audio_socket: Arc<UdpSocket>,
     clock_socket: Arc<UdpSocket>,
     event_tx: mpsc::Sender<EndpointEvent>,
@@ -133,9 +180,40 @@ struct EndpointSession {
     current_sample_rate: Option<u32>,
 }
 
-impl EndpointSession {
+impl<S> EndpointSession<S> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        stream: S,
+        audio_socket: Arc<UdpSocket>,
+        clock_socket: Arc<UdpSocket>,
+        event_tx: mpsc::Sender<EndpointEvent>,
+        endpoint_id: String,
+        endpoint_name: String,
+        capabilities: EndpointCapabilities,
+        audio_port: u16,
+        clock_port: u16,
+        buffer_size_ms: u32,
+    ) -> Self {
+        Self {
+            stream,
+            audio_socket,
+            clock_socket,
+            event_tx,
+            endpoint_id,
+            endpoint_name,
+            capabilities,
+            audio_port,
+            clock_port,
+            buffer_size_ms,
+            current_format: None,
+            current_sample_rate: None,
+        }
+    }
+}
+
+impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> EndpointSession<S> {
     async fn run(self) -> Result<(), OaatError> {
-        // Destructure to get owned fields -- avoids borrow conflicts after into_split().
+        // Destructure to get owned fields -- avoids borrow conflicts after split().
         let EndpointSession {
             stream,
             audio_socket,
@@ -151,7 +229,7 @@ impl EndpointSession {
             mut current_sample_rate,
         } = self;
 
-        let (mut reader, mut writer) = stream.into_split();
+        let (mut reader, mut writer) = tokio::io::split(stream);
         let mut codec = FrameCodec::new();
         let mut read_buf = [0u8; 8192];
 
@@ -459,6 +537,29 @@ fn negotiate_format(caps: &EndpointCapabilities, fp: &FormatPropose) -> Message 
             bits_per_sample: counter_bits,
             dsd_rate: fp.dsd_rate,
         });
+    }
+
+    // For DSD formats, verify the endpoint supports the requested DSD rate
+    if fp.format.is_dsd() {
+        match caps.dsd_max_rate {
+            None => {
+                return Message::FormatReject(FormatReject {
+                    stream_id: fp.stream_id.clone(),
+                    reason: "DSD not supported (no dsd_max_rate)".into(),
+                });
+            }
+            Some(max_rate) => {
+                let requested_rate = fp.dsd_rate.unwrap_or(64);
+                if requested_rate > max_rate {
+                    return Message::FormatReject(FormatReject {
+                        stream_id: fp.stream_id.clone(),
+                        reason: format!(
+                            "DSD rate {requested_rate}x exceeds max {max_rate}x"
+                        ),
+                    });
+                }
+            }
+        }
     }
 
     // For non-PCM formats (DSD, compressed) that are in the supported list, accept

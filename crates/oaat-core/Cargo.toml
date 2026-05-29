@@ -5,7 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 serde = { workspace = true }
@@ -15,3 +18,10 @@ zerocopy = { workspace = true }
 bytes = { workspace = true }
 uuid = { workspace = true }
 bitflags = "2"
+rustls = { workspace = true, optional = true }
+rcgen = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+
+[features]
+default = ["tls"]
+tls = ["dep:rustls", "dep:rcgen", "dep:sha2"]

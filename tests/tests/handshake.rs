@@ -61,6 +61,7 @@ async fn controller_connects_to_endpoint_and_handshakes() {
         clock_addr: actual_clock,
         capabilities: test_capabilities(),
         buffer_size_ms: 1000,
+        tls: false,
     };
 
     let (event_tx, mut event_rx) = mpsc::channel(32);
@@ -82,6 +83,7 @@ async fn controller_connects_to_endpoint_and_handshakes() {
         controller_name: "Test Controller".into(),
         features: vec!["flac_transport".into()],
         clock_port: 9742,
+        tls: false,
     };
 
     let endpoint = ConnectedEndpoint::connect(&ctrl_config, actual_control)
@@ -134,6 +136,7 @@ async fn controller_sends_format_propose_and_audio() {
         clock_addr: actual_clock,
         capabilities: test_capabilities(),
         buffer_size_ms: 1000,
+        tls: false,
     };
 
     let (event_tx, mut event_rx) = mpsc::channel(64);
@@ -152,6 +155,7 @@ async fn controller_sends_format_propose_and_audio() {
         controller_name: "Audio Controller".into(),
         features: vec![],
         clock_port: 9742,
+        tls: false,
     };
 
     let mut endpoint = ConnectedEndpoint::connect(&ctrl_config, actual_control)
@@ -259,6 +263,7 @@ async fn clock_sync_bootstrap() {
         clock_addr: actual_clock,
         capabilities: test_capabilities(),
         buffer_size_ms: 1000,
+        tls: false,
     };
 
     let (event_tx, _event_rx) = mpsc::channel(32);
@@ -277,6 +282,7 @@ async fn clock_sync_bootstrap() {
         controller_name: "Clock Controller".into(),
         features: vec![],
         clock_port: 9742,
+        tls: false,
     };
 
     let mut endpoint = ConnectedEndpoint::connect(&ctrl_config, actual_control)
@@ -316,6 +322,7 @@ async fn setup_endpoint_and_controller(
         clock_addr: actual_clock,
         capabilities: caps,
         buffer_size_ms: 1000,
+        tls: false,
     };
 
     let (event_tx, mut event_rx) = mpsc::channel(64);
@@ -334,6 +341,7 @@ async fn setup_endpoint_and_controller(
         controller_name: "Format Controller".into(),
         features: vec![],
         clock_port: 9742,
+        tls: false,
     };
 
     let endpoint = ConnectedEndpoint::connect(&ctrl_config, actual_control)
@@ -686,6 +694,90 @@ async fn gapless_different_format_returns_next_track_reformat() {
 }
 
 #[tokio::test]
+async fn dsd_format_accepted_when_supported() {
+    init_tracing();
+
+    let dsd_caps = EndpointCapabilities {
+        pcm_max_rate: 192000,
+        pcm_max_bits: 24,
+        dsd_max_rate: Some(64),
+        channels_max: 2,
+        formats: vec![
+            AudioFormat::PcmS16le,
+            AudioFormat::PcmS24le,
+            AudioFormat::DsdU8,
+        ],
+        volume: None,
+        gapless: true,
+        seek: true,
+    };
+
+    let (_event_rx, mut endpoint) = setup_endpoint_and_controller(dsd_caps).await;
+
+    endpoint
+        .propose_format(
+            "stream-dsd-accept",
+            AudioFormat::DsdU8,
+            2822400,
+            2,
+            ChannelLayout::Stereo,
+            1,
+        )
+        .await
+        .unwrap();
+
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        endpoint.response_rx.recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    match resp {
+        EndpointResponse::FormatAccept(fa) => {
+            assert_eq!(fa.stream_id, "stream-dsd-accept");
+        }
+        other => panic!("expected FormatAccept for DSD, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn dsd_format_rejected_when_not_supported() {
+    init_tracing();
+
+    let (_event_rx, mut endpoint) = setup_endpoint_and_controller(test_capabilities()).await;
+
+    endpoint
+        .propose_format(
+            "stream-dsd-reject",
+            AudioFormat::DsdU8,
+            2822400,
+            2,
+            ChannelLayout::Stereo,
+            1,
+        )
+        .await
+        .unwrap();
+
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        endpoint.response_rx.recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    match resp {
+        EndpointResponse::FormatReject(fr) => {
+            assert_eq!(fr.stream_id, "stream-dsd-reject");
+            assert!(fr.reason.contains("unsupported format"));
+        }
+        other => panic!("expected FormatReject for DSD, got {:?}", other),
+    }
+}
+
+#[tokio::test]
 async fn multiroom_zone_streams_to_two_endpoints() {
     init_tracing();
     use oaat_controller::Zone;
@@ -708,6 +800,7 @@ async fn multiroom_zone_streams_to_two_endpoints() {
             clock_addr: clock,
             capabilities: test_capabilities(),
             buffer_size_ms: 1000,
+            tls: false,
         };
 
         let (event_tx, event_rx) = mpsc::channel(256);
@@ -729,6 +822,7 @@ async fn multiroom_zone_streams_to_two_endpoints() {
         controller_name: "Zone Controller".into(),
         features: vec![],
         clock_port: 9742,
+        tls: false,
     };
     let mut zone = Zone::new("zone-test".into(), "Test Zone".into(), config);
 

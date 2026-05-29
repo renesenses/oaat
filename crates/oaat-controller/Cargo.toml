@@ -18,3 +18,9 @@ mdns-sd = { workspace = true }
 bytes = { workspace = true }
 uuid = { workspace = true }
 hostname = { workspace = true }
+tokio-rustls = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+
+[features]
+default = ["tls"]
+tls = ["dep:tokio-rustls", "dep:rustls", "oaat-core/tls"]

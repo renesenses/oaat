@@ -16,6 +16,8 @@ pub struct ControllerConfig {
     pub controller_name: String,
     pub features: Vec<String>,
     pub clock_port: u16,
+    /// Enable TLS 1.3 on the control channel (TOFU client).
+    pub tls: bool,
 }
 
 /// A control-plane response received from the endpoint.
@@ -29,7 +31,7 @@ pub enum EndpointResponse {
 }
 
 pub struct ConnectedEndpoint {
-    writer: tokio::io::WriteHalf<TcpStream>,
+    writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
     pub info: HelloAck,
     pub audio_socket: Arc<UdpSocket>,
     pub audio_target: SocketAddr,
@@ -53,6 +55,44 @@ impl ConnectedEndpoint {
         endpoint_addr: SocketAddr,
     ) -> Result<Self, OaatError> {
         let stream = TcpStream::connect(endpoint_addr).await?;
+
+        #[cfg(feature = "tls")]
+        if config.tls {
+            let tls_config = oaat_core::tls::make_client_config_tofu();
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+            let server_name = rustls::pki_types::ServerName::try_from("oaat-endpoint")
+                .map_err(|e| OaatError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("invalid server name: {e}"),
+                )))?
+                .to_owned();
+            let tls_stream = connector.connect(server_name, stream).await
+                .map_err(|e| OaatError::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    format!("TLS handshake failed: {e}"),
+                )))?;
+
+            // Log the endpoint certificate fingerprint
+            let (_, server_conn) = tls_stream.get_ref();
+            if let Some(cert) = server_conn.peer_certificates().and_then(|c| c.first()) {
+                let fp = oaat_core::tls::cert_fingerprint(cert.as_ref());
+                info!(fingerprint = %fp, "TLS connected (TOFU)");
+            }
+
+            return Self::handshake_and_spawn(config, endpoint_addr, tls_stream).await;
+        }
+
+        Self::handshake_and_spawn(config, endpoint_addr, stream).await
+    }
+
+    async fn handshake_and_spawn<S>(
+        config: &ControllerConfig,
+        endpoint_addr: SocketAddr,
+        stream: S,
+    ) -> Result<Self, OaatError>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
         let (mut reader, mut writer) = tokio::io::split(stream);
 
         let hello = Message::Hello(Hello {
@@ -183,7 +223,7 @@ impl ConnectedEndpoint {
         });
 
         Ok(Self {
-            writer,
+            writer: Box::new(writer),
             info: hello_ack,
             audio_socket,
             audio_target,
@@ -198,6 +238,7 @@ impl ConnectedEndpoint {
 
     pub async fn send_message(&mut self, msg: &Message) -> Result<(), OaatError> {
         self.writer.write_all(&FrameCodec::encode(msg)).await?;
+        self.writer.flush().await?;
         Ok(())
     }
 

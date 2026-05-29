@@ -36,6 +36,8 @@ pub struct EndpointSection {
     pub name: String,
     pub port: u16,
     pub audio_device: Option<String>,
+    /// Enable TLS 1.3 on the control channel.
+    pub tls: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,6 +62,7 @@ impl Default for EndpointSection {
             name: "OAAT Endpoint".into(),
             port: 9740,
             audio_device: None,
+            tls: false,
         }
     }
 }

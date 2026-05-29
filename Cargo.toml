@@ -6,6 +6,7 @@ members = [
     "crates/oaat-controller",
     "crates/oaat-cli",
     "crates/oaat-test",
+    "crates/oaat-ffi",
     "tests",
 ]
 
@@ -14,7 +15,10 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/renesenses/oaat"
+homepage = "https://mozaiklabs.fr/docs/oaat"
 authors = ["Bertrand Clech <renesenses@gmail.com>"]
+keywords = ["audio", "streaming", "multiroom", "hifi", "protocol"]
+categories = ["multimedia::audio", "network-programming"]
 
 [workspace.dependencies]
 oaat-core = { path = "crates/oaat-core" }
@@ -34,3 +38,7 @@ hostname = "0.4"
 clap = { version = "4", features = ["derive"] }
 symphonia = { version = "0.5", features = ["flac"] }
 toml = "0.8"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-rustls = "0.26"
+rcgen = "0.13"
+sha2 = "0.10"

@@ -6,6 +6,8 @@ pub mod capability;
 pub mod codec;
 pub mod clock;
 pub mod error;
+#[cfg(feature = "tls")]
+pub mod tls;
 
 pub use format::{AudioFormat, ChannelLayout, DsdRate, SampleRateFamily};
 pub use wire::{AudioPacketHeader, ClockSyncPacket, PacketFlags};

@@ -22,8 +22,11 @@ cpal = { workspace = true, optional = true }
 ringbuf = { workspace = true, optional = true }
 
 symphonia = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
 
 [features]
-default = ["audio-output", "flac"]
+default = ["audio-output", "flac", "tls"]
 audio-output = ["dep:cpal", "dep:ringbuf"]
 flac = ["dep:symphonia"]
+tls = ["dep:tokio-rustls", "dep:rustls", "oaat-core/tls"]

@@ -17,21 +17,26 @@ struct Cli {
     /// Timeout per test in seconds
     #[arg(short, long, default_value = "5")]
     timeout: u64,
+    /// Enable TLS 1.3 on the control channel (TOFU client)
+    #[arg(long)]
+    tls: bool,
 }
 
 struct TestRunner {
     target: SocketAddr,
     timeout: Duration,
+    tls: bool,
     passed: u32,
     failed: u32,
     skipped: u32,
 }
 
 impl TestRunner {
-    fn new(target: SocketAddr, timeout_secs: u64) -> Self {
+    fn new(target: SocketAddr, timeout_secs: u64, tls: bool) -> Self {
         Self {
             target,
             timeout: Duration::from_secs(timeout_secs),
+            tls,
             passed: 0,
             failed: 0,
             skipped: 0,
@@ -59,6 +64,7 @@ impl TestRunner {
             controller_name: "OAAT Conformance Tester".into(),
             features: vec![],
             clock_port: oaat_core::DEFAULT_CLOCK_PORT,
+            tls: self.tls,
         }
     }
 
@@ -101,7 +107,7 @@ async fn main() {
         .init();
 
     let cli = Cli::parse();
-    let mut runner = TestRunner::new(cli.target, cli.timeout);
+    let mut runner = TestRunner::new(cli.target, cli.timeout, cli.tls);
 
     println!("OAAT Conformance Test — {}\n", cli.target);
 
