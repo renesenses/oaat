@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use tokio::sync::mpsc;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use oaat_controller::{ConnectedEndpoint, ControllerConfig, ControllerDiscovery};
 use oaat_core::format::AudioFormat;
@@ -14,6 +14,9 @@ use oaat_core::ChannelLayout;
 use oaat_endpoint::discovery::EndpointAnnouncement;
 use oaat_endpoint::transport::{PlaybackCommand, VolumeCommand};
 use oaat_endpoint::{CpalOutput, EndpointConfig, EndpointEvent, EndpointTransport};
+
+mod config;
+use config::EndpointFileConfig;
 
 #[derive(Parser)]
 #[command(name = "oaat", about = "OAAT — Open Advanced Audio Transport CLI")]
@@ -27,11 +30,20 @@ enum Command {
     /// Start an OAAT endpoint (receiver/renderer) with audio output
     Endpoint {
         /// Endpoint display name
-        #[arg(short, long, default_value = "OAAT Endpoint")]
-        name: String,
+        #[arg(short, long)]
+        name: Option<String>,
         /// TCP control port (0 = auto)
-        #[arg(long, default_value = "9740")]
-        port: u16,
+        #[arg(long)]
+        port: Option<u16>,
+        /// Path to TOML config file
+        #[arg(short, long)]
+        config: Option<String>,
+        /// Run in daemon mode (suppress interactive output, log only)
+        #[arg(long)]
+        daemon: bool,
+        /// Select audio output device by name
+        #[arg(long)]
+        audio_device: Option<String>,
     },
 
     /// Start an OAAT controller and stream a sine wave
@@ -83,7 +95,26 @@ async fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Endpoint { name, port } => run_endpoint(name, port).await,
+        Command::Endpoint {
+            name,
+            port,
+            config,
+            daemon,
+            audio_device,
+        } => {
+            let file_config = EndpointFileConfig::load(config.as_deref())
+                .unwrap_or_else(|e| {
+                    eprintln!("config error: {e}");
+                    std::process::exit(1);
+                });
+
+            // CLI args override config file values
+            let ep_name = name.unwrap_or(file_config.endpoint.name);
+            let ep_port = port.unwrap_or(file_config.endpoint.port);
+            let ep_audio_device = audio_device.or(file_config.endpoint.audio_device);
+
+            run_endpoint(ep_name, ep_port, ep_audio_device, daemon, &file_config.capabilities).await
+        }
         Command::Controller {
             name,
             target,
@@ -99,25 +130,46 @@ async fn main() {
     }
 }
 
-async fn run_endpoint(name: String, port: u16) {
+async fn run_endpoint(
+    name: String,
+    port: u16,
+    _audio_device: Option<String>,
+    daemon: bool,
+    caps_config: &config::CapabilitiesSection,
+) {
     let endpoint_id = uuid::Uuid::new_v4().to_string();
     let control_addr: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
     let audio_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
     let clock_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
 
+    // Build capabilities from config
+    let mut formats = vec![
+        AudioFormat::PcmS16le,
+        AudioFormat::PcmS24le,
+        AudioFormat::PcmS32le,
+    ];
+    if caps_config.flac {
+        formats.push(AudioFormat::Flac);
+    }
+
     let capabilities = EndpointCapabilities {
-        pcm_max_rate: 192000,
-        pcm_max_bits: 24,
+        pcm_max_rate: caps_config.pcm_max_rate,
+        pcm_max_bits: caps_config.pcm_max_bits,
         dsd_max_rate: None,
-        channels_max: 2,
-        formats: vec![
-            AudioFormat::PcmS16le,
-            AudioFormat::PcmS24le,
-            AudioFormat::PcmS32le,
-        ],
+        channels_max: caps_config.channels_max,
+        formats,
         volume: None,
         gapless: true,
         seek: true,
+    };
+
+    // Build mDNS capabilities string
+    let mdns_caps = oaat_core::capability::Capabilities {
+        pcm_max_rate_khz: caps_config.pcm_max_rate / 1000,
+        pcm_max_bits: caps_config.pcm_max_bits,
+        dsd_max_multiplier: if caps_config.dsd { Some(64) } else { None },
+        flac: caps_config.flac,
+        opus: false,
     };
 
     // Bind TCP first to get actual port
@@ -133,14 +185,8 @@ async fn run_endpoint(name: String, port: u16) {
         instance_name: name.clone(),
         port: actual_port,
         endpoint_id: endpoint_id.clone(),
-        capabilities: oaat_core::capability::Capabilities {
-            pcm_max_rate_khz: 192,
-            pcm_max_bits: 24,
-            dsd_max_multiplier: None,
-            flac: false,
-            opus: false,
-        },
-        channels_max: 2,
+        capabilities: mdns_caps,
+        channels_max: caps_config.channels_max,
         volume_type: Some("sw".into()),
         model: None,
         vendor: Some("MozAIk Labs".into()),
@@ -150,9 +196,13 @@ async fn run_endpoint(name: String, port: u16) {
         warn!(error = %e, "mDNS registration failed, continuing without discovery");
     }
 
-    println!("OAAT Endpoint '{name}' listening on port {actual_port}");
-    println!("Endpoint ID: {endpoint_id}");
-    println!("Waiting for controller connection...\n");
+    if daemon {
+        info!(name = %name, port = actual_port, id = %endpoint_id, "endpoint started (daemon mode)");
+    } else {
+        println!("OAAT Endpoint '{name}' listening on port {actual_port}");
+        println!("Endpoint ID: {endpoint_id}");
+        println!("Waiting for controller connection...\n");
+    }
 
     let ep_config = EndpointConfig {
         endpoint_id,
@@ -177,109 +227,223 @@ async fn run_endpoint(name: String, port: u16) {
     let mut packet_count: u64 = 0;
     let mut total_bytes: u64 = 0;
 
-    while let Some(event) = event_rx.recv().await {
-        match event {
-            EndpointEvent::Connected {
-                controller_id,
-                controller_name,
-            } => {
-                println!("Connected to controller '{controller_name}' ({controller_id})");
-            }
-            EndpointEvent::FormatAccepted { stream_id } => {
-                println!("Format accepted: {stream_id}");
-            }
-            EndpointEvent::FormatRejected { stream_id, reason } => {
-                eprintln!("Format rejected: {stream_id} — {reason}");
-            }
-            EndpointEvent::FormatProposed(fp) => {
-                println!(
-                    "Format: {} {}Hz {}ch {}bit",
-                    fp.format, fp.sample_rate, fp.channels, fp.bits_per_sample
-                );
-                match audio.configure(fp.format, fp.sample_rate, fp.channels) {
-                    Ok(()) => println!("Audio output configured"),
-                    Err(e) => eprintln!("Audio output error: {e}"),
+    // Graceful shutdown: listen for SIGTERM/SIGINT
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("failed to register SIGTERM handler");
+    let sigint = tokio::signal::ctrl_c();
+    tokio::pin!(sigint);
+
+    loop {
+        tokio::select! {
+            event = event_rx.recv() => {
+                let Some(event) = event else { break };
+                match event {
+                    EndpointEvent::Connected {
+                        controller_id,
+                        controller_name,
+                    } => {
+                        if daemon {
+                            info!(controller = %controller_name, id = %controller_id, "controller connected");
+                        } else {
+                            println!("Connected to controller '{controller_name}' ({controller_id})");
+                        }
+                    }
+                    EndpointEvent::FormatAccepted { stream_id } => {
+                        if daemon {
+                            info!(stream_id, "format accepted");
+                        } else {
+                            println!("Format accepted: {stream_id}");
+                        }
+                    }
+                    EndpointEvent::FormatRejected { stream_id, reason } => {
+                        if daemon {
+                            warn!(stream_id, reason, "format rejected");
+                        } else {
+                            eprintln!("Format rejected: {stream_id} — {reason}");
+                        }
+                    }
+                    EndpointEvent::FormatProposed(fp) => {
+                        if daemon {
+                            info!(
+                                format = %fp.format,
+                                sample_rate = fp.sample_rate,
+                                channels = fp.channels,
+                                bits = fp.bits_per_sample,
+                                "format proposed"
+                            );
+                        } else {
+                            println!(
+                                "Format: {} {}Hz {}ch {}bit",
+                                fp.format, fp.sample_rate, fp.channels, fp.bits_per_sample
+                            );
+                        }
+                        match audio.configure(fp.format, fp.sample_rate, fp.channels) {
+                            Ok(()) => {
+                                if daemon {
+                                    info!("audio output configured");
+                                } else {
+                                    println!("Audio output configured");
+                                }
+                            }
+                            Err(e) => {
+                                if daemon {
+                                    error!(error = %e, "audio output configuration failed");
+                                } else {
+                                    eprintln!("Audio output error: {e}");
+                                }
+                            }
+                        }
+                    }
+                    EndpointEvent::AudioPacket { header, payload } => {
+                        packet_count += 1;
+                        total_bytes += payload.len() as u64;
+                        if !payload.is_empty() {
+                            audio.write_audio(&payload);
+                        }
+                        if !daemon && (packet_count.is_multiple_of(200) || header.flags.contains(PacketFlags::FIRST_PACKET)) {
+                            println!(
+                                "  [{packet_count}] seq={} buf={}",
+                                header.sequence,
+                                audio.buffer_level(),
+                            );
+                        }
+                    }
+                    EndpointEvent::Playback(cmd) => match cmd {
+                        PlaybackCommand::Play(id) => {
+                            if daemon {
+                                info!(stream_id = %id, "play");
+                            } else {
+                                println!("Play: {id}");
+                            }
+                            audio.play();
+                        }
+                        PlaybackCommand::Pause(id) => {
+                            if daemon {
+                                info!(stream_id = %id, "pause");
+                            } else {
+                                println!("Pause: {id}");
+                            }
+                            audio.pause();
+                        }
+                        PlaybackCommand::Stop(id) => {
+                            if daemon {
+                                info!(stream_id = %id, packets = packet_count, bytes = total_bytes, "stop");
+                            } else {
+                                println!("Stop: {id}");
+                                println!(
+                                    "Session: {packet_count} packets, {:.1} KB",
+                                    total_bytes as f64 / 1024.0
+                                );
+                            }
+                            audio.stop();
+                        }
+                        PlaybackCommand::Seek(id, pos) => {
+                            if daemon {
+                                info!(stream_id = %id, position_ms = pos, "seek");
+                            } else {
+                                println!("Seek: {id} -> {pos}ms");
+                            }
+                        }
+                    },
+                    EndpointEvent::Metadata(m) => {
+                        if daemon {
+                            info!(
+                                artist = %m.track.artist,
+                                title = %m.track.title,
+                                album = %m.track.album,
+                                "now playing"
+                            );
+                        } else {
+                            println!(
+                                "Now playing: {} — {} [{}]",
+                                m.track.artist, m.track.title, m.track.album
+                            );
+                            if let Some(ref fmt) = m.track.format {
+                                println!("  Format: {fmt}");
+                            }
+                        }
+                    }
+                    EndpointEvent::NextTrackReady { stream_id } => {
+                        if daemon {
+                            info!(stream_id, "gapless ready");
+                        } else {
+                            println!("Gapless ready: {stream_id} (same format, seamless transition)");
+                        }
+                    }
+                    EndpointEvent::NextTrackReformat {
+                        stream_id,
+                        format,
+                        sample_rate,
+                    } => {
+                        if daemon {
+                            info!(stream_id, format = %format, sample_rate, "reformat for next track");
+                        } else {
+                            println!(
+                                "Reformat needed: {stream_id} -> {format} {sample_rate}Hz (reconfiguring output)"
+                            );
+                        }
+                        match audio.configure(format, sample_rate, 2) {
+                            Ok(()) => {
+                                if !daemon {
+                                    println!("Audio output reconfigured for next track");
+                                }
+                            }
+                            Err(e) => {
+                                if daemon {
+                                    error!(error = %e, "audio reconfigure failed");
+                                } else {
+                                    eprintln!("Audio reconfigure error: {e}");
+                                }
+                            }
+                        }
+                    }
+                    EndpointEvent::Volume(cmd) => match cmd {
+                        VolumeCommand::Set(level) => {
+                            audio.set_volume(level);
+                            if daemon {
+                                info!(level, "volume set");
+                            } else {
+                                println!("Volume: {level}%");
+                            }
+                        }
+                        VolumeCommand::Get => {}
+                        VolumeCommand::Mute(muted) => {
+                            audio.set_mute(muted);
+                            if daemon {
+                                info!(muted, "mute toggled");
+                            } else {
+                                println!("Mute: {muted}");
+                            }
+                        }
+                    },
+                    EndpointEvent::Disconnected => {
+                        audio.stop();
+                        if daemon {
+                            info!(packets = packet_count, bytes = total_bytes, "controller disconnected");
+                        } else {
+                            println!("\nDisconnected. {packet_count} packets, {total_bytes} bytes total.");
+                        }
+                        // In daemon mode, don't break — keep waiting for the next connection
+                        if !daemon {
+                            break;
+                        }
+                    }
+                    EndpointEvent::Error(e) => {
+                        error!(error = %e, "endpoint error");
+                    }
                 }
             }
-            EndpointEvent::AudioPacket { header, payload } => {
-                packet_count += 1;
-                total_bytes += payload.len() as u64;
-                if !payload.is_empty() {
-                    audio.write_audio(&payload);
-                }
-                if packet_count.is_multiple_of(200) || header.flags.contains(PacketFlags::FIRST_PACKET) {
-                    println!(
-                        "  [{packet_count}] seq={} buf={}",
-                        header.sequence,
-                        audio.buffer_level(),
-                    );
-                }
-            }
-            EndpointEvent::Playback(cmd) => match cmd {
-                PlaybackCommand::Play(id) => {
-                    println!("▶ Play: {id}");
-                    audio.play();
-                }
-                PlaybackCommand::Pause(id) => {
-                    println!("⏸ Pause: {id}");
-                    audio.pause();
-                }
-                PlaybackCommand::Stop(id) => {
-                    println!("⏹ Stop: {id}");
-                    audio.stop();
-                    println!(
-                        "Session: {packet_count} packets, {:.1} KB",
-                        total_bytes as f64 / 1024.0
-                    );
-                }
-                PlaybackCommand::Seek(id, pos) => {
-                    println!("Seek: {id} -> {pos}ms");
-                }
-            },
-            EndpointEvent::Metadata(m) => {
-                println!(
-                    "Now playing: {} — {} [{}]",
-                    m.track.artist, m.track.title, m.track.album
-                );
-                if let Some(ref fmt) = m.track.format {
-                    println!("  Format: {fmt}");
-                }
-            }
-            EndpointEvent::NextTrackReady { stream_id } => {
-                println!("Gapless ready: {stream_id} (same format, seamless transition)");
-            }
-            EndpointEvent::NextTrackReformat {
-                stream_id,
-                format,
-                sample_rate,
-            } => {
-                println!(
-                    "Reformat needed: {stream_id} -> {format} {sample_rate}Hz (reconfiguring output)"
-                );
-                // Reconfigure audio output for the new format (assume stereo for demo)
-                match audio.configure(format, sample_rate, 2) {
-                    Ok(()) => println!("Audio output reconfigured for next track"),
-                    Err(e) => eprintln!("Audio reconfigure error: {e}"),
-                }
-            }
-            EndpointEvent::Volume(cmd) => match cmd {
-                VolumeCommand::Set(level) => {
-                    audio.set_volume(level);
-                    println!("Volume: {level}%");
-                }
-                VolumeCommand::Get => {}
-                VolumeCommand::Mute(muted) => {
-                    audio.set_mute(muted);
-                    println!("Mute: {muted}");
-                }
-            },
-            EndpointEvent::Disconnected => {
+            _ = &mut sigint => {
+                info!("endpoint shutting down gracefully");
                 audio.stop();
-                println!("\nDisconnected. {packet_count} packets, {total_bytes} bytes total.");
+                let _ = mdns.shutdown();
                 break;
             }
-            EndpointEvent::Error(e) => {
-                error!(error = %e, "endpoint error");
+            _ = sigterm.recv() => {
+                info!("endpoint shutting down gracefully");
+                audio.stop();
+                let _ = mdns.shutdown();
+                break;
             }
         }
     }

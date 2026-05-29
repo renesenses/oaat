@@ -14,6 +14,7 @@ crates/
   oaat-endpoint/     Endpoint SDK: transport, mDNS discovery, cpal audio output, HAL trait
   oaat-controller/   Controller: transport, mDNS browsing, zone manager
   oaat-cli/          CLI binary: endpoint, controller, multiroom, discover
+  oaat-test/         Protocol conformance test tool (20 automated tests)
 tests/               Integration tests (handshake, format negotiation, gapless, multi-room)
 docs/rfc.md          Full protocol RFC
 ```
@@ -68,6 +69,14 @@ Endpoint auto-responds based on capabilities:
 - Format in list but rate/bits too high → `FormatCounter` (stays in same 44.1k/48k family)
 - Format not in list → `FormatReject`
 
+## Conformance testing
+
+```bash
+oaat-test <endpoint:port>    # 20 tests: handshake, caps, format nego, clock, audio, gapless, volume, reconnect
+```
+
+Exit code 0 = conformant, 1 = issues. Use to validate any OAAT endpoint implementation.
+
 ## Tune integration
 
 Branch `fix/oaat-output` on `tune-server-rust`:
@@ -83,3 +92,5 @@ Branch `fix/oaat-output` on `tune-server-rust`:
 - Wire format is big-endian, audio samples are little-endian
 - All ports reported by actual bind (not config) to handle port 0
 - Integration tests use port 0 for all sockets, bind-then-drop to get real ports
+- ConnectedEndpoint aborts its reader task on drop (clean TCP close for reconnection)
+- Endpoint transport loops on accept() for reconnection (no restart needed)

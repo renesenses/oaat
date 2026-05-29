@@ -1,0 +1,14 @@
+[endpoint]
+name = "OAAT Endpoint"
+port = 9740
+# audio_device = "default"  # select output device by name
+
+[capabilities]
+pcm_max_rate = 192000
+pcm_max_bits = 24
+channels_max = 2
+# dsd = false
+# flac = false
+
+[logging]
+level = "info"
