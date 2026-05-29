@@ -18,3 +18,9 @@ mdns-sd = { workspace = true }
 bytes = { workspace = true }
 uuid = { workspace = true }
 hostname = { workspace = true }
+cpal = { workspace = true, optional = true }
+ringbuf = { workspace = true, optional = true }
+
+[features]
+default = ["audio-output"]
+audio-output = ["dep:cpal", "dep:ringbuf"]

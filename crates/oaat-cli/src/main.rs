@@ -12,7 +12,8 @@ use oaat_core::message::{EndpointCapabilities, TrackMetadata};
 use oaat_core::wire::PacketFlags;
 use oaat_core::ChannelLayout;
 use oaat_endpoint::discovery::EndpointAnnouncement;
-use oaat_endpoint::{EndpointConfig, EndpointEvent, EndpointTransport};
+use oaat_endpoint::transport::{PlaybackCommand, VolumeCommand};
+use oaat_endpoint::{CpalOutput, EndpointConfig, EndpointEvent, EndpointTransport};
 
 #[derive(Parser)]
 #[command(name = "oaat", about = "OAAT — Open Advanced Audio Transport CLI")]
@@ -23,7 +24,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Start an OAAT endpoint (receiver/renderer)
+    /// Start an OAAT endpoint (receiver/renderer) with audio output
     Endpoint {
         /// Endpoint display name
         #[arg(short, long, default_value = "OAAT Endpoint")]
@@ -154,6 +155,7 @@ async fn run_endpoint(name: String, port: u16) {
         }
     });
 
+    let mut audio = CpalOutput::new();
     let mut packet_count: u64 = 0;
     let mut total_bytes: u64 = 0;
 
@@ -167,57 +169,66 @@ async fn run_endpoint(name: String, port: u16) {
             }
             EndpointEvent::FormatProposed(fp) => {
                 println!(
-                    "Format proposed: {} {}Hz {}ch {}bit",
+                    "Format: {} {}Hz {}ch {}bit",
                     fp.format, fp.sample_rate, fp.channels, fp.bits_per_sample
                 );
+                match audio.configure(fp.format, fp.sample_rate, fp.channels) {
+                    Ok(()) => println!("Audio output configured"),
+                    Err(e) => eprintln!("Audio output error: {e}"),
+                }
             }
             EndpointEvent::AudioPacket { header, payload } => {
                 packet_count += 1;
                 total_bytes += payload.len() as u64;
-                if packet_count.is_multiple_of(100) || header.flags.contains(PacketFlags::FIRST_PACKET) {
+                if !payload.is_empty() {
+                    audio.write_audio(&payload);
+                }
+                if packet_count.is_multiple_of(200) || header.flags.contains(PacketFlags::FIRST_PACKET) {
                     println!(
-                        "  audio: seq={} pts={}ns samples={} total_packets={} ({:.1} KB)",
+                        "  [{packet_count}] seq={} buf={}",
                         header.sequence,
-                        header.pts_ns,
-                        header.sample_offset,
-                        packet_count,
-                        total_bytes as f64 / 1024.0
+                        audio.buffer_level(),
                     );
                 }
             }
             EndpointEvent::Playback(cmd) => match cmd {
-                oaat_endpoint::transport::PlaybackCommand::Play(id) => {
-                    println!("Play: stream {id}");
+                PlaybackCommand::Play(id) => {
+                    println!("▶ Play: {id}");
+                    audio.play();
                 }
-                oaat_endpoint::transport::PlaybackCommand::Pause(id) => {
-                    println!("Pause: stream {id}");
+                PlaybackCommand::Pause(id) => {
+                    println!("⏸ Pause: {id}");
+                    audio.pause();
                 }
-                oaat_endpoint::transport::PlaybackCommand::Stop(id) => {
-                    println!("Stop: stream {id}");
+                PlaybackCommand::Stop(id) => {
+                    println!("⏹ Stop: {id}");
+                    audio.stop();
+                    println!(
+                        "Session: {packet_count} packets, {:.1} KB",
+                        total_bytes as f64 / 1024.0
+                    );
                 }
-                oaat_endpoint::transport::PlaybackCommand::Seek(id, pos) => {
-                    println!("Seek: stream {id} to {pos}ms");
+                PlaybackCommand::Seek(id, pos) => {
+                    println!("Seek: {id} -> {pos}ms");
                 }
             },
             EndpointEvent::Metadata(m) => {
                 println!(
-                    "Metadata: {} - {} [{}]",
+                    "Now playing: {} — {} [{}]",
                     m.track.artist, m.track.title, m.track.album
                 );
+                if let Some(ref fmt) = m.track.format {
+                    println!("  Format: {fmt}");
+                }
             }
             EndpointEvent::Volume(cmd) => match cmd {
-                oaat_endpoint::transport::VolumeCommand::Set(level) => {
-                    println!("Volume: {level}");
-                }
-                oaat_endpoint::transport::VolumeCommand::Get => {
-                    println!("Volume query");
-                }
-                oaat_endpoint::transport::VolumeCommand::Mute(muted) => {
-                    println!("Mute: {muted}");
-                }
+                VolumeCommand::Set(level) => println!("Volume: {level}"),
+                VolumeCommand::Get => {}
+                VolumeCommand::Mute(muted) => println!("Mute: {muted}"),
             },
             EndpointEvent::Disconnected => {
-                println!("\nController disconnected. Total: {packet_count} packets, {total_bytes} bytes.");
+                audio.stop();
+                println!("\nDisconnected. {packet_count} packets, {total_bytes} bytes total.");
                 break;
             }
             EndpointEvent::Error(e) => {
@@ -260,7 +271,7 @@ async fn run_controller(name: String, target: Option<SocketAddr>, freq: f64, dur
         clock_port: oaat_core::DEFAULT_CLOCK_PORT,
     };
 
-    println!("Connecting to endpoint...");
+    println!("Connecting...");
     let mut endpoint = match ConnectedEndpoint::connect(&config, endpoint_addr).await {
         Ok(ep) => ep,
         Err(e) => {
@@ -274,34 +285,34 @@ async fn run_controller(name: String, target: Option<SocketAddr>, freq: f64, dur
         endpoint.info.endpoint_name, endpoint.info.endpoint_id
     );
     println!(
-        "  PCM max: {}Hz/{}bit, channels: {}",
+        "  PCM max: {}Hz/{}bit, {}ch",
         endpoint.info.capabilities.pcm_max_rate,
         endpoint.info.capabilities.pcm_max_bits,
         endpoint.info.capabilities.channels_max
     );
 
-    // Clock sync bootstrap
-    println!("\nRunning clock sync bootstrap...");
+    // Clock sync
+    println!("\nClock sync...");
     if let Err(e) = endpoint.clock_sync_bootstrap().await {
-        warn!(error = %e, "clock sync failed, continuing without sync");
+        warn!(error = %e, "clock sync failed");
     }
     let offset = endpoint.clock_offset_ns().await;
-    println!("  Clock offset: {offset}ns\n");
+    println!("  Offset: {offset}ns\n");
 
-    // Propose format: 16-bit 44.1kHz stereo (universally supported)
     let sample_rate = 44100u32;
     let channels = 2u8;
     let bits = 16u8;
     let format = AudioFormat::PcmS16le;
     let stream_id = "sine-demo";
 
-    println!("Proposing format: {format} {sample_rate}Hz {channels}ch {bits}bit");
+    // Format negotiation
+    println!("Format: {format} {sample_rate}Hz {channels}ch {bits}bit");
     endpoint
         .propose_format(stream_id, format, sample_rate, channels, ChannelLayout::Stereo, bits)
         .await
         .unwrap();
 
-    // Send metadata
+    // Metadata
     endpoint
         .send_metadata(TrackMetadata {
             title: format!("{freq}Hz Sine Wave"),
@@ -314,30 +325,29 @@ async fn run_controller(name: String, target: Option<SocketAddr>, freq: f64, dur
         .await
         .unwrap();
 
-    // Send play command
+    // Play
     endpoint.send_play(stream_id).await.unwrap();
-    println!("Streaming {freq}Hz sine wave for {duration}s...\n");
+    println!("Streaming {freq}Hz for {duration}s...\n");
 
-    // Generate and stream sine wave
-    let samples_per_packet = 480; // ~10.9ms at 44.1kHz
-    let bytes_per_sample = 2 * channels as usize; // 16-bit stereo = 4 bytes/sample
+    // Generate and send
+    let samples_per_packet = 480;
+    let bytes_per_sample = 2 * channels as usize;
     let total_samples = sample_rate as u64 * duration;
     let mut sample_offset: u64 = 0;
     let start = std::time::Instant::now();
 
     while sample_offset < total_samples {
-        let chunk_samples = samples_per_packet.min((total_samples - sample_offset) as usize);
-        let mut payload = Vec::with_capacity(chunk_samples * bytes_per_sample);
+        let chunk = samples_per_packet.min((total_samples - sample_offset) as usize);
+        let mut payload = Vec::with_capacity(chunk * bytes_per_sample);
 
-        for i in 0..chunk_samples {
+        for i in 0..chunk {
             let t = (sample_offset + i as u64) as f64 / sample_rate as f64;
             let sample = (0.8 * (2.0 * PI * freq * t).sin() * i16::MAX as f64) as i16;
-            // Stereo: same sample on both channels
             payload.extend_from_slice(&sample.to_le_bytes());
             payload.extend_from_slice(&sample.to_le_bytes());
         }
 
-        let pts_ns = (sample_offset as f64 / sample_rate as f64 * 1_000_000_000.0) as u64;
+        let pts_ns = (sample_offset as f64 / sample_rate as f64 * 1e9) as u64;
         let flags = if sample_offset == 0 {
             PacketFlags::FIRST_PACKET
         } else {
@@ -349,39 +359,28 @@ async fn run_controller(name: String, target: Option<SocketAddr>, freq: f64, dur
             .await
             .unwrap();
 
-        sample_offset += chunk_samples as u64;
+        sample_offset += chunk as u64;
 
-        // Pace the sending to roughly real-time
-        let expected_time =
-            Duration::from_nanos((sample_offset as f64 / sample_rate as f64 * 1e9) as u64);
+        let expected = Duration::from_nanos((sample_offset as f64 / sample_rate as f64 * 1e9) as u64);
         let elapsed = start.elapsed();
-        if expected_time > elapsed {
-            tokio::time::sleep(expected_time - elapsed).await;
+        if expected > elapsed {
+            tokio::time::sleep(expected - elapsed).await;
         }
 
-        // Progress
-        let pct = (sample_offset as f64 / total_samples as f64 * 100.0) as u32;
         if sample_offset.is_multiple_of(sample_rate as u64) || sample_offset >= total_samples {
             let secs = sample_offset / sample_rate as u64;
+            let pct = (sample_offset as f64 / total_samples as f64 * 100.0) as u32;
             println!("  {secs}s / {duration}s ({pct}%)");
         }
     }
 
-    // Send last packet flag and stop
     endpoint
-        .send_audio(
-            1,
-            format,
-            (duration as f64 * 1e9) as u64,
-            sample_offset,
-            &[],
-            PacketFlags::LAST_PACKET,
-        )
+        .send_audio(1, format, (duration as f64 * 1e9) as u64, sample_offset, &[], PacketFlags::LAST_PACKET)
         .await
         .unwrap();
 
     endpoint.send_stop(stream_id).await.unwrap();
-    println!("\nStreaming complete. {sample_offset} samples sent.");
+    println!("\nDone. {sample_offset} samples sent.");
 }
 
 fn run_discover(timeout: u64) {

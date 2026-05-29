@@ -1,6 +1,6 @@
 use oaat_core::format::AudioFormat;
 
-pub trait OaatHal: Send + Sync {
+pub trait OaatHal {
     fn configure_output(&mut self, format: AudioFormat, sample_rate: u32, channels: u8)
         -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
