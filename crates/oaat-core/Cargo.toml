@@ -9,6 +9,8 @@ homepage.workspace = true
 authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
+readme = "../../README.md"
+rust-version = "1.85"
 
 [dependencies]
 serde = { workspace = true }
