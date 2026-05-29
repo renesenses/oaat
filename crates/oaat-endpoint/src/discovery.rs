@@ -1,5 +1,7 @@
-use oaat_core::{DEFAULT_CONTROL_PORT, PROTOCOL_VERSION, SERVICE_TYPE};
+use mdns_sd::{ServiceDaemon, ServiceInfo};
 use oaat_core::capability::Capabilities;
+use oaat_core::{DEFAULT_CONTROL_PORT, PROTOCOL_VERSION, SERVICE_TYPE};
+use tracing::info;
 
 pub struct EndpointAnnouncement {
     pub instance_name: String,
@@ -14,34 +16,61 @@ pub struct EndpointAnnouncement {
 }
 
 impl EndpointAnnouncement {
-    pub fn txt_records(&self) -> Vec<(String, String)> {
-        let mut records = vec![
-            ("v".into(), PROTOCOL_VERSION.to_string()),
-            ("id".into(), self.endpoint_id.clone()),
-            ("name".into(), self.instance_name.clone()),
-            ("caps".into(), self.capabilities.to_string()),
-            ("ch".into(), self.channels_max.to_string()),
-        ];
-        if let Some(ref vol) = self.volume_type {
-            records.push(("vol".into(), vol.clone()));
-        }
-        if let Some(ref model) = self.model {
-            records.push(("model".into(), model.clone()));
-        }
-        if let Some(ref vendor) = self.vendor {
-            records.push(("vendor".into(), vendor.clone()));
-        }
-        if let Some(ref fw) = self.firmware {
-            records.push(("fw".into(), fw.clone()));
-        }
-        records
-    }
-
     pub fn service_type() -> &'static str {
         SERVICE_TYPE
     }
 
     pub fn default_port() -> u16 {
         DEFAULT_CONTROL_PORT
+    }
+
+    pub fn register(&self, mdns: &ServiceDaemon) -> Result<(), mdns_sd::Error> {
+        let service_type = format!("{}.local.", SERVICE_TYPE);
+        let hostname = format!(
+            "{}.local.",
+            hostname::get().unwrap_or_default().to_string_lossy()
+        );
+
+        let v_str = PROTOCOL_VERSION.to_string();
+        let caps_str = self.capabilities.to_string();
+        let ch_str = self.channels_max.to_string();
+
+        let mut props: Vec<(&str, &str)> = vec![
+            ("v", &v_str),
+            ("id", &self.endpoint_id),
+            ("name", &self.instance_name),
+            ("caps", &caps_str),
+            ("ch", &ch_str),
+        ];
+        if let Some(ref vol) = self.volume_type {
+            props.push(("vol", vol));
+        }
+        if let Some(ref model) = self.model {
+            props.push(("model", model));
+        }
+        if let Some(ref vendor) = self.vendor {
+            props.push(("vendor", vendor));
+        }
+        if let Some(ref fw) = self.firmware {
+            props.push(("fw", fw));
+        }
+
+        let service = ServiceInfo::new(
+            &service_type,
+            &self.instance_name,
+            &hostname,
+            "",
+            self.port,
+            &props[..],
+        )?;
+
+        mdns.register(service)?;
+        info!(
+            name = %self.instance_name,
+            port = self.port,
+            service_type = SERVICE_TYPE,
+            "mDNS service registered"
+        );
+        Ok(())
     }
 }

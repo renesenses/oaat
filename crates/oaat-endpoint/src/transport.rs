@@ -62,10 +62,13 @@ impl EndpointTransport {
         let audio_socket = Arc::new(UdpSocket::bind(config.audio_addr).await?);
         let clock_socket = Arc::new(UdpSocket::bind(config.clock_addr).await?);
 
+        let actual_audio_port = audio_socket.local_addr()?.port();
+        let actual_clock_port = clock_socket.local_addr()?.port();
+
         info!(
-            control = %config.control_addr,
-            audio = %config.audio_addr,
-            clock = %config.clock_addr,
+            control = %tcp_listener.local_addr()?,
+            audio = actual_audio_port,
+            clock = actual_clock_port,
             "endpoint listening"
         );
 
@@ -80,8 +83,8 @@ impl EndpointTransport {
             endpoint_id: config.endpoint_id,
             endpoint_name: config.endpoint_name,
             capabilities: config.capabilities,
-            audio_port: config.audio_addr.port(),
-            clock_port: config.clock_addr.port(),
+            audio_port: actual_audio_port,
+            clock_port: actual_clock_port,
             buffer_size_ms: config.buffer_size_ms,
         };
 

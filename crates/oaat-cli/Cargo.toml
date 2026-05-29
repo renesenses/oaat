@@ -1,0 +1,23 @@
+[package]
+name = "oaat-cli"
+description = "CLI demo tool for OAAT (Open Advanced Audio Transport)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "oaat"
+path = "src/main.rs"
+
+[dependencies]
+oaat-core = { workspace = true }
+oaat-endpoint = { path = "../oaat-endpoint" }
+oaat-controller = { path = "../oaat-controller" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+uuid = { workspace = true }
+mdns-sd = { workspace = true }

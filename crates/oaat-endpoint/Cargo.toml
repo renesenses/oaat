@@ -17,3 +17,4 @@ tracing = { workspace = true }
 mdns-sd = { workspace = true }
 bytes = { workspace = true }
 uuid = { workspace = true }
+hostname = { workspace = true }

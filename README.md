@@ -23,6 +23,7 @@ Read the full [RFC specification](docs/rfc.md).
 | `oaat-core` | Core types, wire format, protocol messages, format negotiation |
 | `oaat-endpoint` | Endpoint SDK with Hardware Abstraction Layer |
 | `oaat-controller` | Controller implementation (for server integration) |
+| `oaat-cli` | CLI demo tool (`oaat endpoint`, `oaat controller`, `oaat discover`) |
 
 ## Architecture
 
@@ -42,6 +43,29 @@ Read the full [RFC specification](docs/rfc.md).
 ```bash
 cargo build --workspace
 cargo test --workspace
+```
+
+### Demo: stream a sine wave over OAAT
+
+Terminal 1 — start an endpoint:
+```bash
+cargo run --bin oaat -- endpoint --name "Living Room DAC"
+```
+
+Terminal 2 — stream a 440Hz sine wave:
+```bash
+cargo run --bin oaat -- controller --target 127.0.0.1:9740 --freq 440 --duration 5
+```
+
+Or use mDNS auto-discovery (no `--target` needed):
+```bash
+cargo run --bin oaat -- controller --duration 10
+```
+
+### Discover endpoints on the network
+
+```bash
+cargo run --bin oaat -- discover --timeout 5
 ```
 
 ## Implementation Phases
