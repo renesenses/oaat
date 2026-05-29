@@ -684,3 +684,105 @@ async fn gapless_different_format_returns_next_track_reformat() {
         _ => panic!("expected NextTrackReformat event"),
     }
 }
+
+#[tokio::test]
+async fn multiroom_zone_streams_to_two_endpoints() {
+    init_tracing();
+    use oaat_controller::Zone;
+
+    // Start two endpoints
+    let mut ep_addrs = Vec::new();
+    let mut ep_rxs = Vec::new();
+    for i in 0..2 {
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control = tcp.local_addr().unwrap();
+        let audio = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let clock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        drop(tcp);
+
+        let ep_config = EndpointConfig {
+            endpoint_id: format!("ep-zone-{i}"),
+            endpoint_name: format!("Zone Endpoint {i}"),
+            control_addr: control,
+            audio_addr: audio,
+            clock_addr: clock,
+            capabilities: test_capabilities(),
+            buffer_size_ms: 1000,
+        };
+
+        let (event_tx, event_rx) = mpsc::channel(256);
+        let (_ctrl_tx, ctrl_rx) = mpsc::channel(32);
+
+        tokio::spawn(async move {
+            EndpointTransport::run(ep_config, event_tx, ctrl_rx).await.ok();
+        });
+
+        ep_addrs.push(control);
+        ep_rxs.push(event_rx);
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Create zone and add both endpoints
+    let config = ControllerConfig {
+        controller_id: "ctrl-zone".into(),
+        controller_name: "Zone Controller".into(),
+        features: vec![],
+        clock_port: 9742,
+    };
+    let mut zone = Zone::new("zone-test".into(), "Test Zone".into(), config);
+
+    for addr in &ep_addrs {
+        zone.add_endpoint(*addr).await.unwrap();
+    }
+    assert_eq!(zone.endpoint_count(), 2);
+    assert!(zone.is_multiroom());
+
+    // Drain Connected events from both endpoints
+    for rx in &mut ep_rxs {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await;
+    }
+
+    // Propose format to all
+    zone.propose_format_all("zone-stream", AudioFormat::PcmS16le, 44100, 2, ChannelLayout::Stereo, 16)
+        .await
+        .unwrap();
+
+    // Both endpoints should get FormatAccepted + FormatProposed
+    for rx in &mut ep_rxs {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await.unwrap().unwrap();
+        match event {
+            EndpointEvent::FormatAccepted { stream_id } => assert_eq!(stream_id, "zone-stream"),
+            _ => panic!("expected FormatAccepted"),
+        }
+    }
+
+    // Play all
+    zone.play_all("zone-stream").await.unwrap();
+
+    // Send 5 audio packets to all
+    for i in 0..5u64 {
+        let payload = vec![0u8; 960]; // 240 stereo 16-bit samples
+        let flags = if i == 0 { PacketFlags::FIRST_PACKET } else { PacketFlags::empty() };
+        zone.send_audio_all(1, AudioFormat::PcmS16le, i * 5_000_000, i * 240, &payload, flags)
+            .await
+            .unwrap();
+    }
+
+    // Both endpoints should receive audio packets
+    for (idx, rx) in ep_rxs.iter_mut().enumerate() {
+        // Drain FormatProposed and Play events first
+        let mut audio_count = 0;
+        for _ in 0..20 {
+            match tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await {
+                Ok(Some(EndpointEvent::AudioPacket { .. })) => audio_count += 1,
+                Ok(Some(_)) => {}
+                _ => break,
+            }
+        }
+        assert!(audio_count >= 3, "endpoint {idx} got {audio_count} audio packets, expected >= 3");
+    }
+
+    zone.stop_all("zone-stream").await.unwrap();
+}

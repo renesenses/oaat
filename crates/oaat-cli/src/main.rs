@@ -50,6 +50,19 @@ enum Command {
         duration: u64,
     },
 
+    /// Multi-room: stream synchronized audio to multiple endpoints
+    Multiroom {
+        /// Endpoint addresses (e.g. 192.168.1.10:9740 192.168.1.11:9740)
+        #[arg(required = true)]
+        targets: Vec<SocketAddr>,
+        /// Sine wave frequency in Hz
+        #[arg(long, default_value = "440")]
+        freq: f64,
+        /// Duration in seconds
+        #[arg(long, default_value = "5")]
+        duration: u64,
+    },
+
     /// Discover OAAT endpoints on the network
     Discover {
         /// Timeout in seconds
@@ -77,6 +90,11 @@ async fn main() {
             freq,
             duration,
         } => run_controller(name, target, freq, duration).await,
+        Command::Multiroom {
+            targets,
+            freq,
+            duration,
+        } => run_multiroom(targets, freq, duration).await,
         Command::Discover { timeout } => run_discover(timeout),
     }
 }
@@ -498,6 +516,124 @@ async fn run_controller(name: String, target: Option<SocketAddr>, freq: f64, dur
 
     endpoint.send_stop(gapless_stream_id).await.unwrap();
     println!("\nDone. {} + {} = {} total samples sent (gapless).", sample_offset, sample_offset2, total_offset);
+}
+
+async fn run_multiroom(targets: Vec<SocketAddr>, freq: f64, duration: u64) {
+    use oaat_controller::{ControllerConfig, Zone};
+
+    println!("Multi-room: streaming to {} endpoints\n", targets.len());
+
+    let config = ControllerConfig {
+        controller_id: uuid::Uuid::new_v4().to_string(),
+        controller_name: "OAAT Multi-Room".into(),
+        features: vec![],
+        clock_port: oaat_core::DEFAULT_CLOCK_PORT,
+    };
+
+    let mut zone = Zone::new("zone-1".into(), "Demo Zone".into(), config);
+
+    for addr in &targets {
+        print!("  Connecting to {addr}... ");
+        match zone.add_endpoint(*addr).await {
+            Ok(id) => println!("OK ({id})"),
+            Err(e) => {
+                eprintln!("FAILED: {e}");
+                return;
+            }
+        }
+    }
+
+    let n = zone.endpoint_count();
+    println!("\nZone '{}': {} endpoint(s), delay={}ms\n",
+        zone.name, n, zone.play_delay_ms());
+
+    let sample_rate = 44100u32;
+    let format = AudioFormat::PcmS16le;
+    let channels = 2u8;
+    let bits = 16u8;
+    let stream_id = "multiroom-demo";
+
+    zone.propose_format_all(stream_id, format, sample_rate, channels, ChannelLayout::Stereo, bits)
+        .await
+        .unwrap();
+    println!("Format proposed: {format} {sample_rate}Hz {channels}ch {bits}bit");
+
+    zone.send_metadata_all(TrackMetadata {
+        title: format!("{freq}Hz Sine — {n} endpoints"),
+        artist: "OAAT Multi-Room".into(),
+        album: "Sync Demo".into(),
+        duration_ms: duration * 1000,
+        artwork_url: None,
+        format: Some(format!("PCM {bits}/{}", sample_rate / 1000)),
+    })
+    .await
+    .unwrap();
+
+    zone.play_all(stream_id).await.unwrap();
+    println!("Streaming {freq}Hz for {duration}s across {n} endpoints...\n");
+
+    let samples_per_packet = 480;
+    let bytes_per_sample = 2 * channels as usize;
+    let total_samples = sample_rate as u64 * duration;
+    let mut sample_offset: u64 = 0;
+    let play_delay_ns = zone.play_delay_ms() * 1_000_000;
+    let start = std::time::Instant::now();
+    let start_ns = now_ns() + play_delay_ns;
+
+    while sample_offset < total_samples {
+        let chunk = samples_per_packet.min((total_samples - sample_offset) as usize);
+        let mut payload = Vec::with_capacity(chunk * bytes_per_sample);
+
+        for i in 0..chunk {
+            let t = (sample_offset + i as u64) as f64 / sample_rate as f64;
+            let sample = (0.8 * (2.0 * PI * freq * t).sin() * i16::MAX as f64) as i16;
+            payload.extend_from_slice(&sample.to_le_bytes());
+            payload.extend_from_slice(&sample.to_le_bytes());
+        }
+
+        // PTS in controller clock domain — all endpoints adjust via their own clock offset
+        let pts_ns = start_ns + (sample_offset as f64 / sample_rate as f64 * 1e9) as u64;
+        let flags = if sample_offset == 0 {
+            PacketFlags::FIRST_PACKET
+        } else {
+            PacketFlags::empty()
+        };
+
+        zone.send_audio_all(1, format, pts_ns, sample_offset, &payload, flags)
+            .await
+            .unwrap();
+
+        sample_offset += chunk as u64;
+
+        let expected = Duration::from_nanos((sample_offset as f64 / sample_rate as f64 * 1e9) as u64);
+        let elapsed = start.elapsed();
+        if expected > elapsed {
+            tokio::time::sleep(expected - elapsed).await;
+        }
+
+        if sample_offset.is_multiple_of(sample_rate as u64) || sample_offset >= total_samples {
+            let secs = sample_offset / sample_rate as u64;
+            let pct = (sample_offset as f64 / total_samples as f64 * 100.0) as u32;
+            println!("  {secs}s / {duration}s ({pct}%)");
+        }
+    }
+
+    zone.send_audio_all(
+        1, format, start_ns + (duration as f64 * 1e9) as u64,
+        sample_offset, &[], PacketFlags::LAST_PACKET,
+    )
+    .await
+    .unwrap();
+
+    zone.stop_all(stream_id).await.unwrap();
+    println!("\nDone. {sample_offset} samples sent to {n} endpoints in sync.");
+}
+
+fn now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
 }
 
 fn run_discover(timeout: u64) {
