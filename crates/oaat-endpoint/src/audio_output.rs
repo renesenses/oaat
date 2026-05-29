@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleRate, StreamConfig};
@@ -14,6 +14,8 @@ pub struct CpalOutput {
     stream: Option<cpal::Stream>,
     producer: Option<ringbuf::HeapProd<f32>>,
     playing: Arc<AtomicBool>,
+    volume: Arc<AtomicU32>, // 0-1000 (0.0-1.0 * 1000)
+    muted: Arc<AtomicBool>,
     sample_rate: u32,
     channels: u8,
     format: AudioFormat,
@@ -25,6 +27,8 @@ impl CpalOutput {
             stream: None,
             producer: None,
             playing: Arc::new(AtomicBool::new(false)),
+            volume: Arc::new(AtomicU32::new(1000)), // 100%
+            muted: Arc::new(AtomicBool::new(false)),
             sample_rate: 0,
             channels: 0,
             format: AudioFormat::PcmS16le,
@@ -49,9 +53,7 @@ impl CpalOutput {
 
         info!(
             device = device.name().unwrap_or_default(),
-            sample_rate,
-            channels,
-            format = %format,
+            sample_rate, channels, format = %format,
             "configuring audio output"
         );
 
@@ -66,17 +68,22 @@ impl CpalOutput {
         };
 
         let playing = self.playing.clone();
+        let volume = self.volume.clone();
+        let muted = self.muted.clone();
+
         let stream = device.build_output_stream(
             &config,
             move |output: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                if !playing.load(Ordering::Relaxed) {
+                if !playing.load(Ordering::Relaxed) || muted.load(Ordering::Relaxed) {
                     output.fill(0.0);
                     return;
                 }
+                let vol = volume.load(Ordering::Relaxed) as f32 / 1000.0;
                 let read = consumer.pop_slice(output);
-                if read < output.len() {
-                    output[read..].fill(0.0);
+                for sample in &mut output[..read] {
+                    *sample *= vol;
                 }
+                output[read..].fill(0.0);
             },
             move |err| {
                 error!(error = %err, "audio output error");
@@ -111,11 +118,19 @@ impl CpalOutput {
         self.producer = None;
     }
 
+    pub fn set_volume(&self, level: u8) {
+        let scaled = (level as u32 * 1000) / 100;
+        self.volume.store(scaled.min(1000), Ordering::Relaxed);
+    }
+
+    pub fn set_mute(&self, muted: bool) {
+        self.muted.store(muted, Ordering::Relaxed);
+    }
+
     pub fn write_audio(&mut self, data: &[u8]) -> usize {
         let Some(producer) = self.producer.as_mut() else {
             return 0;
         };
-
         let samples = convert_to_f32(self.format, data);
         producer.push_slice(&samples) / self.channels.max(1) as usize
     }

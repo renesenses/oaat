@@ -88,31 +88,31 @@ impl EndpointTransport {
             "endpoint listening"
         );
 
-        let (stream, peer) = tcp_listener.accept().await?;
-        info!(%peer, "controller connected");
+        loop {
+            let (stream, peer) = tcp_listener.accept().await?;
+            info!(%peer, "controller connected");
 
-        let session = EndpointSession {
-            stream,
-            audio_socket,
-            clock_socket,
-            event_tx,
-            endpoint_id: config.endpoint_id,
-            endpoint_name: config.endpoint_name,
-            capabilities: config.capabilities,
-            audio_port: actual_audio_port,
-            clock_port: actual_clock_port,
-            buffer_size_ms: config.buffer_size_ms,
-            current_format: None,
-            current_sample_rate: None,
-        };
+            let session = EndpointSession {
+                stream,
+                audio_socket: audio_socket.clone(),
+                clock_socket: clock_socket.clone(),
+                event_tx: event_tx.clone(),
+                endpoint_id: config.endpoint_id.clone(),
+                endpoint_name: config.endpoint_name.clone(),
+                capabilities: config.capabilities.clone(),
+                audio_port: actual_audio_port,
+                clock_port: actual_clock_port,
+                buffer_size_ms: config.buffer_size_ms,
+                current_format: None,
+                current_sample_rate: None,
+            };
 
-        tokio::spawn(async move {
+            // Run session inline — when it ends, loop back to accept
             if let Err(e) = session.run().await {
-                error!(%peer, error = %e, "session ended with error");
+                warn!(%peer, error = %e, "session ended");
             }
-        });
-
-        Ok(())
+            info!("waiting for next controller connection...");
+        }
     }
 }
 

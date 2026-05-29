@@ -162,6 +162,24 @@ impl Zone {
         Ok(())
     }
 
+    pub async fn set_volume_all(&mut self, level: u8) -> Result<(), OaatError> {
+        for (id, ep) in &mut self.endpoints {
+            if let Err(e) = ep.send_volume(level).await {
+                error!(endpoint = %id, error = %e, "volume set failed");
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn set_mute_all(&mut self, muted: bool) -> Result<(), OaatError> {
+        for (id, ep) in &mut self.endpoints {
+            if let Err(e) = ep.send_mute(muted).await {
+                error!(endpoint = %id, error = %e, "mute failed");
+            }
+        }
+        Ok(())
+    }
+
     /// Run clock sync for all endpoints (steady-state, single exchange each).
     pub async fn clock_sync_all(&mut self) {
         for (id, ep) in &mut self.endpoints {
@@ -172,4 +190,68 @@ impl Zone {
             }
         }
     }
+
+    /// Spawn a background task that runs steady-state clock sync every 2 seconds (RFC §6.3).
+    /// Returns a handle to cancel the task.
+    pub fn start_steady_clock_sync(&mut self) -> Vec<tokio::task::JoinHandle<()>> {
+        let mut handles = Vec::new();
+        for (id, ep) in &mut self.endpoints {
+            let clock_socket = ep.clock_socket.clone();
+            let clock_target = ep.clock_target;
+            let clock_state = ep.clock_state.clone();
+            let ep_id = id.clone();
+
+            let handle = tokio::spawn(async move {
+                let mut seq = 0u16;
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+                loop {
+                    interval.tick().await;
+                    let t1 = now_ns();
+                    let request = oaat_core::wire::ClockSyncPacket {
+                        version: 1,
+                        kind: oaat_core::wire::ClockSyncType::Request,
+                        sequence: seq,
+                        t1,
+                        t2: 0,
+                        t3: 0,
+                    };
+                    let mut buf = [0u8; oaat_core::wire::ClockSyncPacket::SIZE];
+                    request.encode(&mut buf);
+
+                    if clock_socket.send_to(&buf, clock_target).await.is_err() {
+                        break;
+                    }
+
+                    let mut resp_buf = [0u8; oaat_core::wire::ClockSyncPacket::SIZE];
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        clock_socket.recv(&mut resp_buf),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {
+                            let t4 = now_ns();
+                            if let Ok(response) = oaat_core::wire::ClockSyncPacket::decode(&resp_buf) {
+                                let mut state = clock_state.lock().await;
+                                state.update(t1, response.t2, response.t3, t4);
+                            }
+                        }
+                        _ => {
+                            warn!(endpoint = %ep_id, "steady-state clock sync timeout");
+                        }
+                    }
+                    seq = seq.wrapping_add(1);
+                }
+            });
+            handles.push(handle);
+        }
+        handles
+    }
+}
+
+fn now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
 }

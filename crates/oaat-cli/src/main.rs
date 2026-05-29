@@ -263,9 +263,15 @@ async fn run_endpoint(name: String, port: u16) {
                 }
             }
             EndpointEvent::Volume(cmd) => match cmd {
-                VolumeCommand::Set(level) => println!("Volume: {level}"),
+                VolumeCommand::Set(level) => {
+                    audio.set_volume(level);
+                    println!("Volume: {level}%");
+                }
                 VolumeCommand::Get => {}
-                VolumeCommand::Mute(muted) => println!("Mute: {muted}"),
+                VolumeCommand::Mute(muted) => {
+                    audio.set_mute(muted);
+                    println!("Mute: {muted}");
+                }
             },
             EndpointEvent::Disconnected => {
                 audio.stop();

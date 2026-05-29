@@ -33,9 +33,9 @@ pub struct ConnectedEndpoint {
     pub info: HelloAck,
     pub audio_socket: Arc<UdpSocket>,
     pub audio_target: SocketAddr,
-    clock_socket: Arc<UdpSocket>,
-    clock_target: SocketAddr,
-    clock_state: Arc<Mutex<ClockState>>,
+    pub(crate) clock_socket: Arc<UdpSocket>,
+    pub(crate) clock_target: SocketAddr,
+    pub(crate) clock_state: Arc<Mutex<ClockState>>,
     sequence: u16,
     pub response_rx: mpsc::Receiver<EndpointResponse>,
 }
@@ -263,6 +263,15 @@ impl ConnectedEndpoint {
     pub async fn send_metadata(&mut self, track: TrackMetadata) -> Result<(), OaatError> {
         self.send_message(&Message::Metadata(Metadata { track }))
             .await
+    }
+
+    pub async fn send_volume(&mut self, level: u8) -> Result<(), OaatError> {
+        self.send_message(&Message::VolumeSet(VolumeSet { level }))
+            .await
+    }
+
+    pub async fn send_mute(&mut self, muted: bool) -> Result<(), OaatError> {
+        self.send_message(&Message::Mute(Mute { muted })).await
     }
 
     /// Inform the endpoint about the next track's format so it can decide
