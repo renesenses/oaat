@@ -1,0 +1,20 @@
+[package]
+name = "oaat-test"
+description = "OAAT protocol conformance test tool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "oaat-test"
+path = "src/main.rs"
+
+[dependencies]
+oaat-core = { workspace = true }
+oaat-controller = { path = "../oaat-controller" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }

@@ -38,6 +38,13 @@ pub struct ConnectedEndpoint {
     pub(crate) clock_state: Arc<Mutex<ClockState>>,
     sequence: u16,
     pub response_rx: mpsc::Receiver<EndpointResponse>,
+    reader_task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ConnectedEndpoint {
+    fn drop(&mut self) {
+        self.reader_task.abort();
+    }
 }
 
 impl ConnectedEndpoint {
@@ -99,8 +106,7 @@ impl ConnectedEndpoint {
         // Channel for forwarding format negotiation responses to the caller
         let (response_tx, response_rx) = mpsc::channel::<EndpointResponse>(32);
 
-        // Spawn reader task for control messages (responses, errors, etc.)
-        tokio::spawn(async move {
+        let reader_task = tokio::spawn(async move {
             let mut buf = [0u8; 8192];
             loop {
                 match reader.read(&mut buf).await {
@@ -186,6 +192,7 @@ impl ConnectedEndpoint {
             clock_state: Arc::new(Mutex::new(ClockState::new())),
             sequence: 0,
             response_rx,
+            reader_task,
         })
     }
 

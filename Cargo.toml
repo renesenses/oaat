@@ -5,6 +5,7 @@ members = [
     "crates/oaat-endpoint",
     "crates/oaat-controller",
     "crates/oaat-cli",
+    "crates/oaat-test",
     "tests",
 ]
 
