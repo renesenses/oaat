@@ -1,0 +1,14 @@
+[endpoint]
+name = "Audiophonics ESS 9038"
+port = 9740
+# audio_device = "default"
+
+[capabilities]
+pcm_max_rate = 384000
+pcm_max_bits = 32
+channels_max = 2
+dsd = false
+flac = true
+
+[logging]
+level = "info"
