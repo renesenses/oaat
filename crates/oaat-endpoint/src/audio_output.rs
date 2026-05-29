@@ -3,7 +3,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleRate, StreamConfig};
-use ringbuf::{HeapRb, traits::{Consumer, Observer, Producer, Split}};
+use ringbuf::{
+    HeapRb,
+    traits::{Consumer, Observer, Producer, Split},
+};
 use tracing::{error, info, warn};
 
 use oaat_core::format::AudioFormat;
@@ -58,9 +61,6 @@ impl CpalOutput {
         );
 
         let ring_size = RING_BUFFER_FRAMES * channels as usize;
-        let rb = HeapRb::<f32>::new(ring_size);
-        let (producer, mut consumer) = rb.split();
-
         let config = StreamConfig {
             channels: channels as u16,
             sample_rate: SampleRate(sample_rate),
@@ -71,25 +71,61 @@ impl CpalOutput {
         let volume = self.volume.clone();
         let muted = self.muted.clone();
 
-        let stream = device.build_output_stream(
-            &config,
-            move |output: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                if !playing.load(Ordering::Relaxed) || muted.load(Ordering::Relaxed) {
-                    output.fill(0.0);
-                    return;
-                }
-                let vol = volume.load(Ordering::Relaxed) as f32 / 1000.0;
-                let read = consumer.pop_slice(output);
-                for sample in &mut output[..read] {
-                    *sample *= vol;
-                }
-                output[read..].fill(0.0);
-            },
-            move |err| {
-                error!(error = %err, "audio output error");
-            },
-            None,
-        )?;
+        // Check if device supports f32 natively, otherwise use i32 (hardware DACs)
+        let supports_f32 = device
+            .supported_output_configs()
+            .map(|cfgs| {
+                cfgs.into_iter()
+                    .any(|c| c.sample_format() == cpal::SampleFormat::F32)
+            })
+            .unwrap_or(false);
+
+        let rb = HeapRb::<f32>::new(ring_size);
+        let (producer, mut consumer) = rb.split();
+
+        let stream = if supports_f32 {
+            info!("opening audio output (f32)");
+            device.build_output_stream(
+                &config,
+                move |output: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    if !playing.load(Ordering::Relaxed) || muted.load(Ordering::Relaxed) {
+                        output.fill(0.0);
+                        return;
+                    }
+                    let vol = volume.load(Ordering::Relaxed) as f32 / 1000.0;
+                    let read = consumer.pop_slice(output);
+                    for sample in &mut output[..read] {
+                        *sample *= vol;
+                    }
+                    output[read..].fill(0.0);
+                },
+                |err| error!(error = %err, "audio output error"),
+                None,
+            )?
+        } else {
+            info!("opening audio output (i32/S32_LE)");
+            device.build_output_stream(
+                &config,
+                move |output: &mut [i32], _: &cpal::OutputCallbackInfo| {
+                    if !playing.load(Ordering::Relaxed) || muted.load(Ordering::Relaxed) {
+                        output.fill(0);
+                        return;
+                    }
+                    let vol = volume.load(Ordering::Relaxed) as f32 / 1000.0;
+                    let mut tmp = vec![0.0f32; output.len()];
+                    let read = consumer.pop_slice(&mut tmp);
+                    for (i, sample) in output.iter_mut().enumerate() {
+                        if i < read {
+                            *sample = (tmp[i] * vol * i32::MAX as f32) as i32;
+                        } else {
+                            *sample = 0;
+                        }
+                    }
+                },
+                |err| error!(error = %err, "audio output error"),
+                None,
+            )?
+        };
 
         self.stream = Some(stream);
         self.producer = Some(producer);
