@@ -10,7 +10,7 @@ Type=simple
 User=bertrand
 PermissionsStartOnly=true
 ExecStartPre=/bin/bash -c "mkdir -p /run/user/1000 && chown bertrand:bertrand /run/user/1000"
-ExecStart=/usr/bin/cage -s -- /usr/bin/cog --platform=wl http://192.168.1.15:8888
+ExecStart=/usr/bin/cage -s -- /usr/bin/cog --platform=wl http://192.168.1.15:8888/?kiosk=true
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=WLR_LIBINPUT_NO_DEVICES=1
 Restart=always

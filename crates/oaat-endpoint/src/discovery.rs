@@ -1,7 +1,8 @@
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use oaat_core::capability::Capabilities;
 use oaat_core::{DEFAULT_CONTROL_PORT, PROTOCOL_VERSION, SERVICE_TYPE};
-use tracing::info;
+use std::net::Ipv4Addr;
+use tracing::{info, warn};
 
 pub struct EndpointAnnouncement {
     pub instance_name: String,
@@ -13,6 +14,21 @@ pub struct EndpointAnnouncement {
     pub model: Option<String>,
     pub vendor: Option<String>,
     pub firmware: Option<String>,
+}
+
+fn detect_local_ip() -> Ipv4Addr {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok();
+    if let Some(sock) = sock {
+        if sock.connect("8.8.8.8:53").is_ok() {
+            if let Ok(addr) = sock.local_addr() {
+                if let std::net::IpAddr::V4(v4) = addr.ip() {
+                    return v4;
+                }
+            }
+        }
+    }
+    warn!("could not detect local IP, falling back to 0.0.0.0");
+    Ipv4Addr::UNSPECIFIED
 }
 
 impl EndpointAnnouncement {
@@ -55,19 +71,24 @@ impl EndpointAnnouncement {
             props.push(("fw", fw));
         }
 
+        let local_ip = detect_local_ip();
+        let ip_str = local_ip.to_string();
+
         let service = ServiceInfo::new(
             &service_type,
             &self.instance_name,
             &hostname,
-            "",
+            &ip_str,
             self.port,
             &props[..],
-        )?;
+        )?
+        .enable_addr_auto();
 
         mdns.register(service)?;
         info!(
             name = %self.instance_name,
             port = self.port,
+            ip = %local_ip,
             service_type = SERVICE_TYPE,
             "mDNS service registered"
         );
