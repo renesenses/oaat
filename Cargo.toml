@@ -21,7 +21,7 @@ keywords = ["audio", "streaming", "multiroom", "hifi", "protocol"]
 categories = ["multimedia::audio", "network-programming"]
 
 [workspace.dependencies]
-oaat-core = { path = "crates/oaat-core" }
+oaat-core = { version = "0.1", path = "crates/oaat-core" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
