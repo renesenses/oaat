@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/renesenses/oaat"
@@ -21,7 +21,7 @@ keywords = ["audio", "streaming", "multiroom", "hifi", "protocol"]
 categories = ["multimedia::audio", "network-programming"]
 
 [workspace.dependencies]
-oaat-core = { version = "0.1", path = "crates/oaat-core" }
+oaat-core = { version = "0.1.1", path = "crates/oaat-core" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

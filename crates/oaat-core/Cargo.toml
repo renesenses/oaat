@@ -25,5 +25,5 @@ rcgen = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 
 [features]
-default = ["tls"]
+default = []
 tls = ["dep:rustls", "dep:rcgen", "dep:sha2"]

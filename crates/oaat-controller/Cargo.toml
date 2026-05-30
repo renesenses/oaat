@@ -22,5 +22,5 @@ tokio-rustls = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 
 [features]
-default = ["tls"]
+default = []
 tls = ["dep:tokio-rustls", "dep:rustls", "oaat-core/tls"]
