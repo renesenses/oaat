@@ -27,6 +27,7 @@ use tracing::info;
 pub struct EndpointFileConfig {
     pub endpoint: EndpointSection,
     pub capabilities: CapabilitiesSection,
+    pub dac: DacSection,
     pub logging: LoggingSection,
 }
 
@@ -75,6 +76,29 @@ impl Default for CapabilitiesSection {
             channels_max: 2,
             dsd: false,
             flac: false,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct DacSection {
+    /// Use ALSA hardware volume control instead of software volume.
+    pub hardware_volume: bool,
+    /// ALSA card number for mixer commands.
+    pub card: u32,
+    /// FIR filter type (ESS 9038 DACs).
+    /// Options: "brick wall", "corrected minimum phase fast", "minimum phase slow",
+    ///          "minimum phase fast", "linear phase slow", "linear phase fast", "apodizing fast"
+    pub fir_filter: Option<String>,
+}
+
+impl Default for DacSection {
+    fn default() -> Self {
+        Self {
+            hardware_volume: false,
+            card: 0,
+            fir_filter: None,
         }
     }
 }

@@ -1,0 +1,17 @@
+[Unit]
+Description=Tune Now Playing Display
+After=network-online.target oaat-endpoint.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/python3 /opt/oaat/tune-display.py
+Environment=TUNE_SERVER=http://192.168.1.15:8888
+Environment=POLL_INTERVAL=2
+Environment=FB_DEVICE=/dev/fb0
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -130,6 +130,7 @@ async fn main() {
                 daemon,
                 ep_tls,
                 &file_config.capabilities,
+                &file_config.dac,
             )
             .await
         }
@@ -163,6 +164,7 @@ async fn run_endpoint(
     daemon: bool,
     tls: bool,
     caps_config: &config::CapabilitiesSection,
+    dac_config: &config::DacSection,
 ) {
     let endpoint_id = uuid::Uuid::new_v4().to_string();
     let control_addr: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
@@ -219,7 +221,7 @@ async fn run_endpoint(
         endpoint_id: endpoint_id.clone(),
         capabilities: mdns_caps,
         channels_max: caps_config.channels_max,
-        volume_type: Some("sw".into()),
+        volume_type: Some(if dac_config.hardware_volume { "hw" } else { "sw" }.into()),
         model: None,
         vendor: Some("MozAIk Labs".into()),
         firmware: Some(env!("CARGO_PKG_VERSION").into()),
@@ -259,6 +261,18 @@ async fn run_endpoint(
     let mut audio = CpalOutput::new();
     let mut packet_count: u64 = 0;
     let mut total_bytes: u64 = 0;
+
+    // Initialize hardware DAC mixer (Linux only)
+    #[cfg(target_os = "linux")]
+    let alsa_mixer = if dac_config.hardware_volume {
+        let mixer = oaat_endpoint::AlsaMixer::new(dac_config.card);
+        mixer.init(dac_config.fir_filter.as_deref());
+        Some(mixer)
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "linux"))]
+    let alsa_mixer: Option<()> = None;
 
     // Graceful shutdown: listen for SIGTERM/SIGINT
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -432,15 +446,29 @@ async fn run_endpoint(
                     }
                     EndpointEvent::Volume(cmd) => match cmd {
                         VolumeCommand::Set(level) => {
+                            #[cfg(target_os = "linux")]
+                            if let Some(ref mixer) = alsa_mixer {
+                                mixer.set_volume(level);
+                            } else {
+                                audio.set_volume(level);
+                            }
+                            #[cfg(not(target_os = "linux"))]
                             audio.set_volume(level);
                             if daemon {
-                                info!(level, "volume set");
+                                info!(level, hw = alsa_mixer.is_some(), "volume set");
                             } else {
                                 println!("Volume: {level}%");
                             }
                         }
                         VolumeCommand::Get => {}
                         VolumeCommand::Mute(muted) => {
+                            #[cfg(target_os = "linux")]
+                            if let Some(ref mixer) = alsa_mixer {
+                                mixer.set_mute(muted);
+                            } else {
+                                audio.set_mute(muted);
+                            }
+                            #[cfg(not(target_os = "linux"))]
                             audio.set_mute(muted);
                             if daemon {
                                 info!(muted, "mute toggled");
@@ -759,8 +787,6 @@ async fn run_controller(
 }
 
 async fn run_controller_file(name: String, target: Option<SocketAddr>, path: &str, tls: bool) {
-    use std::io::Read;
-
     let file_data = std::fs::read(path).unwrap_or_else(|e| {
         eprintln!("Cannot read {path}: {e}");
         std::process::exit(1);
