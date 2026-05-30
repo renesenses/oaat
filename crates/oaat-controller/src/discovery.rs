@@ -1,4 +1,4 @@
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
 use oaat_core::capability::Capabilities;
 use oaat_core::{CTRL_SERVICE_TYPE, PROTOCOL_VERSION, SERVICE_TYPE};
 use std::net::SocketAddr;
@@ -86,8 +86,8 @@ impl ControllerDiscovery {
         endpoints
     }
 
-    fn parse_endpoint(info: &ServiceInfo) -> Option<DiscoveredEndpoint> {
-        let ip = *info.get_addresses().iter().next()?;
+    fn parse_endpoint(info: &ResolvedService) -> Option<DiscoveredEndpoint> {
+        let ip = *info.get_addresses_v4().iter().next()?;
         let port = info.get_port();
         let props = info.get_properties();
 
@@ -109,7 +109,7 @@ impl ControllerDiscovery {
         Some(DiscoveredEndpoint {
             name,
             endpoint_id,
-            addr: SocketAddr::new(ip, port),
+            addr: SocketAddr::new(std::net::IpAddr::V4(ip), port),
             capabilities: caps,
             channels_max,
             model,

@@ -29,7 +29,7 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zerocopy = { version = "0.8", features = ["derive"] }
-mdns-sd = "0.12"
+mdns-sd = "0.20"
 cpal = "0.15"
 ringbuf = "0.4"
 uuid = { version = "1", features = ["v4", "serde"] }
