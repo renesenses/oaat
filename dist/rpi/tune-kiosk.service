@@ -1,0 +1,20 @@
+[Unit]
+Description=Tune Web UI Kiosk (cage + cog)
+After=network-online.target seatd.service
+Wants=network-online.target
+Requires=seatd.service
+Conflicts=tune-display.service
+
+[Service]
+Type=simple
+User=bertrand
+PermissionsStartOnly=true
+ExecStartPre=/bin/bash -c "mkdir -p /run/user/1000 && chown bertrand:bertrand /run/user/1000"
+ExecStart=/usr/bin/cage -s -- /usr/bin/cog --platform=wl http://192.168.1.15:8888
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=WLR_LIBINPUT_NO_DEVICES=1
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
