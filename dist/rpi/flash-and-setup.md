@@ -1,37 +1,42 @@
-# Flash Raspberry Pi 4 pour OAAT + Audiophonics ESS 9038
+# Flash Raspberry Pi pour OAAT
 
-## 1. Télécharger Raspberry Pi Imager
+Guide rapide pour préparer une carte SD depuis zéro.
 
-Si pas déjà installé :
+## 1. Installer Raspberry Pi Imager
+
 ```bash
+# macOS
 brew install --cask raspberry-pi-imager
+
+# Linux
+sudo apt install rpi-imager
 ```
+
+Ou télécharger depuis https://www.raspberrypi.com/software/
 
 ## 2. Flasher la carte SD
 
 1. Ouvrir **Raspberry Pi Imager**
-2. Choisir l'OS : **Raspberry Pi OS Lite (64-bit)** (pas Desktop, on n'a pas besoin de GUI)
-3. Choisir la carte SD
-4. **Cliquer sur l'engrenage** (settings) avant de flasher :
+2. Choisir l'appareil : **Raspberry Pi 3** ou **Raspberry Pi 4**
+3. Choisir l'OS : `Raspberry Pi OS (other)` → **Raspberry Pi OS Lite (64-bit)**
+4. Choisir la carte SD
+5. Cliquer sur l'engrenage (paramètres) :
    - Hostname : `oaat-endpoint`
-   - Enable SSH : **oui**, mot de passe
-   - Username : `bertrand`
-   - Password : `FSJhdbcy`
-   - WiFi : configurer si pas en Ethernet
-   - Locale : Europe/Paris, clavier FR
-5. Flasher
+   - Activer SSH : oui, avec mot de passe
+   - Nom d'utilisateur / mot de passe : à votre choix
+   - WiFi : configurer si pas d'Ethernet
+   - Fuseau horaire : `Europe/Paris`
+6. Flasher
 
 ## 3. Premier boot
 
 1. Insérer la SD dans le Pi
-2. Brancher Ethernet + alimentation
-3. Attendre 1-2 minutes
-4. Depuis le Mac :
+2. Brancher le DAC HAT sur le GPIO
+3. Brancher Ethernet + alimentation
+4. Attendre 1-2 minutes
 
 ```bash
-ssh bertrand@oaat-endpoint.local
-# ou
-ssh bertrand@192.168.1.42
+ssh <user>@oaat-endpoint.local
 ```
 
 ## 4. Installer OAAT
@@ -40,7 +45,7 @@ ssh bertrand@192.168.1.42
 curl -sL https://raw.githubusercontent.com/renesenses/oaat/main/dist/rpi/setup.sh | sudo bash
 ```
 
-## 5. Reboot (pour activer le DAC)
+## 5. Reboot
 
 ```bash
 sudo reboot
@@ -49,11 +54,15 @@ sudo reboot
 ## 6. Vérifier
 
 ```bash
-# Depuis le Pi
-aplay -l                    # Le DAC doit apparaître
-speaker-test -D hw:0 -c 2  # Test son direct
+# Sur le Pi
+aplay -l
+speaker-test -D hw:0,0 -c 2 -t sine -f 440
 
-# Depuis le Mac
-oaat-test 192.168.1.42:9740         # 20 tests de conformité
-oaat controller --target 192.168.1.42:9740 --freq 440 --duration 5  # Sinusoïde !
+# Depuis un autre appareil
+oaat-test <ip-du-pi>:9740
+oaat controller --target <ip-du-pi>:9740 --freq 440 --duration 5
 ```
+
+## Guide complet
+
+Voir [docs/howto-rpi-endpoint.md](../../docs/howto-rpi-endpoint.md) pour le guide détaillé avec configuration, troubleshooting et multi-room.

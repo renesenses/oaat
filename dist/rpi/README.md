@@ -1,74 +1,48 @@
-# OAAT Endpoint — Raspberry Pi 4 + Audiophonics ESS 9038Q2M
+# OAAT Endpoint — Raspberry Pi
+
+Setup scripts for running an OAAT audio endpoint on Raspberry Pi 3B+, 4, or 5 with an I2S DAC HAT.
 
 ## Quick setup
 
 ```bash
-# SSH into the Pi
-ssh pi@<pi-ip>
-
-# Download and run setup
+ssh pi@oaat-endpoint.local
 curl -sL https://raw.githubusercontent.com/renesenses/oaat/main/dist/rpi/setup.sh | sudo bash
 ```
 
-## What the setup does
+The script prompts for your DAC model and handles everything automatically.
 
-1. Installs ALSA + build tools
-2. Configures `hifiberry-dacplus` overlay for the ESS 9038 I2S DAC
-3. Sets ALSA default to hw:0,0 with S32_LE format
-4. Installs Rust and builds oaat from source
-5. Creates `/opt/oaat/` with binary + config
-6. Installs + enables systemd service
+## Supported DACs
 
-## Manual steps
+| DAC | Overlay | PCM max |
+|-----|---------|---------|
+| Audiophonics ESS 9038Q2M | `i-sabre-q2m` | 384 kHz / 32 bits |
+| HifiBerry DAC+ / DAC+ Pro | `hifiberry-dacplus` | 192 kHz / 32 bits |
+| HifiBerry DAC2 HD | `hifiberry-dacplushd` | 192 kHz / 24 bits |
+| Allo Boss | `allo-boss-dac-pcm512x-audio` | 384 kHz / 32 bits |
+| IQaudio DAC+ | `iqaudio-dacplus` | 192 kHz / 24 bits |
+| JustBoom DAC HAT | `justboom-dac` | 384 kHz / 32 bits |
 
-After setup, if the DAC overlay was just added:
-```bash
-sudo reboot
-# After reboot:
-sudo systemctl start oaat-endpoint
-```
-
-## Verify
+## Non-interactive install
 
 ```bash
-# Check service
-sudo systemctl status oaat-endpoint
-
-# Check DAC is detected
-aplay -l
-
-# Test audio directly
-speaker-test -D hw:0,0 -c 2 -t sine -f 440
-
-# Run conformance test from another machine
-oaat-test <pi-ip>:9740
+sudo bash setup.sh --dac ess9038
 ```
 
-## Config
+## Full guide (FR)
 
-Edit `/opt/oaat/endpoint.toml`:
-```toml
-[endpoint]
-name = "Audiophonics ESS 9038"
-port = 9740
+See [docs/howto-rpi-endpoint.md](../../docs/howto-rpi-endpoint.md) for the complete step-by-step guide in French, including manual installation, configuration reference, troubleshooting, and multi-room setup.
 
-[capabilities]
-pcm_max_rate = 384000   # ESS9038 supports up to 384kHz
-pcm_max_bits = 32       # 32-bit capable
-channels_max = 2
-flac = true
+## Files
+
+- `setup.sh` — Automated setup script (interactive DAC selection)
+- `endpoint.toml` — Default endpoint config (Audiophonics ESS 9038)
+
+## After setup
+
+```bash
+sudo reboot                              # Activate DAC overlay
+sudo systemctl status oaat-endpoint      # Check service
+aplay -l                                 # Verify DAC detection
+speaker-test -D hw:0,0 -c 2 -t sine     # Test audio directly
+oaat-test <pi-ip>:9740                   # Conformance test (from another machine)
 ```
-
-## Troubleshooting
-
-**No sound?**
-- `aplay -l` — verify DAC is listed as card 0
-- `cat /proc/asound/cards` — check ALSA cards
-- Check `/boot/firmware/config.txt` has `dtoverlay=hifiberry-dacplus`
-
-**Service won't start?**
-- `journalctl -u oaat-endpoint -f` — check logs
-- Verify ALSA works: `speaker-test -D hw:0,0 -c 2`
-
-**Wrong DAC overlay?**
-Some Audiophonics boards need `dtoverlay=allo-boss-dac-pcm512x-audio` or `dtoverlay=es9038q2m`. Try these if hifiberry-dacplus doesn't work.
