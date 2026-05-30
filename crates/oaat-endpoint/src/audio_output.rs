@@ -25,6 +25,18 @@ pub struct CpalOutput {
 }
 
 impl CpalOutput {
+    pub fn list_devices() -> Vec<String> {
+        let host = cpal::default_host();
+        host.output_devices()
+            .map(|devs| devs.filter_map(|d| d.name().ok()).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn default_device_name() -> Option<String> {
+        let host = cpal::default_host();
+        host.default_output_device().and_then(|d| d.name().ok())
+    }
+
     pub fn new() -> Self {
         Self {
             stream: None,

@@ -195,6 +195,19 @@ async fn run_endpoint(
     let audio_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
     let clock_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
 
+    // List available audio output devices at startup for diagnostics
+    {
+        let devices = CpalOutput::list_devices();
+        for (i, dname) in devices.iter().enumerate() {
+            info!(index = i, device = %dname, "audio_device_available");
+        }
+        let default_name = CpalOutput::default_device_name().unwrap_or_else(|| "(none)".into());
+        info!(default = %default_name, "audio_device_default");
+        if let Some(ref pref) = audio_device {
+            info!(preferred = %pref, "audio_device_configured");
+        }
+    }
+
     // Build capabilities from config
     let mut formats = vec![
         AudioFormat::PcmS16le,
