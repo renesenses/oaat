@@ -157,6 +157,30 @@ async fn main() {
     }
 }
 
+fn load_or_create_endpoint_id(name: &str) -> String {
+    let slug: String = name
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '_' })
+        .collect();
+    let id_file = std::path::PathBuf::from(format!("/var/tmp/oaat-{slug}.id"));
+
+    if let Ok(id) = std::fs::read_to_string(&id_file) {
+        let id = id.trim().to_string();
+        if !id.is_empty() {
+            tracing::info!(id = %id, path = %id_file.display(), "loaded persistent endpoint ID");
+            return id;
+        }
+    }
+
+    let id = uuid::Uuid::new_v4().to_string();
+    if let Err(e) = std::fs::write(&id_file, &id) {
+        tracing::warn!(error = %e, path = %id_file.display(), "could not persist endpoint ID");
+    } else {
+        tracing::info!(id = %id, path = %id_file.display(), "created persistent endpoint ID");
+    }
+    id
+}
+
 async fn run_endpoint(
     name: String,
     port: u16,
@@ -166,7 +190,7 @@ async fn run_endpoint(
     caps_config: &config::CapabilitiesSection,
     dac_config: &config::DacSection,
 ) {
-    let endpoint_id = uuid::Uuid::new_v4().to_string();
+    let endpoint_id = load_or_create_endpoint_id(&name);
     let control_addr: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
     let audio_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
     let clock_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
