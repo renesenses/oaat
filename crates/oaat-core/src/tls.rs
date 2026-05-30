@@ -18,10 +18,8 @@ fn ensure_crypto_provider() {
 /// Generate a self-signed certificate for use by an OAAT endpoint.
 ///
 /// Returns `(ServerConfig, certificate DER bytes, SHA-256 hex fingerprint)`.
-pub fn generate_self_signed_cert() -> Result<
-    (rustls::ServerConfig, Vec<u8>, String),
-    Box<dyn std::error::Error + Send + Sync>,
-> {
+pub fn generate_self_signed_cert()
+-> Result<(rustls::ServerConfig, Vec<u8>, String), Box<dyn std::error::Error + Send + Sync>> {
     ensure_crypto_provider();
     let mut params = CertificateParams::new(vec!["oaat-endpoint".into()])?;
     params.distinguished_name.push(

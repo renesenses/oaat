@@ -14,9 +14,9 @@ use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
+use oaat_core::Message;
 use oaat_core::format::AudioFormat;
 use oaat_core::message::EndpointCapabilities;
-use oaat_core::Message;
 use oaat_endpoint::transport::{EndpointConfig, EndpointEvent, EndpointTransport};
 
 // ---------------------------------------------------------------------------
@@ -244,10 +244,7 @@ fn none_event() -> OaatEvent {
 /// # Safety
 /// `name` must be a valid null-terminated C string.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn oaat_endpoint_new(
-    name: *const c_char,
-    port: u16,
-) -> *mut OaatEndpoint {
+pub unsafe extern "C" fn oaat_endpoint_new(name: *const c_char, port: u16) -> *mut OaatEndpoint {
     if name.is_null() {
         return std::ptr::null_mut();
     }
@@ -392,7 +389,8 @@ fn convert_event(ep: &OaatEndpoint, event: EndpointEvent) -> OaatEvent {
             controller_id,
             controller_name,
         } => {
-            ep.status.store(OaatStatus::Connected as u8, Ordering::Relaxed);
+            ep.status
+                .store(OaatStatus::Connected as u8, Ordering::Relaxed);
             OaatEvent {
                 event_type: OaatEventType::Connected,
                 data: OaatEventData {
@@ -425,7 +423,8 @@ fn convert_event(ep: &OaatEndpoint, event: EndpointEvent) -> OaatEvent {
         }
 
         EndpointEvent::FormatAccepted { stream_id } => {
-            ep.status.store(OaatStatus::Streaming as u8, Ordering::Relaxed);
+            ep.status
+                .store(OaatStatus::Streaming as u8, Ordering::Relaxed);
             OaatEvent {
                 event_type: OaatEventType::FormatAccepted,
                 data: OaatEventData {
@@ -487,7 +486,8 @@ fn convert_event(ep: &OaatEndpoint, event: EndpointEvent) -> OaatEvent {
             use oaat_endpoint::transport::PlaybackCommand;
             let (event_type, stream_id) = match &cmd {
                 PlaybackCommand::Play(s) => {
-                    ep.status.store(OaatStatus::Streaming as u8, Ordering::Relaxed);
+                    ep.status
+                        .store(OaatStatus::Streaming as u8, Ordering::Relaxed);
                     (OaatEventType::Play, s.as_str())
                 }
                 PlaybackCommand::Pause(s) => {
@@ -495,7 +495,8 @@ fn convert_event(ep: &OaatEndpoint, event: EndpointEvent) -> OaatEvent {
                     (OaatEventType::Pause, s.as_str())
                 }
                 PlaybackCommand::Stop(s) => {
-                    ep.status.store(OaatStatus::Connected as u8, Ordering::Relaxed);
+                    ep.status
+                        .store(OaatStatus::Connected as u8, Ordering::Relaxed);
                     (OaatEventType::Stop, s.as_str())
                 }
                 PlaybackCommand::Seek(s, _) => (OaatEventType::Play, s.as_str()),
@@ -546,10 +547,7 @@ fn convert_event(ep: &OaatEndpoint, event: EndpointEvent) -> OaatEvent {
                 VolumeCommand::Mute(muted) => OaatEvent {
                     event_type: OaatEventType::VolumeMute,
                     data: OaatEventData {
-                        volume: std::mem::ManuallyDrop::new(OaatVolumeData {
-                            level: 0,
-                            muted,
-                        }),
+                        volume: std::mem::ManuallyDrop::new(OaatVolumeData { level: 0, muted }),
                     },
                 },
             }

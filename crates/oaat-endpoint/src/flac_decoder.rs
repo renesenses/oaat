@@ -1,7 +1,7 @@
 use std::io::Cursor;
 
 use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_FLAC};
+use symphonia::core::codecs::{CODEC_TYPE_FLAC, DecoderOptions};
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;

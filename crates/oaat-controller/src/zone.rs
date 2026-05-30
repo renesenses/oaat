@@ -6,7 +6,9 @@ use tracing::{error, info, warn};
 use oaat_core::format::AudioFormat;
 use oaat_core::message::TrackMetadata;
 use oaat_core::wire::PacketFlags;
-use oaat_core::{ChannelLayout, OaatError, DEFAULT_MULTIROOM_PLAY_DELAY_MS, DEFAULT_SINGLE_PLAY_DELAY_MS};
+use oaat_core::{
+    ChannelLayout, DEFAULT_MULTIROOM_PLAY_DELAY_MS, DEFAULT_SINGLE_PLAY_DELAY_MS, OaatError,
+};
 
 use crate::transport::{ConnectedEndpoint, ControllerConfig};
 
@@ -88,7 +90,14 @@ impl Zone {
     ) -> Result<(), OaatError> {
         for (id, ep) in &mut self.endpoints {
             if let Err(e) = ep
-                .propose_format(stream_id, format, sample_rate, channels, channel_layout, bits_per_sample)
+                .propose_format(
+                    stream_id,
+                    format,
+                    sample_rate,
+                    channels,
+                    channel_layout,
+                    bits_per_sample,
+                )
                 .await
             {
                 error!(endpoint = %id, error = %e, "format propose failed");
@@ -231,7 +240,9 @@ impl Zone {
                     {
                         Ok(Ok(_)) => {
                             let t4 = now_ns();
-                            if let Ok(response) = oaat_core::wire::ClockSyncPacket::decode(&resp_buf) {
+                            if let Ok(response) =
+                                oaat_core::wire::ClockSyncPacket::decode(&resp_buf)
+                            {
                                 let mut state = clock_state.lock().await;
                                 state.update(t1, response.t2, response.t3, t4);
                             }

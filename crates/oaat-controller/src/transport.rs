@@ -2,13 +2,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, error, info};
 
 use oaat_core::clock::ClockState;
 use oaat_core::codec::FrameCodec;
 use oaat_core::message::*;
-use oaat_core::wire::{AudioPacketHeader, ClockSyncPacket, ClockSyncType, AUDIO_HEADER_SIZE};
+use oaat_core::wire::{AUDIO_HEADER_SIZE, AudioPacketHeader, ClockSyncPacket, ClockSyncType};
 use oaat_core::{Message, OaatError, PROTOCOL_VERSION};
 
 pub struct ControllerConfig {
@@ -61,16 +61,19 @@ impl ConnectedEndpoint {
             let tls_config = oaat_core::tls::make_client_config_tofu();
             let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
             let server_name = rustls::pki_types::ServerName::try_from("oaat-endpoint")
-                .map_err(|e| OaatError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("invalid server name: {e}"),
-                )))?
+                .map_err(|e| {
+                    OaatError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("invalid server name: {e}"),
+                    ))
+                })?
                 .to_owned();
-            let tls_stream = connector.connect(server_name, stream).await
-                .map_err(|e| OaatError::Io(std::io::Error::new(
+            let tls_stream = connector.connect(server_name, stream).await.map_err(|e| {
+                OaatError::Io(std::io::Error::new(
                     std::io::ErrorKind::ConnectionRefused,
                     format!("TLS handshake failed: {e}"),
-                )))?;
+                ))
+            })?;
 
             // Log the endpoint certificate fingerprint
             let (_, server_conn) = tls_stream.get_ref();
@@ -160,9 +163,8 @@ impl ConnectedEndpoint {
                             match msg {
                                 Message::FormatAccept(fa) => {
                                     debug!(stream_id = %fa.stream_id, "format accepted");
-                                    let _ = response_tx
-                                        .send(EndpointResponse::FormatAccept(fa))
-                                        .await;
+                                    let _ =
+                                        response_tx.send(EndpointResponse::FormatAccept(fa)).await;
                                 }
                                 Message::FormatCounter(fc) => {
                                     debug!(
@@ -171,9 +173,8 @@ impl ConnectedEndpoint {
                                         bits = fc.bits_per_sample,
                                         "format counter-proposed"
                                     );
-                                    let _ = response_tx
-                                        .send(EndpointResponse::FormatCounter(fc))
-                                        .await;
+                                    let _ =
+                                        response_tx.send(EndpointResponse::FormatCounter(fc)).await;
                                 }
                                 Message::FormatReject(fr) => {
                                     debug!(
@@ -181,9 +182,8 @@ impl ConnectedEndpoint {
                                         reason = %fr.reason,
                                         "format rejected"
                                     );
-                                    let _ = response_tx
-                                        .send(EndpointResponse::FormatReject(fr))
-                                        .await;
+                                    let _ =
+                                        response_tx.send(EndpointResponse::FormatReject(fr)).await;
                                 }
                                 Message::NextTrackReady(ntr) => {
                                     debug!(
@@ -206,10 +206,7 @@ impl ConnectedEndpoint {
                                         .await;
                                 }
                                 other => {
-                                    debug!(
-                                        "received: {:?}",
-                                        std::mem::discriminant(&other)
-                                    );
+                                    debug!("received: {:?}", std::mem::discriminant(&other));
                                 }
                             }
                         }

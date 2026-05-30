@@ -1,22 +1,22 @@
+pub mod capability;
+pub mod clock;
+pub mod codec;
+pub mod error;
 pub mod format;
-pub mod wire;
 pub mod message;
 pub mod session;
-pub mod capability;
-pub mod codec;
-pub mod clock;
-pub mod error;
 #[cfg(feature = "tls")]
 pub mod tls;
+pub mod wire;
 
+pub use capability::Capabilities;
+pub use clock::ClockState;
+pub use codec::FrameCodec;
+pub use error::OaatError;
 pub use format::{AudioFormat, ChannelLayout, DsdRate, SampleRateFamily};
-pub use wire::{AudioPacketHeader, ClockSyncPacket, PacketFlags};
 pub use message::Message;
 pub use session::SessionState;
-pub use capability::Capabilities;
-pub use codec::FrameCodec;
-pub use clock::ClockState;
-pub use error::OaatError;
+pub use wire::{AudioPacketHeader, ClockSyncPacket, PacketFlags};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const DEFAULT_CONTROL_PORT: u16 = 9740;

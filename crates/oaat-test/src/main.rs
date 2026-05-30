@@ -5,9 +5,9 @@ use clap::Parser;
 use tokio::time::timeout;
 
 use oaat_controller::{ConnectedEndpoint, ControllerConfig, EndpointResponse};
+use oaat_core::ChannelLayout;
 use oaat_core::format::AudioFormat;
 use oaat_core::wire::PacketFlags;
-use oaat_core::ChannelLayout;
 
 #[derive(Parser)]
 #[command(name = "oaat-test", about = "OAAT protocol conformance test tool")]
@@ -92,7 +92,12 @@ impl TestRunner {
     }
 
     async fn connect(&self) -> Result<ConnectedEndpoint, String> {
-        match timeout(self.timeout, ConnectedEndpoint::connect(&self.config(), self.target)).await {
+        match timeout(
+            self.timeout,
+            ConnectedEndpoint::connect(&self.config(), self.target),
+        )
+        .await
+        {
             Ok(Ok(ep)) => Ok(ep),
             Ok(Err(e)) => Err(e.to_string()),
             Err(_) => Err("timeout".into()),
@@ -155,7 +160,11 @@ async fn main() {
     let max_rate = ep.info.capabilities.pcm_max_rate;
     let max_bits = ep.info.capabilities.pcm_max_bits;
     let max_ch = ep.info.capabilities.channels_max;
-    let has_s16 = ep.info.capabilities.formats.contains(&AudioFormat::PcmS16le);
+    let has_s16 = ep
+        .info
+        .capabilities
+        .formats
+        .contains(&AudioFormat::PcmS16le);
     let has_opus = ep.info.capabilities.formats.contains(&AudioFormat::Opus);
 
     if max_rate >= 44100 {
@@ -183,9 +192,16 @@ async fn main() {
     println!("\n[Format Negotiation]");
 
     // Accept
-    ep.propose_format("t-accept", AudioFormat::PcmS16le, 44100, 2, ChannelLayout::Stereo, 16)
-        .await
-        .ok();
+    ep.propose_format(
+        "t-accept",
+        AudioFormat::PcmS16le,
+        44100,
+        2,
+        ChannelLayout::Stereo,
+        16,
+    )
+    .await
+    .ok();
     match timeout(runner.timeout, ep.response_rx.recv()).await {
         Ok(Some(EndpointResponse::FormatAccept(fa))) if fa.stream_id == "t-accept" => {
             runner.pass("FormatAccept for PCM_S16LE 44.1kHz");
@@ -196,12 +212,22 @@ async fn main() {
 
     // Counter (rate too high)
     let too_high = (max_rate * 2).max(768000);
-    ep.propose_format("t-counter", AudioFormat::PcmS16le, too_high, 2, ChannelLayout::Stereo, 16)
-        .await
-        .ok();
+    ep.propose_format(
+        "t-counter",
+        AudioFormat::PcmS16le,
+        too_high,
+        2,
+        ChannelLayout::Stereo,
+        16,
+    )
+    .await
+    .ok();
     match timeout(runner.timeout, ep.response_rx.recv()).await {
         Ok(Some(EndpointResponse::FormatCounter(fc))) if fc.sample_rate <= max_rate => {
-            runner.pass(&format!("FormatCounter: {too_high}Hz -> {}Hz", fc.sample_rate));
+            runner.pass(&format!(
+                "FormatCounter: {too_high}Hz -> {}Hz",
+                fc.sample_rate
+            ));
         }
         Ok(Some(EndpointResponse::FormatAccept(_))) => {
             runner.skip("FormatCounter", &format!("accepted {too_high}Hz"));
@@ -251,9 +277,16 @@ async fn main() {
     // === 5. Audio Streaming ===
     println!("\n[Audio Streaming]");
     // Re-propose a format that was accepted earlier
-    ep.propose_format("t-audio", AudioFormat::PcmS16le, 44100, 2, ChannelLayout::Stereo, 16)
-        .await
-        .ok();
+    ep.propose_format(
+        "t-audio",
+        AudioFormat::PcmS16le,
+        44100,
+        2,
+        ChannelLayout::Stereo,
+        16,
+    )
+    .await
+    .ok();
     let _ = timeout(Duration::from_secs(1), ep.response_rx.recv()).await;
 
     ep.send_play("t-audio").await.ok();
@@ -265,7 +298,15 @@ async fn main() {
         } else {
             PacketFlags::empty()
         };
-        if ep.send_audio(1, AudioFormat::PcmS16le, i * 5_000_000, i * 240, &silence, flags)
+        if ep
+            .send_audio(
+                1,
+                AudioFormat::PcmS16le,
+                i * 5_000_000,
+                i * 240,
+                &silence,
+                flags,
+            )
             .await
             .is_ok()
         {
@@ -283,14 +324,28 @@ async fn main() {
     println!("\n[Gapless]");
 
     // Same format
-    ep.propose_format("t-gap", AudioFormat::PcmS16le, 44100, 2, ChannelLayout::Stereo, 16)
-        .await
-        .ok();
+    ep.propose_format(
+        "t-gap",
+        AudioFormat::PcmS16le,
+        44100,
+        2,
+        ChannelLayout::Stereo,
+        16,
+    )
+    .await
+    .ok();
     let _ = timeout(Duration::from_secs(1), ep.response_rx.recv()).await;
 
-    ep.prepare_next_track("t-gap-same", AudioFormat::PcmS16le, 44100, 2, ChannelLayout::Stereo, 16)
-        .await
-        .ok();
+    ep.prepare_next_track(
+        "t-gap-same",
+        AudioFormat::PcmS16le,
+        44100,
+        2,
+        ChannelLayout::Stereo,
+        16,
+    )
+    .await
+    .ok();
     match timeout(runner.timeout, ep.response_rx.recv()).await {
         Ok(Some(EndpointResponse::NextTrackReady(_))) => {
             runner.pass("gapless same format -> NextTrackReady");
@@ -300,9 +355,16 @@ async fn main() {
     }
 
     // Different format
-    ep.prepare_next_track("t-gap-diff", AudioFormat::PcmS16le, 96000, 2, ChannelLayout::Stereo, 16)
-        .await
-        .ok();
+    ep.prepare_next_track(
+        "t-gap-diff",
+        AudioFormat::PcmS16le,
+        96000,
+        2,
+        ChannelLayout::Stereo,
+        16,
+    )
+    .await
+    .ok();
     match timeout(runner.timeout, ep.response_rx.recv()).await {
         Ok(Some(EndpointResponse::NextTrackReformat(ntf))) => {
             runner.pass(&format!(

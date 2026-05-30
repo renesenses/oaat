@@ -100,8 +100,8 @@ impl EndpointFileConfig {
         if let Some(path) = explicit_path {
             let contents = std::fs::read_to_string(path)
                 .map_err(|e| format!("cannot read config {path}: {e}"))?;
-            let config: Self = toml::from_str(&contents)
-                .map_err(|e| format!("invalid config {path}: {e}"))?;
+            let config: Self =
+                toml::from_str(&contents).map_err(|e| format!("invalid config {path}: {e}"))?;
             info!(path, "loaded config");
             return Ok(config);
         }

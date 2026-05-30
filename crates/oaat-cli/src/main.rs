@@ -758,12 +758,7 @@ async fn run_controller(
     );
 }
 
-async fn run_controller_file(
-    name: String,
-    target: Option<SocketAddr>,
-    path: &str,
-    tls: bool,
-) {
+async fn run_controller_file(name: String, target: Option<SocketAddr>, path: &str, tls: bool) {
     use std::io::Read;
 
     let file_data = std::fs::read(path).unwrap_or_else(|e| {
@@ -771,7 +766,8 @@ async fn run_controller_file(
         std::process::exit(1);
     });
 
-    let is_wav = file_data.len() > 44 && &file_data[0..4] == b"RIFF" && &file_data[8..12] == b"WAVE";
+    let is_wav =
+        file_data.len() > 44 && &file_data[0..4] == b"RIFF" && &file_data[8..12] == b"WAVE";
     if !is_wav {
         eprintln!("Only WAV files are supported for now (got: {path})");
         std::process::exit(1);
@@ -779,7 +775,8 @@ async fn run_controller_file(
 
     // Parse WAV header
     let channels = u16::from_le_bytes([file_data[22], file_data[23]]) as u8;
-    let sample_rate = u32::from_le_bytes([file_data[24], file_data[25], file_data[26], file_data[27]]);
+    let sample_rate =
+        u32::from_le_bytes([file_data[24], file_data[25], file_data[26], file_data[27]]);
     let bits_per_sample = u16::from_le_bytes([file_data[34], file_data[35]]) as u8;
 
     // Find data chunk

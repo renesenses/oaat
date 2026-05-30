@@ -108,7 +108,10 @@ mod tests {
             clock.update(1000, 1060, 1065, 1025);
         }
         let offset = clock.offset_ns();
-        assert!((offset - 50).abs() < 2, "offset should converge to ~50, got {offset}");
+        assert!(
+            (offset - 50).abs() < 2,
+            "offset should converge to ~50, got {offset}"
+        );
     }
 
     #[test]

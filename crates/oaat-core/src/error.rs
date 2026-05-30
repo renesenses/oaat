@@ -12,7 +12,10 @@ pub enum OaatError {
     InvalidClockSyncType(u8),
 
     #[error("invalid state transition: {from} -> {to}")]
-    InvalidStateTransition { from: SessionState, to: SessionState },
+    InvalidStateTransition {
+        from: SessionState,
+        to: SessionState,
+    },
 
     #[error("invalid capability string: {0:?}")]
     InvalidCapabilityString(String),

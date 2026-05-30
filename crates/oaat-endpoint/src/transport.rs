@@ -8,7 +8,7 @@ use tracing::{debug, error, info, warn};
 use oaat_core::codec::FrameCodec;
 use oaat_core::format::SampleRateFamily;
 use oaat_core::message::*;
-use oaat_core::wire::{AudioPacketHeader, ClockSyncPacket, ClockSyncType, AUDIO_HEADER_SIZE};
+use oaat_core::wire::{AUDIO_HEADER_SIZE, AudioPacketHeader, ClockSyncPacket, ClockSyncType};
 use oaat_core::{Message, OaatError, PROTOCOL_VERSION};
 
 pub struct EndpointConfig {
@@ -87,10 +87,11 @@ impl EndpointTransport {
         #[cfg(feature = "tls")]
         let tls_acceptor = if config.tls {
             let (server_config, _cert_der, fingerprint) =
-                oaat_core::tls::generate_self_signed_cert()
-                    .map_err(|e| OaatError::Io(
-                        std::io::Error::other(format!("TLS cert generation failed: {e}")),
-                    ))?;
+                oaat_core::tls::generate_self_signed_cert().map_err(|e| {
+                    OaatError::Io(std::io::Error::other(format!(
+                        "TLS cert generation failed: {e}"
+                    )))
+                })?;
             info!(fingerprint = %fingerprint, "TLS enabled, self-signed certificate generated");
             Some(tokio_rustls::TlsAcceptor::from(Arc::new(server_config)))
         } else {
@@ -330,9 +331,7 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
                             _ => {}
                         }
 
-                        let _ = event_tx
-                            .send(EndpointEvent::FormatProposed(fp))
-                            .await;
+                        let _ = event_tx.send(EndpointEvent::FormatProposed(fp)).await;
                     }
                     Message::NextTrackPrepare(ntp) => {
                         let same_format = current_format == Some(ntp.format)
@@ -464,10 +463,7 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
         }
     }
 
-    async fn audio_receive_loop(
-        socket: Arc<UdpSocket>,
-        event_tx: mpsc::Sender<EndpointEvent>,
-    ) {
+    async fn audio_receive_loop(socket: Arc<UdpSocket>, event_tx: mpsc::Sender<EndpointEvent>) {
         let mut buf = vec![0u8; AUDIO_HEADER_SIZE + oaat_core::MAX_AUDIO_PAYLOAD];
         loop {
             let n = match socket.recv(&mut buf).await {
@@ -553,9 +549,7 @@ fn negotiate_format(caps: &EndpointCapabilities, fp: &FormatPropose) -> Message 
                 if requested_rate > max_rate {
                     return Message::FormatReject(FormatReject {
                         stream_id: fp.stream_id.clone(),
-                        reason: format!(
-                            "DSD rate {requested_rate}x exceeds max {max_rate}x"
-                        ),
+                        reason: format!("DSD rate {requested_rate}x exceeds max {max_rate}x"),
                     });
                 }
             }

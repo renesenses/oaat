@@ -1,6 +1,6 @@
-use oaat_core::session::SessionState;
-use oaat_core::message::{Message, HelloAck, EndpointCapabilities};
 use oaat_core::error::OaatError;
+use oaat_core::message::{EndpointCapabilities, HelloAck, Message};
+use oaat_core::session::SessionState;
 
 pub struct EndpointSession {
     pub state: SessionState,
@@ -26,7 +26,14 @@ impl EndpointSession {
         Ok(())
     }
 
-    pub fn handle_hello(&mut self, msg: &Message, capabilities: EndpointCapabilities, audio_port: u16, clock_port: u16, buffer_ms: u32) -> Result<Message, OaatError> {
+    pub fn handle_hello(
+        &mut self,
+        msg: &Message,
+        capabilities: EndpointCapabilities,
+        audio_port: u16,
+        clock_port: u16,
+        buffer_ms: u32,
+    ) -> Result<Message, OaatError> {
         match msg {
             Message::Hello(hello) => {
                 if hello.protocol_version != oaat_core::PROTOCOL_VERSION {

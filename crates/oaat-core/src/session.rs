@@ -42,7 +42,10 @@ impl SessionState {
         if self.can_transition_to(next) {
             Ok(next)
         } else {
-            Err(OaatError::InvalidStateTransition { from: self, to: next })
+            Err(OaatError::InvalidStateTransition {
+                from: self,
+                to: next,
+            })
         }
     }
 }

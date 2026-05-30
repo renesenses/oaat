@@ -1,5 +1,5 @@
-use crate::format::AudioFormat;
 use crate::error::OaatError;
+use crate::format::AudioFormat;
 
 pub const AUDIO_HEADER_SIZE: usize = 32;
 
@@ -58,10 +58,9 @@ impl AudioPacketHeader {
 
     pub fn decode(buf: &[u8; AUDIO_HEADER_SIZE]) -> Result<Self, OaatError> {
         let version = buf[0] >> 4;
-        let flags =
-            PacketFlags::from_bits(buf[0] & 0x0F).ok_or(OaatError::InvalidPacketFlags(buf[0] & 0x0F))?;
-        let format =
-            AudioFormat::from_wire_id(buf[1]).ok_or(OaatError::UnknownFormat(buf[1]))?;
+        let flags = PacketFlags::from_bits(buf[0] & 0x0F)
+            .ok_or(OaatError::InvalidPacketFlags(buf[0] & 0x0F))?;
+        let format = AudioFormat::from_wire_id(buf[1]).ok_or(OaatError::UnknownFormat(buf[1]))?;
         let sequence = u16::from_be_bytes([buf[2], buf[3]]);
         let stream_id = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
         let pts_ns = u64::from_be_bytes(buf[8..16].try_into().unwrap());

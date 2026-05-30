@@ -1,6 +1,6 @@
-use bytes::{Buf, BytesMut};
 use crate::error::OaatError;
 use crate::message::Message;
+use bytes::{Buf, BytesMut};
 
 const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024; // 16 MB
 
