@@ -184,7 +184,7 @@ fn load_or_create_endpoint_id(name: &str) -> String {
 async fn run_endpoint(
     name: String,
     port: u16,
-    _audio_device: Option<String>,
+    audio_device: Option<String>,
     daemon: bool,
     tls: bool,
     caps_config: &config::CapabilitiesSection,
@@ -348,7 +348,7 @@ async fn run_endpoint(
                                 fp.format, fp.sample_rate, fp.channels, fp.bits_per_sample
                             );
                         }
-                        match audio.configure(fp.format, fp.sample_rate, fp.channels) {
+                        match audio.configure_with_device(fp.format, fp.sample_rate, fp.channels, audio_device.as_deref()) {
                             Ok(()) => {
                                 if daemon {
                                     info!("audio output configured");
@@ -453,7 +453,7 @@ async fn run_endpoint(
                                 "Reformat needed: {stream_id} -> {format} {sample_rate}Hz (reconfiguring output)"
                             );
                         }
-                        match audio.configure(format, sample_rate, 2) {
+                        match audio.configure_with_device(format, sample_rate, 2, audio_device.as_deref()) {
                             Ok(()) => {
                                 if !daemon {
                                     println!("Audio output reconfigured for next track");

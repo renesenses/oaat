@@ -44,15 +44,43 @@ impl CpalOutput {
         sample_rate: u32,
         channels: u8,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        self.configure_with_device(format, sample_rate, channels, None)
+    }
+
+    pub fn configure_with_device(
+        &mut self,
+        format: AudioFormat,
+        sample_rate: u32,
+        channels: u8,
+        device_name: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         self.stop();
         self.format = format;
         self.sample_rate = sample_rate;
         self.channels = channels;
 
         let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .ok_or("no audio output device found")?;
+        let device = if let Some(name) = device_name {
+            let found = host.output_devices()?.find(|d| {
+                d.name()
+                    .map(|n| n.to_lowercase().contains(&name.to_lowercase()))
+                    .unwrap_or(false)
+            });
+            match found {
+                Some(d) => {
+                    info!(requested = name, found = d.name().unwrap_or_default(), "audio device matched by name");
+                    d
+                }
+                None => {
+                    warn!(requested = name, "audio device not found, falling back to default");
+                    host.default_output_device()
+                        .ok_or("no audio output device found")?
+                }
+            }
+        } else {
+            host.default_output_device()
+                .ok_or("no audio output device found")?
+        };
 
         info!(
             device = device.name().unwrap_or_default(),
