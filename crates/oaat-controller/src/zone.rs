@@ -162,9 +162,16 @@ impl Zone {
         buf[..oaat_core::wire::AUDIO_HEADER_SIZE].copy_from_slice(&hdr_buf);
         buf[oaat_core::wire::AUDIO_HEADER_SIZE..].copy_from_slice(payload);
 
-        // Fan-out: send the same packet to all endpoints
-        for (id, ep) in &self.endpoints {
-            if let Err(e) = ep.audio_socket.send_to(&buf, ep.audio_target).await {
+        // Collect targets before await to avoid holding &ConnectedEndpoint (which is !Sync)
+        // across await points — required for the future to be Send.
+        let targets: Vec<(String, std::sync::Arc<tokio::net::UdpSocket>, std::net::SocketAddr)> =
+            self.endpoints
+                .iter()
+                .map(|(id, ep)| (id.clone(), ep.audio_socket.clone(), ep.audio_target))
+                .collect();
+
+        for (id, socket, target) in &targets {
+            if let Err(e) = socket.send_to(&buf, target).await {
                 error!(endpoint = %id, error = %e, "audio send failed");
             }
         }
