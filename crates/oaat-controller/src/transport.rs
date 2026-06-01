@@ -31,7 +31,7 @@ pub enum EndpointResponse {
 }
 
 pub struct ConnectedEndpoint {
-    writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+    writer: tokio::sync::Mutex<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>,
     pub info: HelloAck,
     pub audio_socket: Arc<UdpSocket>,
     pub audio_target: SocketAddr,
@@ -220,7 +220,7 @@ impl ConnectedEndpoint {
         });
 
         Ok(Self {
-            writer: Box::new(writer),
+            writer: tokio::sync::Mutex::new(Box::new(writer)),
             info: hello_ack,
             audio_socket,
             audio_target,
@@ -234,8 +234,9 @@ impl ConnectedEndpoint {
     }
 
     pub async fn send_message(&mut self, msg: &Message) -> Result<(), OaatError> {
-        self.writer.write_all(&FrameCodec::encode(msg)).await?;
-        self.writer.flush().await?;
+        let mut w = self.writer.lock().await;
+        w.write_all(&FrameCodec::encode(msg)).await?;
+        w.flush().await?;
         Ok(())
     }
 
