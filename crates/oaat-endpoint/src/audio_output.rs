@@ -156,7 +156,8 @@ impl CpalOutput {
                     let read = consumer.pop_slice(&mut tmp);
                     for (i, sample) in output.iter_mut().enumerate() {
                         if i < read {
-                            *sample = (tmp[i] * vol * i32::MAX as f32) as i32;
+                            let s = (tmp[i] * vol).clamp(-1.0, 1.0);
+                            *sample = (s * (i32::MAX - 256) as f32) as i32;
                         } else {
                             *sample = 0;
                         }
