@@ -1,3 +1,4 @@
+use std::fs::File;
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -15,6 +16,7 @@ pub struct AlsaDirectOutput {
     channels: u8,
     format: AudioFormat,
     bytes_written: u64,
+    capture_file: Option<File>,
 }
 
 impl AlsaDirectOutput {
@@ -47,6 +49,7 @@ impl AlsaDirectOutput {
             channels: 0,
             format: AudioFormat::PcmS16le,
             bytes_written: 0,
+            capture_file: None,
         }
     }
 
@@ -102,6 +105,12 @@ impl AlsaDirectOutput {
         self.bytes_written = 0;
         self.playing.store(false, Ordering::Relaxed);
 
+        let capture_path = "/tmp/oaat_capture.raw";
+        self.capture_file = File::create(capture_path).ok();
+        if self.capture_file.is_some() {
+            info!(path = capture_path, "capture file opened for diagnostics");
+        }
+
         Ok(())
     }
 
@@ -119,6 +128,10 @@ impl AlsaDirectOutput {
         if let Some(mut child) = self.process.take() {
             drop(child.stdin.take());
             let _ = child.wait();
+        }
+        if let Some(f) = self.capture_file.take() {
+            drop(f);
+            info!(bytes = self.bytes_written, "capture file closed");
         }
         self.bytes_written = 0;
     }
@@ -152,6 +165,10 @@ impl AlsaDirectOutput {
         };
 
         let vol = self.volume.load(Ordering::Relaxed) as f32 / 1000.0;
+
+        if let Some(ref mut f) = self.capture_file {
+            let _ = f.write_all(data);
+        }
 
         let result = if (vol - 1.0).abs() < 0.001 {
             stdin.write_all(data)
