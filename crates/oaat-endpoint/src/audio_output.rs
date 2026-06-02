@@ -111,7 +111,9 @@ impl CpalOutput {
         let volume = self.volume.clone();
         let muted = self.muted.clone();
 
-        // Check if device supports f32 natively, otherwise use i32 (hardware DACs)
+        // Check supported formats: prefer f32, fallback to i16 (most compatible with I2S DACs).
+        // Many I2S DACs (ESS 9038 via hifiberry overlay) accept S32_LE in ALSA but
+        // only output sound with S16_LE. Use i16 as the safe fallback.
         let supports_f32 = device
             .supported_output_configs()
             .map(|cfgs| {
@@ -143,10 +145,10 @@ impl CpalOutput {
                 None,
             )?
         } else {
-            info!("opening audio output (i32/S32_LE)");
+            info!("opening audio output (i16/S16_LE)");
             device.build_output_stream(
                 &config,
-                move |output: &mut [i32], _: &cpal::OutputCallbackInfo| {
+                move |output: &mut [i16], _: &cpal::OutputCallbackInfo| {
                     if !playing.load(Ordering::Relaxed) || muted.load(Ordering::Relaxed) {
                         output.fill(0);
                         return;
@@ -157,7 +159,7 @@ impl CpalOutput {
                     for (i, sample) in output.iter_mut().enumerate() {
                         if i < read {
                             let s = (tmp[i] * vol).clamp(-1.0, 1.0);
-                            *sample = (s * (i32::MAX - 256) as f32) as i32;
+                            *sample = (s * i16::MAX as f32) as i16;
                         } else {
                             *sample = 0;
                         }
