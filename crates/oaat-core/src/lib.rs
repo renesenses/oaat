@@ -25,6 +25,6 @@ pub const DEFAULT_CLOCK_PORT: u16 = 9742;
 pub const SERVICE_TYPE: &str = "_oaat._tcp";
 pub const CTRL_SERVICE_TYPE: &str = "_oaat-ctrl._tcp";
 pub const AUDIO_HEADER_SIZE: usize = 32;
-pub const MAX_AUDIO_PAYLOAD: usize = 1440;
+pub const MAX_AUDIO_PAYLOAD: usize = 8192;
 pub const DEFAULT_SINGLE_PLAY_DELAY_MS: u64 = 200;
 pub const DEFAULT_MULTIROOM_PLAY_DELAY_MS: u64 = 500;
