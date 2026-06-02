@@ -1,4 +1,6 @@
 #[cfg(target_os = "linux")]
+pub mod alsa_direct;
+#[cfg(target_os = "linux")]
 pub mod alsa_mixer;
 #[cfg(feature = "audio-output")]
 pub mod audio_output;
@@ -9,6 +11,8 @@ pub mod hal;
 pub mod session;
 pub mod transport;
 
+#[cfg(target_os = "linux")]
+pub use alsa_direct::AlsaDirectOutput;
 #[cfg(target_os = "linux")]
 pub use alsa_mixer::AlsaMixer;
 #[cfg(feature = "audio-output")]

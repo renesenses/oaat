@@ -13,6 +13,9 @@ use oaat_core::message::{EndpointCapabilities, TrackMetadata};
 use oaat_core::wire::PacketFlags;
 use oaat_endpoint::discovery::EndpointAnnouncement;
 use oaat_endpoint::transport::{PlaybackCommand, VolumeCommand};
+#[cfg(target_os = "linux")]
+use oaat_endpoint::{AlsaDirectOutput, EndpointConfig, EndpointEvent, EndpointTransport};
+#[cfg(not(target_os = "linux"))]
 use oaat_endpoint::{CpalOutput, EndpointConfig, EndpointEvent, EndpointTransport};
 
 mod config;
@@ -197,10 +200,16 @@ async fn run_endpoint(
 
     // List available audio output devices at startup for diagnostics
     {
+        #[cfg(target_os = "linux")]
+        let devices = AlsaDirectOutput::list_devices();
+        #[cfg(not(target_os = "linux"))]
         let devices = CpalOutput::list_devices();
         for (i, dname) in devices.iter().enumerate() {
             info!(index = i, device = %dname, "audio_device_available");
         }
+        #[cfg(target_os = "linux")]
+        let default_name = AlsaDirectOutput::default_device_name().unwrap_or_else(|| "(none)".into());
+        #[cfg(not(target_os = "linux"))]
         let default_name = CpalOutput::default_device_name().unwrap_or_else(|| "(none)".into());
         info!(default = %default_name, "audio_device_default");
         if let Some(ref pref) = audio_device {
@@ -295,6 +304,9 @@ async fn run_endpoint(
         }
     });
 
+    #[cfg(target_os = "linux")]
+    let mut audio = AlsaDirectOutput::new();
+    #[cfg(not(target_os = "linux"))]
     let mut audio = CpalOutput::new();
     let mut packet_count: u64 = 0;
     let mut total_bytes: u64 = 0;
