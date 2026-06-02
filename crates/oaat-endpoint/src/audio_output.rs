@@ -145,10 +145,10 @@ impl CpalOutput {
                 None,
             )?
         } else {
-            info!("opening audio output (i16/S16_LE)");
+            info!("opening audio output (i32/S32_LE)");
             device.build_output_stream(
                 &config,
-                move |output: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                move |output: &mut [i32], _: &cpal::OutputCallbackInfo| {
                     if !playing.load(Ordering::Relaxed) || muted.load(Ordering::Relaxed) {
                         output.fill(0);
                         return;
@@ -159,7 +159,7 @@ impl CpalOutput {
                     for (i, sample) in output.iter_mut().enumerate() {
                         if i < read {
                             let s = (tmp[i] * vol).clamp(-1.0, 1.0);
-                            *sample = (s * i16::MAX as f32) as i16;
+                            *sample = (s * (i32::MAX - 256) as f32) as i32;
                         } else {
                             *sample = 0;
                         }
