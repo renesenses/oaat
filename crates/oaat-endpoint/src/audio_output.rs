@@ -228,7 +228,15 @@ impl CpalOutput {
             convert_to_f32(self.format, data)
         };
 
-        producer.push_slice(&samples) / self.channels.max(1) as usize
+        // Only push complete frames to maintain channel alignment.
+        // A partial push (odd number of samples for stereo) would permanently
+        // swap L/R channels for all subsequent audio → distortion.
+        let ch = self.channels.max(1) as usize;
+        let available = producer.vacant_len();
+        let frames_to_push = (available / ch).min(samples.len() / ch);
+        let samples_to_push = frames_to_push * ch;
+        producer.push_slice(&samples[..samples_to_push]);
+        frames_to_push
     }
 
     pub fn buffer_level(&self) -> usize {
