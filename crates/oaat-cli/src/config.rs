@@ -75,7 +75,7 @@ impl Default for CapabilitiesSection {
             pcm_max_bits: 24,
             channels_max: 2,
             dsd: false,
-            flac: false,
+            flac: true,
         }
     }
 }
