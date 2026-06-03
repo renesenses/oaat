@@ -71,34 +71,62 @@ impl AlsaDirectOutput {
         self.sample_rate = sample_rate;
         self.channels = channels;
 
-        let alsa_fmt = format_to_alsa(format)
-            .ok_or_else(|| format!("unsupported format for ALSA direct: {format}"))?;
-
         let device = device_name.unwrap_or("default");
 
-        let child = Command::new("aplay")
-            .args([
-                "-D", device,
-                "-f", alsa_fmt,
-                "-r", &sample_rate.to_string(),
-                "-c", &channels.to_string(),
-                "-t", "raw",
-                "-q",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
+        if format == AudioFormat::Flac {
+            let child = Command::new("ffmpeg")
+                .args([
+                    "-f", "flac",
+                    "-i", "pipe:0",
+                    "-f", "alsa",
+                    "-acodec", "pcm_s24le",
+                    "-ar", &sample_rate.to_string(),
+                    "-ac", &channels.to_string(),
+                    device,
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?;
 
-        info!(
-            device,
-            format = alsa_fmt,
-            sample_rate,
-            channels,
-            "ALSA direct output started (aplay pipe)"
-        );
+            info!(
+                device,
+                format = "FLAC→pcm_s24le",
+                sample_rate,
+                channels,
+                "ALSA direct output started (ffmpeg FLAC decode)"
+            );
 
-        self.process = Some(child);
+            self.process = Some(child);
+        } else {
+            let alsa_fmt = format_to_alsa(format)
+                .ok_or_else(|| format!("unsupported format for ALSA direct: {format}"))?;
+
+            let child = Command::new("aplay")
+                .args([
+                    "-D", device,
+                    "-f", alsa_fmt,
+                    "-r", &sample_rate.to_string(),
+                    "-c", &channels.to_string(),
+                    "-t", "raw",
+                    "-q",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?;
+
+            info!(
+                device,
+                format = alsa_fmt,
+                sample_rate,
+                channels,
+                "ALSA direct output started (aplay pipe)"
+            );
+
+            self.process = Some(child);
+        }
+
         self.bytes_written = 0;
         self.playing.store(false, Ordering::Relaxed);
 
