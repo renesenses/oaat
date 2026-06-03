@@ -31,16 +31,16 @@ cargo clippy --workspace -- -D warnings
 
 ```bash
 # Start endpoint (listens on port 9740, announces via mDNS)
-cargo run --bin oaat -- endpoint --name "My DAC" --port 9740
+cargo run --bin tune-bridge -- endpoint --name "My DAC" --port 9740
 
 # Stream to a single endpoint
-cargo run --bin oaat -- controller --target 127.0.0.1:9740 --freq 440 --duration 5
+cargo run --bin tune-bridge -- controller --target 127.0.0.1:9740 --freq 440 --duration 5
 
 # Multi-room: stream to N endpoints in sync
-cargo run --bin oaat -- multiroom 192.168.1.10:9740 192.168.1.11:9740 --duration 10
+cargo run --bin tune-bridge -- multiroom 192.168.1.10:9740 192.168.1.11:9740 --duration 10
 
 # Discover endpoints on the network
-cargo run --bin oaat -- discover --timeout 5
+cargo run --bin tune-bridge -- discover --timeout 5
 ```
 
 ## Protocol architecture

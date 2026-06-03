@@ -24,9 +24,13 @@ ringbuf = { workspace = true, optional = true }
 symphonia = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
+hyper = { version = "1", features = ["http1", "server"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
 
 [features]
-default = ["audio-output", "flac", "tls"]
+default = ["audio-output", "flac", "tls", "web-ui"]
 audio-output = ["dep:cpal", "dep:ringbuf"]
 flac = ["dep:symphonia"]
 tls = ["dep:tokio-rustls", "dep:rustls", "oaat-core/tls"]
+web-ui = ["dep:hyper", "dep:hyper-util", "dep:http-body-util"]

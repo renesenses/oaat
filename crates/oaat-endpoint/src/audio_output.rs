@@ -13,6 +13,36 @@ use oaat_core::format::AudioFormat;
 
 const RING_BUFFER_FRAMES: usize = 48000;
 
+/// Names that indicate a built-in / onboard audio device (not a USB DAC).
+const BUILTIN_DEVICE_KEYWORDS: &[&str] = &[
+    "built-in",
+    "speakers",
+    "realtek",
+    "internal",
+    "hdmi",
+    "displayport",
+    "macbook",
+    "default",
+];
+
+/// Names that indicate a USB DAC or external audio device.
+const USB_DAC_KEYWORDS: &[&str] = &["usb", "dac"];
+
+/// Classify a device name: returns true if the device looks like a USB DAC / external device.
+fn is_usb_dac(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    // Positive match: contains USB/DAC keywords
+    if USB_DAC_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+        return true;
+    }
+    // Negative match: if it matches built-in keywords, it is NOT a USB DAC
+    if BUILTIN_DEVICE_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+        return false;
+    }
+    // Unknown device name — assume external (prefer it over built-in)
+    true
+}
+
 pub struct CpalOutput {
     stream: Option<cpal::Stream>,
     producer: Option<ringbuf::HeapProd<f32>>,
@@ -22,6 +52,7 @@ pub struct CpalOutput {
     sample_rate: u32,
     channels: u8,
     format: AudioFormat,
+    device_name: Option<String>,
 }
 
 impl CpalOutput {
@@ -37,6 +68,32 @@ impl CpalOutput {
         host.default_output_device().and_then(|d| d.name().ok())
     }
 
+    /// Auto-detect the best audio output device, preferring USB DACs over built-in audio.
+    /// Returns the device name if a USB DAC is found, or None to use the system default.
+    pub fn auto_detect_usb_dac() -> Option<String> {
+        let devices = Self::list_devices();
+        if devices.is_empty() {
+            return None;
+        }
+
+        // Look for a USB DAC first
+        for name in &devices {
+            if is_usb_dac(name) {
+                info!(device = %name, "auto-detected USB DAC");
+                return Some(name.clone());
+            }
+        }
+
+        // No USB DAC found — return None so caller falls back to default
+        warn!("no USB DAC detected, will use system default audio output");
+        None
+    }
+
+    /// Get the current audio device name.
+    pub fn current_device_name(&self) -> Option<&str> {
+        self.device_name.as_deref()
+    }
+
     pub fn new() -> Self {
         Self {
             stream: None,
@@ -47,6 +104,7 @@ impl CpalOutput {
             sample_rate: 0,
             channels: 0,
             format: AudioFormat::PcmS16le,
+            device_name: None,
         }
     }
 
@@ -94,10 +152,13 @@ impl CpalOutput {
                 .ok_or("no audio output device found")?
         };
 
+        let actual_device_name = device.name().unwrap_or_default();
+        self.device_name = Some(actual_device_name.clone());
+        let usb_hint = if is_usb_dac(&actual_device_name) { " (USB)" } else { "" };
         info!(
-            device = device.name().unwrap_or_default(),
+            device = %actual_device_name,
             sample_rate, channels, format = %format,
-            "configuring audio output"
+            "Tune Bridge using: {}{}", actual_device_name, usb_hint
         );
 
         let ring_size = RING_BUFFER_FRAMES * channels as usize;

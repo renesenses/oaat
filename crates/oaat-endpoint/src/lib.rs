@@ -10,6 +10,8 @@ pub mod flac_decoder;
 pub mod hal;
 pub mod session;
 pub mod transport;
+#[cfg(feature = "web-ui")]
+pub mod web_ui;
 
 #[cfg(target_os = "linux")]
 pub use alsa_direct::AlsaDirectOutput;
@@ -19,3 +21,5 @@ pub use alsa_mixer::AlsaMixer;
 pub use audio_output::CpalOutput;
 pub use hal::OaatHal;
 pub use transport::{EndpointConfig, EndpointEvent, EndpointTransport};
+#[cfg(feature = "web-ui")]
+pub use web_ui::{BridgeStatus, BridgeStatusHandle, start_web_ui};

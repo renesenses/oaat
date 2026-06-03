@@ -111,7 +111,10 @@ impl Default for LoggingSection {
     }
 }
 
-const DEFAULT_CONFIG_PATH: &str = "/etc/oaat/endpoint.toml";
+const DEFAULT_CONFIG_PATHS: &[&str] = &[
+    "/etc/tune-bridge/config.toml",
+    "/etc/oaat/endpoint.toml",
+];
 
 impl EndpointFileConfig {
     /// Load config from an explicit path, the default path, or built-in defaults.
@@ -130,14 +133,16 @@ impl EndpointFileConfig {
             return Ok(config);
         }
 
-        let default_path = Path::new(DEFAULT_CONFIG_PATH);
-        if default_path.exists() {
-            let contents = std::fs::read_to_string(default_path)
-                .map_err(|e| format!("cannot read config {}: {e}", DEFAULT_CONFIG_PATH))?;
-            let config: Self = toml::from_str(&contents)
-                .map_err(|e| format!("invalid config {}: {e}", DEFAULT_CONFIG_PATH))?;
-            info!(path = DEFAULT_CONFIG_PATH, "loaded config");
-            return Ok(config);
+        for default_path_str in DEFAULT_CONFIG_PATHS {
+            let default_path = Path::new(default_path_str);
+            if default_path.exists() {
+                let contents = std::fs::read_to_string(default_path)
+                    .map_err(|e| format!("cannot read config {}: {e}", default_path_str))?;
+                let config: Self = toml::from_str(&contents)
+                    .map_err(|e| format!("invalid config {}: {e}", default_path_str))?;
+                info!(path = default_path_str, "loaded config");
+                return Ok(config);
+            }
         }
 
         info!("no config file found, using built-in defaults");

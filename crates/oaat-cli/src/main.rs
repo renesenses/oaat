@@ -17,12 +17,23 @@ use oaat_endpoint::transport::{PlaybackCommand, VolumeCommand};
 use oaat_endpoint::{AlsaDirectOutput, EndpointConfig, EndpointEvent, EndpointTransport};
 #[cfg(not(target_os = "linux"))]
 use oaat_endpoint::{CpalOutput, EndpointConfig, EndpointEvent, EndpointTransport};
+#[cfg(feature = "web-ui")]
+use oaat_endpoint::web_ui;
 
 mod config;
 use config::EndpointFileConfig;
 
+const PID_FILE: &str = "/tmp/tune-bridge.pid";
+const DEFAULT_WEB_UI_PORT: u16 = 9741;
+
 #[derive(Parser)]
-#[command(name = "oaat", about = "OAAT — Open Advanced Audio Transport CLI")]
+#[command(
+    name = "tune-bridge",
+    about = "Tune Bridge — lightweight audio bridge for USB DACs",
+    long_about = "Tune Bridge receives audio streams from a Tune server via the OAAT protocol \
+                  and outputs them to a local USB DAC. Think Roon Bridge, but open-source.",
+    version = env!("CARGO_PKG_VERSION"),
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -30,21 +41,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Start an OAAT endpoint (receiver/renderer) with audio output
+    /// Start Tune Bridge endpoint (receiver/renderer) with audio output
     Endpoint {
-        /// Endpoint display name
+        /// Bridge display name (default: system hostname)
         #[arg(short, long)]
         name: Option<String>,
-        /// TCP control port (0 = auto)
+        /// TCP control port (default: 9740)
         #[arg(long)]
         port: Option<u16>,
         /// Path to TOML config file
         #[arg(short, long)]
         config: Option<String>,
-        /// Run in daemon mode (suppress interactive output, log only)
+        /// Run as a background daemon (write PID to /tmp/tune-bridge.pid)
         #[arg(long)]
         daemon: bool,
-        /// Select audio output device by name
+        /// Select audio output device by name (default: auto-detect USB DAC)
         #[arg(long)]
         audio_device: Option<String>,
         /// List available audio output devices and exit
@@ -53,6 +64,12 @@ enum Command {
         /// Enable TLS 1.3 on the control channel (self-signed cert, TOFU)
         #[arg(long)]
         tls: bool,
+        /// Disable the web status UI
+        #[arg(long)]
+        no_web_ui: bool,
+        /// Web UI port (default: 9741)
+        #[arg(long)]
+        web_port: Option<u16>,
     },
 
     /// Start an OAAT controller and stream audio (file or sine wave)
@@ -98,12 +115,39 @@ enum Command {
     },
 }
 
+/// Write PID file for daemon mode.
+fn write_pid_file() {
+    let pid = std::process::id();
+    if let Err(e) = std::fs::write(PID_FILE, pid.to_string()) {
+        warn!(error = %e, path = PID_FILE, "failed to write PID file");
+    } else {
+        info!(pid, path = PID_FILE, "PID file written");
+    }
+}
+
+/// Remove PID file on shutdown.
+fn remove_pid_file() {
+    if std::path::Path::new(PID_FILE).exists() {
+        if let Err(e) = std::fs::remove_file(PID_FILE) {
+            warn!(error = %e, "failed to remove PID file");
+        }
+    }
+}
+
+/// Get the system hostname for the default bridge name.
+fn system_hostname() -> String {
+    hostname::get()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string()
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "oaat=info".into()),
+                .unwrap_or_else(|_| "oaat=info,tune_bridge=info".into()),
         )
         .init();
 
@@ -118,26 +162,51 @@ async fn main() {
             audio_device,
             list_devices,
             tls,
+            no_web_ui,
+            web_port,
         } => {
             if list_devices {
-                #[cfg(not(feature = "alsa-direct"))]
+                #[cfg(not(target_os = "linux"))]
                 {
                     let devices = oaat_endpoint::CpalOutput::list_devices();
                     let default = oaat_endpoint::CpalOutput::default_device_name();
                     println!("Available audio output devices:\n");
                     for d in &devices {
                         let marker = if Some(d.as_str()) == default.as_deref() { " (default)" } else { "" };
-                        println!("  • {d}{marker}");
+                        println!("  {d}{marker}");
                     }
                     if devices.is_empty() {
                         println!("  (no devices found)");
                     }
                 }
-                #[cfg(feature = "alsa-direct")]
+                #[cfg(target_os = "linux")]
                 {
-                    println!("  (ALSA direct mode — use `aplay -l` to list devices)");
+                    println!("  (ALSA direct mode -- use `aplay -l` to list devices)");
                 }
                 std::process::exit(0);
+            }
+
+            // Daemon mode: fork to background on Unix
+            if daemon {
+                #[cfg(unix)]
+                {
+                    // Fork to background using double-fork technique
+                    unsafe {
+                        let pid = libc::fork();
+                        if pid < 0 {
+                            eprintln!("fork failed");
+                            std::process::exit(1);
+                        }
+                        if pid > 0 {
+                            // Parent: print child PID and exit
+                            println!("Tune Bridge started in background (PID: {})", pid);
+                            std::process::exit(0);
+                        }
+                        // Child: create new session
+                        libc::setsid();
+                    }
+                }
+                write_pid_file();
             }
 
             let file_config = EndpointFileConfig::load(config.as_deref()).unwrap_or_else(|e| {
@@ -146,10 +215,28 @@ async fn main() {
             });
 
             // CLI args override config file values
-            let ep_name = name.unwrap_or(file_config.endpoint.name);
+            let ep_name = name.unwrap_or_else(|| {
+                let cfg_name = &file_config.endpoint.name;
+                if cfg_name == "OAAT Endpoint" {
+                    // Default was not overridden in config -- use hostname
+                    system_hostname()
+                } else {
+                    cfg_name.clone()
+                }
+            });
             let ep_port = port.unwrap_or(file_config.endpoint.port);
-            let ep_audio_device = audio_device.or(file_config.endpoint.audio_device);
+
+            // Audio device: CLI > config > auto-detect USB DAC
+            let ep_audio_device = audio_device.or(file_config.endpoint.audio_device).or_else(|| {
+                #[cfg(not(target_os = "linux"))]
+                { CpalOutput::auto_detect_usb_dac() }
+                #[cfg(target_os = "linux")]
+                { None }
+            });
+
             let ep_tls = tls || file_config.endpoint.tls;
+            let ep_web_port = web_port.unwrap_or(DEFAULT_WEB_UI_PORT);
+            let ep_web_ui = !no_web_ui;
 
             run_endpoint(
                 ep_name,
@@ -159,8 +246,14 @@ async fn main() {
                 ep_tls,
                 &file_config.capabilities,
                 &file_config.dac,
+                ep_web_ui,
+                ep_web_port,
             )
-            .await
+            .await;
+
+            if daemon {
+                remove_pid_file();
+            }
         }
         Command::Controller {
             name,
@@ -209,6 +302,7 @@ fn load_or_create_endpoint_id(name: &str) -> String {
     id
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_endpoint(
     name: String,
     port: u16,
@@ -217,6 +311,8 @@ async fn run_endpoint(
     tls: bool,
     caps_config: &config::CapabilitiesSection,
     dac_config: &config::DacSection,
+    web_ui_enabled: bool,
+    web_ui_port: u16,
 ) {
     let endpoint_id = load_or_create_endpoint_id(&name);
     let control_addr: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
@@ -224,12 +320,13 @@ async fn run_endpoint(
     let clock_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
 
     // List available audio output devices at startup for diagnostics
+    let available_devices;
     {
         #[cfg(target_os = "linux")]
-        let devices = AlsaDirectOutput::list_devices();
+        { available_devices = AlsaDirectOutput::list_devices(); }
         #[cfg(not(target_os = "linux"))]
-        let devices = CpalOutput::list_devices();
-        for (i, dname) in devices.iter().enumerate() {
+        { available_devices = CpalOutput::list_devices(); }
+        for (i, dname) in available_devices.iter().enumerate() {
             info!(index = i, device = %dname, "audio_device_available");
         }
         #[cfg(target_os = "linux")]
@@ -301,12 +398,59 @@ async fn run_endpoint(
         warn!(error = %e, "mDNS registration failed, continuing without discovery");
     }
 
+    // Start web UI
+    #[cfg(feature = "web-ui")]
+    let (status_handle, device_switch_rx) = {
+        let initial_device = audio_device
+            .as_deref()
+            .unwrap_or_else(|| "system default")
+            .to_string();
+        let initial_status = web_ui::BridgeStatus {
+            bridge_name: name.clone(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            current_device: initial_device,
+            available_devices: available_devices.clone(),
+            connected: false,
+            controller_name: None,
+            stream_format: None,
+            stream_sample_rate: None,
+            stream_bits: None,
+            stream_channels: None,
+        };
+        let (handle, _reader) = web_ui::BridgeStatusHandle::new(initial_status);
+        let (switch_tx, switch_rx) = mpsc::channel::<String>(8);
+        if web_ui_enabled {
+            web_ui::start_web_ui(web_ui_port, handle.clone(), switch_tx).await;
+        }
+        (handle, switch_rx)
+    };
+    #[cfg(not(feature = "web-ui"))]
+    let (_, mut device_switch_rx) = mpsc::channel::<String>(1);
+
+    #[cfg(feature = "web-ui")]
+    let mut device_switch_rx = device_switch_rx;
+
     if daemon {
-        info!(name = %name, port = actual_port, id = %endpoint_id, "endpoint started (daemon mode)");
+        info!(
+            name = %name, port = actual_port, id = %endpoint_id,
+            web_ui = web_ui_enabled, web_port = web_ui_port,
+            "Tune Bridge started (daemon mode)"
+        );
     } else {
-        println!("OAAT Endpoint '{name}' listening on port {actual_port}");
-        println!("Endpoint ID: {endpoint_id}");
-        println!("Waiting for controller connection...\n");
+        println!();
+        println!("  Tune Bridge '{name}'");
+        println!("  OAAT port: {actual_port}  |  ID: {endpoint_id}");
+        if web_ui_enabled {
+            println!("  Web UI: http://localhost:{web_ui_port}");
+        }
+        if let Some(ref dev) = audio_device {
+            println!("  Audio device: {dev}");
+        } else {
+            println!("  Audio device: auto-detect");
+        }
+        println!();
+        println!("  Waiting for Tune server connection...");
+        println!();
     }
 
     let ep_config = EndpointConfig {
@@ -335,6 +479,7 @@ async fn run_endpoint(
     let mut audio = CpalOutput::new();
     let mut packet_count: u64 = 0;
     let mut total_bytes: u64 = 0;
+    let mut current_audio_device = audio_device;
 
     // Initialize hardware DAC mixer (Linux only)
     #[cfg(target_os = "linux")]
@@ -363,6 +508,14 @@ async fn run_endpoint(
                         controller_id,
                         controller_name,
                     } => {
+                        #[cfg(feature = "web-ui")]
+                        {
+                            let ctrl_name = controller_name.clone();
+                            status_handle.update(|s| {
+                                s.connected = true;
+                                s.controller_name = Some(ctrl_name);
+                            }).await;
+                        }
                         if daemon {
                             info!(controller = %controller_name, id = %controller_id, "controller connected");
                         } else {
@@ -380,7 +533,7 @@ async fn run_endpoint(
                         if daemon {
                             warn!(stream_id, reason, "format rejected");
                         } else {
-                            eprintln!("Format rejected: {stream_id} — {reason}");
+                            eprintln!("Format rejected: {stream_id} -- {reason}");
                         }
                     }
                     EndpointEvent::FormatProposed(fp) => {
@@ -398,8 +551,23 @@ async fn run_endpoint(
                                 fp.format, fp.sample_rate, fp.channels, fp.bits_per_sample
                             );
                         }
-                        match audio.configure_with_device(fp.format, fp.sample_rate, fp.channels, audio_device.as_deref()) {
+                        match audio.configure_with_device(fp.format, fp.sample_rate, fp.channels, current_audio_device.as_deref()) {
                             Ok(()) => {
+                                #[cfg(feature = "web-ui")]
+                                {
+                                    let dev_name = audio.current_device_name().unwrap_or("unknown").to_string();
+                                    let fmt_s = fp.format.to_string();
+                                    let sr = fp.sample_rate;
+                                    let bits = fp.bits_per_sample;
+                                    let ch = fp.channels;
+                                    status_handle.update(move |s| {
+                                        s.current_device = dev_name;
+                                        s.stream_format = Some(fmt_s);
+                                        s.stream_sample_rate = Some(sr);
+                                        s.stream_bits = Some(bits);
+                                        s.stream_channels = Some(ch);
+                                    }).await;
+                                }
                                 if daemon {
                                     info!("audio output configured");
                                 } else {
@@ -457,6 +625,13 @@ async fn run_endpoint(
                                 );
                             }
                             audio.stop();
+                            #[cfg(feature = "web-ui")]
+                            status_handle.update(|s| {
+                                s.stream_format = None;
+                                s.stream_sample_rate = None;
+                                s.stream_bits = None;
+                                s.stream_channels = None;
+                            }).await;
                         }
                         PlaybackCommand::Seek(id, pos) => {
                             if daemon {
@@ -476,7 +651,7 @@ async fn run_endpoint(
                             );
                         } else {
                             println!(
-                                "Now playing: {} — {} [{}]",
+                                "Now playing: {} -- {} [{}]",
                                 m.track.artist, m.track.title, m.track.album
                             );
                             if let Some(ref fmt) = m.track.format {
@@ -503,8 +678,19 @@ async fn run_endpoint(
                                 "Reformat needed: {stream_id} -> {format} {sample_rate}Hz (reconfiguring output)"
                             );
                         }
-                        match audio.configure_with_device(format, sample_rate, 2, audio_device.as_deref()) {
+                        match audio.configure_with_device(format, sample_rate, 2, current_audio_device.as_deref()) {
                             Ok(()) => {
+                                #[cfg(feature = "web-ui")]
+                                {
+                                    let dev_name = audio.current_device_name().unwrap_or("unknown").to_string();
+                                    let fmt_s = format.to_string();
+                                    status_handle.update(move |s| {
+                                        s.current_device = dev_name;
+                                        s.stream_format = Some(fmt_s);
+                                        s.stream_sample_rate = Some(sample_rate);
+                                        s.stream_channels = Some(2);
+                                    }).await;
+                                }
                                 if !daemon {
                                     println!("Audio output reconfigured for next track");
                                 }
@@ -553,6 +739,15 @@ async fn run_endpoint(
                     },
                     EndpointEvent::Disconnected => {
                         audio.stop();
+                        #[cfg(feature = "web-ui")]
+                        status_handle.update(|s| {
+                            s.connected = false;
+                            s.controller_name = None;
+                            s.stream_format = None;
+                            s.stream_sample_rate = None;
+                            s.stream_bits = None;
+                            s.stream_channels = None;
+                        }).await;
                         if daemon {
                             info!(packets = packet_count, bytes = total_bytes, "controller disconnected");
                         } else {
@@ -568,16 +763,27 @@ async fn run_endpoint(
                     }
                 }
             }
+            // Handle device switch requests from the web UI
+            Some(new_device) = device_switch_rx.recv() => {
+                info!(device = %new_device, "switching audio device via web UI");
+                current_audio_device = Some(new_device.clone());
+                #[cfg(feature = "web-ui")]
+                status_handle.update(|s| {
+                    s.current_device = new_device;
+                }).await;
+            }
             _ = &mut sigint => {
-                info!("endpoint shutting down gracefully");
+                info!("Tune Bridge shutting down gracefully");
                 audio.stop();
                 let _ = mdns.shutdown();
+                remove_pid_file();
                 break;
             }
             _ = sigterm.recv() => {
-                info!("endpoint shutting down gracefully");
+                info!("Tune Bridge shutting down gracefully (SIGTERM)");
                 audio.stop();
                 let _ = mdns.shutdown();
+                remove_pid_file();
                 break;
             }
         }
