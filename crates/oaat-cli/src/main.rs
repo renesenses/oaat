@@ -47,6 +47,9 @@ enum Command {
         /// Select audio output device by name
         #[arg(long)]
         audio_device: Option<String>,
+        /// List available audio output devices and exit
+        #[arg(long)]
+        list_devices: bool,
         /// Enable TLS 1.3 on the control channel (self-signed cert, TOFU)
         #[arg(long)]
         tls: bool,
@@ -113,8 +116,30 @@ async fn main() {
             config,
             daemon,
             audio_device,
+            list_devices,
             tls,
         } => {
+            if list_devices {
+                #[cfg(not(feature = "alsa-direct"))]
+                {
+                    let devices = oaat_endpoint::CpalOutput::list_devices();
+                    let default = oaat_endpoint::CpalOutput::default_device_name();
+                    println!("Available audio output devices:\n");
+                    for d in &devices {
+                        let marker = if Some(d.as_str()) == default.as_deref() { " (default)" } else { "" };
+                        println!("  • {d}{marker}");
+                    }
+                    if devices.is_empty() {
+                        println!("  (no devices found)");
+                    }
+                }
+                #[cfg(feature = "alsa-direct")]
+                {
+                    println!("  (ALSA direct mode — use `aplay -l` to list devices)");
+                }
+                std::process::exit(0);
+            }
+
             let file_config = EndpointFileConfig::load(config.as_deref()).unwrap_or_else(|e| {
                 eprintln!("config error: {e}");
                 std::process::exit(1);
