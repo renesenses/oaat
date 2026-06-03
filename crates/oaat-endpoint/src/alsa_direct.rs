@@ -115,19 +115,18 @@ impl AlsaDirectOutput {
                     "-f", "flac",
                     "-i", "pipe:0",
                     "-f", "alsa",
-                    "-acodec", "pcm_s24le",
                     "-ar", &sample_rate.to_string(),
                     "-ac", &channels.to_string(),
                     device,
                 ])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .spawn()?;
 
             info!(
                 device,
-                format = "FLAC→pcm_s24le",
+                format = "FLAC→ALSA",
                 sample_rate,
                 channels,
                 "ALSA direct output started (ffmpeg FLAC decode)"
