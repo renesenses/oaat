@@ -231,7 +231,7 @@ async fn main() {
                 #[cfg(not(target_os = "linux"))]
                 { CpalOutput::auto_detect_usb_dac() }
                 #[cfg(target_os = "linux")]
-                { None }
+                { AlsaDirectOutput::auto_detect_usb_dac() }
             });
 
             let ep_tls = tls || file_config.endpoint.tls;

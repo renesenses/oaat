@@ -39,11 +39,27 @@ impl AlsaDirectOutput {
 
     pub fn auto_detect_usb_dac() -> Option<String> {
         let devices = Self::list_devices();
-        // On ALSA, prefer any non-default device (likely USB DAC)
+        // On ALSA, prefer device with USB/DAC in name
         for d in &devices {
             let lower = d.to_lowercase();
             if lower.contains("usb") || lower.contains("dac") {
                 return Some(d.clone());
+            }
+        }
+        // Fallback: use sysdefault:CARD=X if only one card exists (likely USB DAC)
+        let cards: Vec<_> = devices.iter()
+            .filter(|d| d.starts_with("sysdefault:CARD="))
+            .collect();
+        if cards.len() == 1 {
+            return Some(cards[0].clone());
+        }
+        // Last resort: first non-builtin sysdefault
+        for d in &devices {
+            if d.starts_with("sysdefault:CARD=") {
+                let lower = d.to_lowercase();
+                if !lower.contains("hdmi") && !lower.contains("builtin") {
+                    return Some(d.clone());
+                }
             }
         }
         None
