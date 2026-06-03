@@ -181,7 +181,26 @@ async fn main() {
                 }
                 #[cfg(target_os = "linux")]
                 {
-                    println!("  (ALSA direct mode -- use `aplay -l` to list devices)");
+                    let devices = AlsaDirectOutput::list_devices();
+                    println!("Available audio output devices (ALSA):\n");
+                    for d in &devices {
+                        println!("  {d}");
+                    }
+                    if devices.is_empty() {
+                        println!("  (no devices found — check `aplay -l`)");
+                    }
+                    println!("\nUsable names for --audio-device:");
+                    // Parse card names from aplay -l output and show sysdefault:CARD=X
+                    for d in &devices {
+                        if let Some(card) = d.split(':').next() {
+                            if let Some(num) = card.strip_prefix("card ") {
+                                if let Some(name) = d.split('[').nth(1).and_then(|s| s.split(']').next()) {
+                                    let short = name.trim();
+                                    println!("  sysdefault:CARD={short}");
+                                }
+                            }
+                        }
+                    }
                 }
                 std::process::exit(0);
             }
