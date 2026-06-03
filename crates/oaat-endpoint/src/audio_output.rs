@@ -22,7 +22,6 @@ const BUILTIN_DEVICE_KEYWORDS: &[&str] = &[
     "hdmi",
     "displayport",
     "macbook",
-    "default",
 ];
 
 /// Names that indicate a USB DAC or external audio device.
