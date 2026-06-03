@@ -110,27 +110,28 @@ impl AlsaDirectOutput {
         };
 
         if format == AudioFormat::Flac {
-            let alsa_fmt = match sample_rate {
-                _ if channels == 2 => "S24_3LE",
-                _ => "S24_3LE",
-            };
-            let cmd = format!(
-                "ffmpeg -f flac -i pipe:0 -f s24le -ar {} -ac {} pipe:1 | aplay -D {} -f {} -r {} -c {} -t raw -q",
-                sample_rate, channels, device, alsa_fmt, sample_rate, channels
-            );
-            let child = Command::new("sh")
-                .args(["-c", &cmd])
+            // Decode FLAC in write_audio via symphonia, output raw f32 PCM to aplay.
+            // No FFmpeg needed.
+            let child = Command::new("aplay")
+                .args([
+                    "-D", device,
+                    "-f", "FLOAT_LE",
+                    "-r", &sample_rate.to_string(),
+                    "-c", &channels.to_string(),
+                    "-t", "raw",
+                    "-q",
+                ])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
-                .stderr(Stdio::piped())
+                .stderr(Stdio::null())
                 .spawn()?;
 
             info!(
                 device,
-                format = "FLAC→s24le→aplay",
+                format = "FLAC→symphonia→f32→aplay",
                 sample_rate,
                 channels,
-                "ALSA direct output started (ffmpeg FLAC pipe aplay)"
+                "ALSA direct output started (Rust FLAC decode)"
             );
 
             self.process = Some(child);
@@ -216,6 +217,41 @@ impl AlsaDirectOutput {
         };
 
         let vol = self.volume.load(Ordering::Relaxed) as f32 / 1000.0;
+
+        // For FLAC: decode to f32 PCM via symphonia, then write raw f32 to aplay
+        if self.format == AudioFormat::Flac {
+            #[cfg(feature = "flac")]
+            {
+                match crate::flac_decoder::decode_flac_to_f32(data) {
+                    Ok(samples) => {
+                        let pcm: Vec<u8> = if (vol - 1.0).abs() < 0.001 {
+                            samples.iter().flat_map(|s| s.to_le_bytes()).collect()
+                        } else {
+                            samples.iter().flat_map(|s| (s * vol).to_le_bytes()).collect()
+                        };
+                        match stdin.write_all(&pcm) {
+                            Ok(()) => {
+                                self.bytes_written += pcm.len() as u64;
+                                return samples.len() / self.channels.max(1) as usize;
+                            }
+                            Err(e) => {
+                                error!(error = %e, "ALSA FLAC write failed");
+                                return 0;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "FLAC decode failed, skipping packet");
+                        return 0;
+                    }
+                }
+            }
+            #[cfg(not(feature = "flac"))]
+            {
+                warn!("FLAC data received but flac feature not enabled");
+                return 0;
+            }
+        }
 
         let result = if (vol - 1.0).abs() < 0.001 {
             stdin.write_all(data)
