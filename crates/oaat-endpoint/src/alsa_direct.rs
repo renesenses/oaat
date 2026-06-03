@@ -103,7 +103,11 @@ impl AlsaDirectOutput {
         self.sample_rate = sample_rate;
         self.channels = channels;
 
-        let device = device_name.unwrap_or("default");
+        let device = match device_name {
+            Some(d) if d.starts_with("hw:") || d.starts_with("plughw:")
+                || d.starts_with("default") || d.starts_with("sysdefault:") => d,
+            _ => "default",
+        };
 
         if format == AudioFormat::Flac {
             let child = Command::new("ffmpeg")
