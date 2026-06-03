@@ -435,6 +435,12 @@ async fn run_endpoint(
             stream_sample_rate: None,
             stream_bits: None,
             stream_channels: None,
+            track_title: None,
+            track_artist: None,
+            track_album: None,
+            artwork_url: None,
+            volume: 100,
+            playing: false,
         };
         let (handle, _reader) = web_ui::BridgeStatusHandle::new(initial_status);
         let (switch_tx, switch_rx) = mpsc::channel::<String>(8);
@@ -650,6 +656,11 @@ async fn run_endpoint(
                                 s.stream_sample_rate = None;
                                 s.stream_bits = None;
                                 s.stream_channels = None;
+                                s.track_title = None;
+                                s.track_artist = None;
+                                s.track_album = None;
+                                s.artwork_url = None;
+                                s.playing = false;
                             }).await;
                         }
                         PlaybackCommand::Seek(id, pos) => {
@@ -676,6 +687,20 @@ async fn run_endpoint(
                             if let Some(ref fmt) = m.track.format {
                                 println!("  Format: {fmt}");
                             }
+                        }
+                        #[cfg(feature = "web-ui")]
+                        {
+                            let title = m.track.title.clone();
+                            let artist = m.track.artist.clone();
+                            let album = m.track.album.clone();
+                            let artwork = m.track.artwork_url.clone();
+                            status_handle.update(move |s| {
+                                s.track_title = Some(title);
+                                s.track_artist = Some(artist);
+                                s.track_album = Some(album);
+                                s.artwork_url = artwork;
+                                s.playing = true;
+                            }).await;
                         }
                     }
                     EndpointEvent::NextTrackReady { stream_id } => {
