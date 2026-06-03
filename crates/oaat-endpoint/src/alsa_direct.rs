@@ -37,6 +37,22 @@ impl AlsaDirectOutput {
         Some("default".to_string())
     }
 
+    pub fn auto_detect_usb_dac() -> Option<String> {
+        let devices = Self::list_devices();
+        // On ALSA, prefer any non-default device (likely USB DAC)
+        for d in &devices {
+            let lower = d.to_lowercase();
+            if lower.contains("usb") || lower.contains("dac") {
+                return Some(d.clone());
+            }
+        }
+        None
+    }
+
+    pub fn current_device_name(&self) -> Option<&str> {
+        Some("alsa-direct")
+    }
+
     pub fn new() -> Self {
         Self {
             process: None,
