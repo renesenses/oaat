@@ -110,15 +110,16 @@ impl AlsaDirectOutput {
         };
 
         if format == AudioFormat::Flac {
-            let child = Command::new("ffmpeg")
-                .args([
-                    "-f", "flac",
-                    "-i", "pipe:0",
-                    "-f", "alsa",
-                    "-ar", &sample_rate.to_string(),
-                    "-ac", &channels.to_string(),
-                    device,
-                ])
+            let alsa_fmt = match sample_rate {
+                _ if channels == 2 => "S24_3LE",
+                _ => "S24_3LE",
+            };
+            let cmd = format!(
+                "ffmpeg -f flac -i pipe:0 -f s24le -ar {} -ac {} pipe:1 | aplay -D {} -f {} -r {} -c {} -t raw -q",
+                sample_rate, channels, device, alsa_fmt, sample_rate, channels
+            );
+            let child = Command::new("sh")
+                .args(["-c", &cmd])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
@@ -126,10 +127,10 @@ impl AlsaDirectOutput {
 
             info!(
                 device,
-                format = "FLAC→ALSA",
+                format = "FLAC→s24le→aplay",
                 sample_rate,
                 channels,
-                "ALSA direct output started (ffmpeg FLAC decode)"
+                "ALSA direct output started (ffmpeg FLAC pipe aplay)"
             );
 
             self.process = Some(child);
