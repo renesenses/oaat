@@ -2,6 +2,7 @@ pub mod capability;
 pub mod clock;
 pub mod codec;
 pub mod error;
+pub mod fec;
 pub mod format;
 pub mod message;
 pub mod session;
