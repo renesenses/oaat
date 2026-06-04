@@ -47,6 +47,8 @@ impl EndpointAnnouncement {
         let v_str = PROTOCOL_VERSION.to_string();
         let caps_str = self.capabilities.to_string();
         let ch_str = self.channels_max.to_string();
+        let local_ip = detect_local_ip();
+        let ip_str = local_ip.to_string();
 
         let mut props: Vec<(&str, &str)> = vec![
             ("v", &v_str),
@@ -54,6 +56,7 @@ impl EndpointAnnouncement {
             ("name", &self.instance_name),
             ("caps", &caps_str),
             ("ch", &ch_str),
+            ("ip", &ip_str),
         ];
         if let Some(ref vol) = self.volume_type {
             props.push(("vol", vol));
@@ -68,9 +71,6 @@ impl EndpointAnnouncement {
             props.push(("fw", fw));
         }
 
-        let local_ip = detect_local_ip();
-        let ip_str = local_ip.to_string();
-
         let service = ServiceInfo::new(
             &service_type,
             &self.instance_name,
@@ -78,8 +78,7 @@ impl EndpointAnnouncement {
             &ip_str,
             self.port,
             &props[..],
-        )?
-        .enable_addr_auto();
+        )?;
 
         mdns.register(service)?;
         info!(
