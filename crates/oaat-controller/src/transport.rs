@@ -55,7 +55,17 @@ impl ConnectedEndpoint {
         config: &ControllerConfig,
         endpoint_addr: SocketAddr,
     ) -> Result<Self, OaatError> {
-        let stream = TcpStream::connect(endpoint_addr).await?;
+        let stream = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            TcpStream::connect(endpoint_addr),
+        )
+        .await
+        .map_err(|_| {
+            OaatError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("connect timeout (5s) to {endpoint_addr}"),
+            ))
+        })??;
 
         #[cfg(feature = "tls")]
         if config.tls {
