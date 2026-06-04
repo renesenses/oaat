@@ -122,7 +122,7 @@ impl AlsaDirectOutput {
                 .args(["-c", &cmd])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
-                .stderr(Stdio::piped())
+                .stderr(Stdio::inherit())
                 .spawn()?;
 
             info!(
@@ -205,8 +205,19 @@ impl AlsaDirectOutput {
             return 0;
         };
 
-        if child.try_wait().ok().flatten().is_some() {
-            warn!("aplay process exited unexpectedly");
+        if let Some(status) = child.try_wait().ok().flatten() {
+            let stderr_msg = child.stderr.take()
+                .and_then(|mut e| {
+                    let mut buf = String::new();
+                    std::io::Read::read_to_string(&mut e, &mut buf).ok()?;
+                    Some(buf)
+                })
+                .unwrap_or_default();
+            warn!(
+                exit_code = %status,
+                stderr = %stderr_msg.trim(),
+                "audio output process exited unexpectedly"
+            );
             self.process = None;
             return 0;
         }
