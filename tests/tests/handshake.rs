@@ -862,15 +862,23 @@ async fn multiroom_zone_streams_to_two_endpoints() {
     .await
     .unwrap();
 
-    // Both endpoints should get FormatAccepted + FormatProposed
+    // Both endpoints should get FormatAccepted (may be preceded by zone events)
     for rx in &mut ep_rxs {
-        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        match event {
-            EndpointEvent::FormatAccepted { stream_id } => assert_eq!(stream_id, "zone-stream"),
-            _ => panic!("expected FormatAccepted"),
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            match event {
+                EndpointEvent::FormatAccepted { stream_id } => {
+                    assert_eq!(stream_id, "zone-stream");
+                    break;
+                }
+                EndpointEvent::ZoneAssigned { .. }
+                | EndpointEvent::ZoneUpdated { .. }
+                | EndpointEvent::FormatProposed(_) => continue,
+                other => panic!("expected FormatAccepted, got {other:?}"),
+            }
         }
     }
 
@@ -915,4 +923,263 @@ async fn multiroom_zone_streams_to_two_endpoints() {
     }
 
     zone.stop_all("zone-stream").await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Multi-device tests
+// ---------------------------------------------------------------------------
+
+async fn spawn_test_endpoint(index: usize) -> (SocketAddr, mpsc::Receiver<EndpointEvent>) {
+    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let control = tcp.local_addr().unwrap();
+    let audio: SocketAddr = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let clock: SocketAddr = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    drop(tcp);
+
+    let ep_config = EndpointConfig {
+        endpoint_id: format!("ep-multi-{index}"),
+        endpoint_name: format!("Multi Endpoint {index}"),
+        control_addr: control,
+        audio_addr: audio,
+        clock_addr: clock,
+        capabilities: test_capabilities(),
+        buffer_size_ms: 1000,
+        tls: false,
+    };
+
+    let (event_tx, event_rx) = mpsc::channel(256);
+    let (_ctrl_tx, ctrl_rx) = mpsc::channel(32);
+
+    tokio::spawn(async move {
+        EndpointTransport::run(ep_config, event_tx, ctrl_rx)
+            .await
+            .ok();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (control, event_rx)
+}
+
+fn test_controller_config() -> ControllerConfig {
+    ControllerConfig {
+        controller_id: "ctrl-multi".into(),
+        controller_name: "Multi Controller".into(),
+        features: vec![],
+        clock_port: 9742,
+        tls: false,
+    }
+}
+
+/// Drain events until we find one matching the predicate, or timeout.
+async fn drain_until<F>(rx: &mut mpsc::Receiver<EndpointEvent>, pred: F) -> Option<EndpointEvent>
+where
+    F: Fn(&EndpointEvent) -> bool,
+{
+    for _ in 0..50 {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await {
+            Ok(Some(event)) if pred(&event) => return Some(event),
+            Ok(Some(_)) => continue,
+            _ => return None,
+        }
+    }
+    None
+}
+
+#[tokio::test]
+async fn zone_manager_create_and_dissolve() {
+    init_tracing();
+    use oaat_controller::ZoneManager;
+
+    let mut mgr = ZoneManager::new(test_controller_config());
+    let mut events = mgr.subscribe();
+
+    mgr.create_zone("z1".into(), "Living Room".into());
+    mgr.create_zone("z2".into(), "Kitchen".into());
+
+    assert_eq!(mgr.zone_ids().len(), 2);
+
+    let snap = mgr.snapshot();
+    assert_eq!(snap.len(), 2);
+
+    mgr.dissolve_zone("z1");
+    assert_eq!(mgr.zone_ids().len(), 1);
+
+    // Verify events
+    let e1 = events.recv().await.unwrap();
+    assert!(matches!(e1, oaat_controller::ZoneEvent::ZoneCreated { ref zone_id, .. } if zone_id == "z1"));
+    let e2 = events.recv().await.unwrap();
+    assert!(matches!(e2, oaat_controller::ZoneEvent::ZoneCreated { ref zone_id, .. } if zone_id == "z2"));
+    let e3 = events.recv().await.unwrap();
+    assert!(matches!(e3, oaat_controller::ZoneEvent::ZoneDissolved { ref zone_id } if zone_id == "z1"));
+}
+
+#[tokio::test]
+async fn zone_manager_add_endpoint_emits_event() {
+    init_tracing();
+    use oaat_controller::ZoneManager;
+
+    let (addr, mut ep_rx) = spawn_test_endpoint(10).await;
+    let mut mgr = ZoneManager::new(test_controller_config());
+    let mut events = mgr.subscribe();
+
+    mgr.create_zone("z1".into(), "Zone".into());
+    let ep_id = mgr.add_endpoint_to_zone("z1", addr).await.unwrap();
+    assert!(!ep_id.is_empty());
+
+    // Should have ZoneCreated + EndpointJoined
+    let _ = events.recv().await; // ZoneCreated
+    let e = events.recv().await.unwrap();
+    assert!(matches!(e, oaat_controller::ZoneEvent::EndpointJoined { ref zone_id, .. } if zone_id == "z1"));
+
+    // Endpoint should have received ZoneAssigned
+    let ev = drain_until(&mut ep_rx, |e| matches!(e, EndpointEvent::ZoneAssigned { .. })).await;
+    assert!(ev.is_some());
+
+    mgr.dissolve_zone("z1");
+}
+
+#[tokio::test]
+async fn per_device_volume() {
+    init_tracing();
+
+    let (addr0, _rx0) = spawn_test_endpoint(20).await;
+    let (addr1, _rx1) = spawn_test_endpoint(21).await;
+
+    let mut zone = oaat_controller::Zone::new(
+        "z-vol".into(),
+        "Volume Zone".into(),
+        test_controller_config(),
+    );
+
+    let ep0 = zone.add_endpoint(addr0).await.unwrap();
+    let ep1 = zone.add_endpoint(addr1).await.unwrap();
+
+    // Set master volume
+    zone.set_volume_all(80).await.unwrap();
+    assert_eq!(zone.volume_map().master, 80);
+
+    // Set per-device offset for endpoint 1
+    zone.set_volume_offset(&ep1, -20).await.unwrap();
+
+    // Check effective volumes
+    assert_eq!(zone.volume_map().effective_volume(&ep0), 80); // no offset
+    assert_eq!(zone.volume_map().effective_volume(&ep1), 60); // 80 + (-20)
+
+    // Set absolute level for endpoint 0
+    zone.set_volume_endpoint(&ep0, 50).await.unwrap();
+    assert_eq!(zone.volume_map().effective_volume(&ep0), 50);
+    // offset should be 50 - 80 = -30
+    assert_eq!(zone.volume_map().offset(&ep0), -30);
+}
+
+#[tokio::test]
+async fn late_join_catches_up_to_active_stream() {
+    init_tracing();
+
+    let (addr0, mut _rx0) = spawn_test_endpoint(30).await;
+    let (addr1, mut rx1) = spawn_test_endpoint(31).await;
+
+    let mut zone = oaat_controller::Zone::new(
+        "z-late".into(),
+        "Late Join Zone".into(),
+        test_controller_config(),
+    );
+
+    // Add first endpoint and start streaming
+    let _ep0 = zone.add_endpoint(addr0).await.unwrap();
+    zone.propose_format_all("stream-1", AudioFormat::PcmS16le, 44100, 2, ChannelLayout::Stereo, 16)
+        .await
+        .unwrap();
+
+    zone.send_metadata_all(oaat_core::message::TrackMetadata {
+        title: "Test".into(),
+        artist: "Artist".into(),
+        album: "Album".into(),
+        duration_ms: 60000,
+        artwork_url: None,
+        format: None,
+    })
+    .await
+    .unwrap();
+
+    zone.play_all("stream-1").await.unwrap();
+
+    // Send a few audio packets
+    for i in 0..3u64 {
+        let payload = vec![0u8; 960];
+        zone.send_audio_all(1, AudioFormat::PcmS16le, i * 5_000_000, i * 240, &payload, PacketFlags::empty())
+            .await
+            .unwrap();
+    }
+
+    // Now late-join the second endpoint
+    let _ep1 = zone.join_active(addr1).await.unwrap();
+
+    // The second endpoint should receive ZoneAssigned, FormatProposed/Accepted, Metadata, and Play
+    let got_zone = drain_until(&mut rx1, |e| matches!(e, EndpointEvent::ZoneAssigned { .. })).await;
+    assert!(got_zone.is_some(), "late-join endpoint should get ZoneAssigned");
+
+    let got_format = drain_until(&mut rx1, |e| matches!(e, EndpointEvent::FormatAccepted { .. })).await;
+    assert!(got_format.is_some(), "late-join endpoint should get FormatAccepted");
+
+    let got_meta = drain_until(&mut rx1, |e| matches!(e, EndpointEvent::Metadata(_))).await;
+    assert!(got_meta.is_some(), "late-join endpoint should get Metadata");
+
+    let got_play = drain_until(&mut rx1, |e| matches!(e, EndpointEvent::Playback(oaat_endpoint::transport::PlaybackCommand::Play(_)))).await;
+    assert!(got_play.is_some(), "late-join endpoint should get Play");
+
+    // Verify the late-join endpoint also receives subsequent audio packets
+    for i in 3..6u64 {
+        let payload = vec![0u8; 960];
+        zone.send_audio_all(1, AudioFormat::PcmS16le, i * 5_000_000, i * 240, &payload, PacketFlags::empty())
+            .await
+            .unwrap();
+    }
+
+    let got_audio = drain_until(&mut rx1, |e| matches!(e, EndpointEvent::AudioPacket { .. })).await;
+    assert!(got_audio.is_some(), "late-join endpoint should receive audio packets");
+
+    zone.stop_all("stream-1").await.unwrap();
+}
+
+#[tokio::test]
+async fn remove_endpoint_sends_zone_release() {
+    init_tracing();
+
+    let (addr0, mut rx0) = spawn_test_endpoint(40).await;
+    let (addr1, mut rx1) = spawn_test_endpoint(41).await;
+
+    let mut zone = oaat_controller::Zone::new(
+        "z-remove".into(),
+        "Remove Zone".into(),
+        test_controller_config(),
+    );
+
+    let ep0 = zone.add_endpoint(addr0).await.unwrap();
+    let _ep1 = zone.add_endpoint(addr1).await.unwrap();
+    assert_eq!(zone.endpoint_count(), 2);
+
+    // Remove endpoint 0 with notification
+    zone.remove_endpoint_and_notify(&ep0).await;
+    assert_eq!(zone.endpoint_count(), 1);
+
+    // Endpoint 1 should get a ZoneUpdate with 1 member remaining
+    // (skip earlier ZoneUpdated events from add_endpoint broadcasts)
+    let got_update = drain_until(&mut rx1, |e| {
+        matches!(e, EndpointEvent::ZoneUpdated { endpoint_ids, .. } if endpoint_ids.len() == 1)
+    })
+    .await;
+    assert!(got_update.is_some(), "remaining endpoint should get ZoneUpdate with 1 member after removal");
+
+    // Endpoint 0 should get ZoneRelease (sent fire-and-forget on remove)
+    let got_release = drain_until(&mut rx0, |e| matches!(e, EndpointEvent::ZoneReleased { .. })).await;
+    assert!(got_release.is_some(), "removed endpoint should get ZoneRelease");
 }

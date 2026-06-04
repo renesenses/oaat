@@ -35,6 +35,7 @@ pub enum Message {
     ZoneAssign(ZoneAssign),
     ZoneUpdate(ZoneUpdate),
     ZoneRelease(ZoneRelease),
+    ZoneAck(ZoneAck),
 
     // -- Gapless --
     NextTrackPrepare(NextTrackPrepare),
@@ -219,6 +220,15 @@ pub struct ZoneUpdate {
 pub struct ZoneRelease {
     pub zone_id: String,
     pub endpoint_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ZoneAck {
+    pub zone_id: String,
+    pub endpoint_id: String,
+    pub accepted: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 // -- Gapless --

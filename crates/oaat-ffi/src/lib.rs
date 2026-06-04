@@ -579,9 +579,11 @@ fn convert_event(ep: &OaatEndpoint, event: EndpointEvent) -> OaatEvent {
         }
 
         // Events that don't have a direct C mapping — surface as None
-        EndpointEvent::NextTrackReady { .. } | EndpointEvent::NextTrackReformat { .. } => {
-            none_event()
-        }
+        EndpointEvent::NextTrackReady { .. }
+        | EndpointEvent::NextTrackReformat { .. }
+        | EndpointEvent::ZoneAssigned { .. }
+        | EndpointEvent::ZoneUpdated { .. }
+        | EndpointEvent::ZoneReleased { .. } => none_event(),
     }
 }
 

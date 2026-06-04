@@ -17,15 +17,12 @@ pub struct EndpointAnnouncement {
 }
 
 fn detect_local_ip() -> Ipv4Addr {
-    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok();
-    if let Some(sock) = sock {
-        if sock.connect("8.8.8.8:53").is_ok() {
-            if let Ok(addr) = sock.local_addr() {
-                if let std::net::IpAddr::V4(v4) = addr.ip() {
-                    return v4;
-                }
-            }
-        }
+    if let Some(sock) = std::net::UdpSocket::bind("0.0.0.0:0").ok()
+        && sock.connect("8.8.8.8:53").is_ok()
+        && let Ok(addr) = sock.local_addr()
+        && let std::net::IpAddr::V4(v4) = addr.ip()
+    {
+        return v4;
     }
     warn!("could not detect local IP, falling back to 0.0.0.0");
     Ipv4Addr::UNSPECIFIED

@@ -1,7 +1,7 @@
 # RFC: OAAT -- Open Advanced Audio Transport
 
-**Version**: 0.1.0 (Draft)
-**Date**: 2026-05-29
+**Version**: 0.2.0 (Draft)
+**Date**: 2026-06-04
 **Author**: Bertrand Clech / MozAIk Labs
 **Status**: Draft
 **License**: Apache 2.0
@@ -75,9 +75,15 @@ A **Zone** is a logical grouping of one or more Endpoints that play the same aud
 
 Zone operations:
 - `zone.create(endpoint_ids[])` -- create a zone with initial members
-- `zone.add(endpoint_id)` -- add an endpoint to an existing zone
-- `zone.remove(endpoint_id)` -- remove an endpoint from a zone
+- `zone.add(endpoint_id)` -- add an endpoint to an existing zone (supports late-join during playback)
+- `zone.remove(endpoint_id)` -- remove an endpoint from a zone (graceful, notifies remaining members)
 - `zone.destroy()` -- dissolve a zone, all endpoints become idle
+
+A **Zone Manager** is the centralized component that manages all zones. It provides:
+- Zone lifecycle (create, dissolve, list, snapshot)
+- Endpoint movement between zones
+- Event stream for zone membership changes (endpoint joined, left, failed)
+- Health monitoring of connected endpoints
 
 ### 2.3 Session Lifecycle
 
@@ -456,11 +462,104 @@ JSON objects over TCP, framed with 4-byte big-endian length prefix:
 
 ### 7.5 Zone Management
 
-| Message Type | Description |
-|-------------|-------------|
-| `zone_assign` | Assign endpoint to a zone |
-| `zone_update` | Zone membership changed |
-| `zone_release` | Remove endpoint from zone |
+Zone management allows dynamic multi-device grouping during playback.
+
+| Message Type | Direction | Description |
+|-------------|-----------|-------------|
+| `zone_assign` | C → E | Assign endpoint to a zone |
+| `zone_update` | C → E | Zone membership changed (broadcast to all members) |
+| `zone_release` | C → E | Remove endpoint from zone |
+| `zone_ack` | E → C | Acknowledge zone assignment |
+
+#### 7.5.1 Zone Assignment
+
+When a Controller adds an Endpoint to a Zone, it sends `zone_assign`:
+
+```json
+{
+  "type": "zone_assign",
+  "zone_id": "zone-living-room",
+  "endpoint_id": "a3f8...c7"
+}
+```
+
+The Endpoint MUST respond with `zone_ack`:
+
+```json
+{
+  "type": "zone_ack",
+  "zone_id": "zone-living-room",
+  "endpoint_id": "a3f8...c7",
+  "accepted": true,
+  "reason": null
+}
+```
+
+An Endpoint MAY reject a zone assignment (e.g., if already in another zone from a different Controller) by setting `accepted: false` with a reason string.
+
+#### 7.5.2 Zone Membership Updates
+
+When zone membership changes (endpoint added or removed), the Controller broadcasts `zone_update` to ALL remaining zone members:
+
+```json
+{
+  "type": "zone_update",
+  "zone_id": "zone-living-room",
+  "endpoint_ids": ["a3f8...c7", "b2e1...d9"]
+}
+```
+
+This allows endpoints to be aware of their peers (useful for companion app UIs and diagnostics).
+
+#### 7.5.3 Zone Release
+
+When an Endpoint is removed from a Zone:
+
+```json
+{
+  "type": "zone_release",
+  "zone_id": "zone-living-room",
+  "endpoint_id": "a3f8...c7"
+}
+```
+
+The Endpoint MUST stop playback and return to Idle upon receiving `zone_release`. No acknowledgment is required.
+
+#### 7.5.4 Late-Join Protocol
+
+An Endpoint MAY join a Zone that is already streaming. The Controller performs the following sequence:
+
+1. TCP connect + handshake (Hello/HelloAck)
+2. Clock sync bootstrap (10 exchanges)
+3. `zone_assign` → wait for `zone_ack`
+4. `format_propose` with the current stream's format
+5. `metadata` with the current track information
+6. `volume_set` with the effective volume for this endpoint
+7. `play` — the Endpoint begins playback
+8. `zone_update` broadcast to all zone members
+
+The late-joining Endpoint will start receiving audio packets from the current position in the stream. There is no catch-up mechanism for already-played audio.
+
+#### 7.5.5 Per-Device Volume
+
+Volume in a multi-device zone uses a **master + offset** model:
+
+- **Master volume**: Zone-wide level (0-100), applied to all endpoints.
+- **Per-endpoint offset**: Signed delta (-100 to +100) per endpoint.
+- **Effective volume**: `clamp(master + offset, 0, 100)`
+
+The Controller sends `volume_set` with the effective volume computed for each endpoint individually. Endpoints are unaware of the master/offset model — they only see their effective level.
+
+This allows users to balance volume across rooms (e.g., kitchen louder than bedroom) while adjusting the overall zone volume with a single control.
+
+#### 7.5.6 Endpoint Health
+
+The Controller SHOULD monitor endpoint health:
+
+- **TCP reader task**: If the TCP control connection drops, the endpoint is considered disconnected.
+- **Clock sync**: If 3 consecutive clock sync exchanges fail (timeout > 1s each), the endpoint SHOULD be marked as degraded.
+- **Graceful degradation**: Audio continues to healthy endpoints; failed endpoints are removed from the zone.
+- **Reconnection**: The Controller MAY attempt to reconnect a failed endpoint and re-join it to the zone via the late-join protocol.
 
 ### 7.6 Gapless Playback
 
@@ -598,23 +697,26 @@ trait OaatHal {
 
 ## 12. Implementation Phases
 
-### Phase 1: Foundation (MVP) -- 4-6 weeks
-Single Controller, single Endpoint, stereo PCM playback. `oaat-types`, `oaat-endpoint`, `oaat-controller` crates. Basic CLI tools.
+### Phase 1: Foundation (MVP) ✅
+Single Controller, single Endpoint, stereo PCM playback. `oaat-core`, `oaat-endpoint`, `oaat-controller` crates. CLI tools. 20 conformance tests.
 
-### Phase 2: Multi-Room -- 3-4 weeks
-Zone support, synchronized playback across 2+ endpoints. Clock sync refinement, drift detection.
+### Phase 2: Multi-Room ✅
+Zone support, synchronized playback across 2+ endpoints. PTP-inspired clock sync, EMA filtering.
 
-### Phase 3: Format Coverage -- 3-4 weeks
-DSD native, FLAC transport, gapless playback, all PCM formats.
+### Phase 3: Format Coverage ✅
+DSD native, FLAC transport, gapless playback, all 10 PCM/DSD/compressed formats. Format negotiation with counter-proposal.
 
-### Phase 4: Production Hardening -- 4-6 weeks
-TLS, PSK auth, reconnection logic, Wi-Fi adaptation, QoS, `oaat-test` conformance tool.
+### Phase 4: Production Hardening ✅
+TLS 1.3 (TOFU), reconnection logic, `oaat-test` conformance tool, ALSA direct output, USB DAC auto-detection, daemon mode, web status UI.
 
-### Phase 5: Ecosystem -- Ongoing
-Tune integration, C FFI bindings, PyO3 bindings, example HAL implementations, outreach to Volumio/moOde/HiFiBerryOS, IETF Internet-Draft.
+### Phase 5: Dynamic Multi-Device ✅
+Zone Manager with event system, dynamic join/leave during playback, per-device volume (master + offset model), zone protocol messages (ZoneAssign/ZoneUpdate/ZoneRelease/ZoneAck), endpoint health monitoring, graceful degradation, C FFI bindings.
 
-### Phase 6: Advanced Features -- Post v1.0
-Multi-channel, room correction exchange, mesh topology, WAN extension, power management.
+### Phase 6: Ecosystem -- In progress
+Tune server integration (OaatOutput/OaatMultiroomOutput), crates.io publication, Raspberry Pi deployment, outreach to Volumio/moOde/HiFiBerryOS.
+
+### Phase 7: Advanced Features -- Post v1.0
+Multi-channel, room correction exchange, mesh topology, WAN extension (Tune Cloud/Bridge), power management, IETF Internet-Draft.
 
 ---
 
@@ -661,3 +763,6 @@ Building OAAT from scratch allows clean design decisions (UDP audio, PTP sync, e
 | TOFU | Trust On First Use -- certificate acceptance pattern |
 | FEC | Forward Error Correction -- redundant data for packet loss recovery |
 | EMA | Exponential Moving Average -- clock offset smoothing filter |
+| Zone Manager | Centralized component managing all zones, events, and endpoint health |
+| Late-Join | Process of adding an endpoint to a zone that is already streaming |
+| Volume Offset | Per-endpoint signed delta applied to zone master volume |

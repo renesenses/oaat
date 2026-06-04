@@ -34,4 +34,7 @@ pub enum OaatError {
 
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+
+    #[error("protocol: {0}")]
+    Protocol(String),
 }

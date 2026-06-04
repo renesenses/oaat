@@ -23,6 +23,7 @@ pub struct EndpointConfig {
     pub tls: bool,
 }
 
+#[derive(Debug)]
 pub enum EndpointEvent {
     Connected {
         controller_id: String,
@@ -51,10 +52,21 @@ pub enum EndpointEvent {
         format: oaat_core::format::AudioFormat,
         sample_rate: u32,
     },
+    ZoneAssigned {
+        zone_id: String,
+    },
+    ZoneUpdated {
+        zone_id: String,
+        endpoint_ids: Vec<String>,
+    },
+    ZoneReleased {
+        zone_id: String,
+    },
     Disconnected,
     Error(OaatError),
 }
 
+#[derive(Debug)]
 pub enum PlaybackCommand {
     Play(String),
     Pause(String),
@@ -62,6 +74,7 @@ pub enum PlaybackCommand {
     Seek(String, u64),
 }
 
+#[derive(Debug)]
 pub enum VolumeCommand {
     Set(u8),
     Get,
@@ -414,6 +427,42 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
                     Message::Mute(m) => {
                         let _ = event_tx
                             .send(EndpointEvent::Volume(VolumeCommand::Mute(m.muted)))
+                            .await;
+                    }
+                    Message::ZoneAssign(za) => {
+                        info!(zone_id = %za.zone_id, "assigned to zone");
+                        let ack = Message::ZoneAck(oaat_core::message::ZoneAck {
+                            zone_id: za.zone_id.clone(),
+                            endpoint_id: za.endpoint_id.clone(),
+                            accepted: true,
+                            reason: None,
+                        });
+                        writer.write_all(&FrameCodec::encode(&ack)).await?;
+                        let _ = event_tx
+                            .send(EndpointEvent::ZoneAssigned {
+                                zone_id: za.zone_id,
+                            })
+                            .await;
+                    }
+                    Message::ZoneUpdate(zu) => {
+                        info!(
+                            zone_id = %zu.zone_id,
+                            members = zu.endpoint_ids.len(),
+                            "zone membership updated"
+                        );
+                        let _ = event_tx
+                            .send(EndpointEvent::ZoneUpdated {
+                                zone_id: zu.zone_id,
+                                endpoint_ids: zu.endpoint_ids,
+                            })
+                            .await;
+                    }
+                    Message::ZoneRelease(zr) => {
+                        info!(zone_id = %zr.zone_id, "released from zone");
+                        let _ = event_tx
+                            .send(EndpointEvent::ZoneReleased {
+                                zone_id: zr.zone_id,
+                            })
                             .await;
                     }
                     other => {

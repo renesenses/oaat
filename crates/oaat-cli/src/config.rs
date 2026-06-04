@@ -80,7 +80,7 @@ impl Default for CapabilitiesSection {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct DacSection {
     /// Use ALSA hardware volume control instead of software volume.
@@ -93,15 +93,6 @@ pub struct DacSection {
     pub fir_filter: Option<String>,
 }
 
-impl Default for DacSection {
-    fn default() -> Self {
-        Self {
-            hardware_volume: false,
-            card: 0,
-            fir_filter: None,
-        }
-    }
-}
 
 impl Default for LoggingSection {
     fn default() -> Self {

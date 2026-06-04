@@ -127,10 +127,10 @@ fn write_pid_file() {
 
 /// Remove PID file on shutdown.
 fn remove_pid_file() {
-    if std::path::Path::new(PID_FILE).exists() {
-        if let Err(e) = std::fs::remove_file(PID_FILE) {
-            warn!(error = %e, "failed to remove PID file");
-        }
+    if std::path::Path::new(PID_FILE).exists()
+        && let Err(e) = std::fs::remove_file(PID_FILE)
+    {
+        warn!(error = %e, "failed to remove PID file");
     }
 }
 
@@ -422,7 +422,7 @@ async fn run_endpoint(
     let (status_handle, device_switch_rx) = {
         let initial_device = audio_device
             .as_deref()
-            .unwrap_or_else(|| "system default")
+            .unwrap_or("system default")
             .to_string();
         let initial_status = web_ui::BridgeStatus {
             bridge_name: name.clone(),
@@ -781,6 +781,27 @@ async fn run_endpoint(
                             }
                         }
                     },
+                    EndpointEvent::ZoneAssigned { zone_id } => {
+                        if daemon {
+                            info!(zone_id = %zone_id, "assigned to zone");
+                        } else {
+                            println!("Zone assigned: {zone_id}");
+                        }
+                    }
+                    EndpointEvent::ZoneUpdated { zone_id, endpoint_ids } => {
+                        if daemon {
+                            info!(zone_id = %zone_id, members = endpoint_ids.len(), "zone updated");
+                        } else {
+                            println!("Zone {zone_id}: {} member(s)", endpoint_ids.len());
+                        }
+                    }
+                    EndpointEvent::ZoneReleased { zone_id } => {
+                        if daemon {
+                            info!(zone_id = %zone_id, "released from zone");
+                        } else {
+                            println!("Zone released: {zone_id}");
+                        }
+                    }
                     EndpointEvent::Disconnected => {
                         audio.stop();
                         #[cfg(feature = "web-ui")]
@@ -1146,7 +1167,7 @@ async fn run_controller_file(name: String, target: Option<SocketAddr>, path: &st
             break;
         }
         data_offset += 8 + chunk_size;
-        if chunk_size % 2 != 0 {
+        if !chunk_size.is_multiple_of(2) {
             data_offset += 1;
         }
     }

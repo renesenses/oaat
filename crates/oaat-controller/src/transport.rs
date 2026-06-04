@@ -11,6 +11,7 @@ use oaat_core::message::*;
 use oaat_core::wire::{AUDIO_HEADER_SIZE, AudioPacketHeader, ClockSyncPacket, ClockSyncType};
 use oaat_core::{Message, OaatError, PROTOCOL_VERSION};
 
+#[derive(Clone)]
 pub struct ControllerConfig {
     pub controller_id: String,
     pub controller_name: String,
@@ -382,6 +383,12 @@ impl ConnectedEndpoint {
 
     pub async fn clock_offset_ns(&self) -> i64 {
         self.clock_state.lock().await.offset_ns()
+    }
+
+    /// Check whether the TCP reader task is still running.
+    /// Returns `false` once the endpoint has disconnected or the reader errored out.
+    pub fn is_reader_alive(&self) -> bool {
+        !self.reader_task.is_finished()
     }
 }
 
