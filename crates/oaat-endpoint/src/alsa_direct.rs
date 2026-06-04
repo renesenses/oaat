@@ -110,28 +110,27 @@ impl AlsaDirectOutput {
         };
 
         if format == AudioFormat::Flac {
-            // Decode FLAC in write_audio via symphonia, output raw f32 PCM to aplay.
-            // No FFmpeg needed.
-            let child = Command::new("aplay")
-                .args([
-                    "-D", device,
-                    "-f", "FLOAT_LE",
-                    "-r", &sample_rate.to_string(),
-                    "-c", &channels.to_string(),
-                    "-t", "raw",
-                    "-q",
-                ])
+            // Stream FLAC through ffmpeg → raw PCM → aplay.
+            // Each write_audio() call writes FLAC data to ffmpeg's stdin;
+            // ffmpeg handles the streaming decode (needs FLAC headers only once).
+            let bits = if channels <= 2 { "s24le" } else { "s16le" };
+            let alsa_fmt = if bits == "s24le" { "S24_3LE" } else { "S16_LE" };
+            let cmd = format!(
+                "ffmpeg -hide_banner -loglevel error -f flac -i pipe:0 -f {bits} -ar {sample_rate} -ac {channels} pipe:1 | aplay -D {device} -f {alsa_fmt} -r {sample_rate} -c {channels} -t raw -q"
+            );
+            let child = Command::new("sh")
+                .args(["-c", &cmd])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .spawn()?;
 
             info!(
                 device,
-                format = "FLAC→symphonia→f32→aplay",
+                format = %format!("FLAC→ffmpeg→{bits}→aplay"),
                 sample_rate,
                 channels,
-                "ALSA direct output started (Rust FLAC decode)"
+                "ALSA direct output started (ffmpeg FLAC pipe)"
             );
 
             self.process = Some(child);
@@ -218,38 +217,17 @@ impl AlsaDirectOutput {
 
         let vol = self.volume.load(Ordering::Relaxed) as f32 / 1000.0;
 
-        // For FLAC: decode to f32 PCM via symphonia, then write raw f32 to aplay
+        // For FLAC: write raw FLAC data to ffmpeg pipe (ffmpeg handles decode)
         if self.format == AudioFormat::Flac {
-            #[cfg(feature = "flac")]
-            {
-                match crate::flac_decoder::decode_flac_to_f32(data) {
-                    Ok(samples) => {
-                        let pcm: Vec<u8> = if (vol - 1.0).abs() < 0.001 {
-                            samples.iter().flat_map(|s| s.to_le_bytes()).collect()
-                        } else {
-                            samples.iter().flat_map(|s| (s * vol).to_le_bytes()).collect()
-                        };
-                        match stdin.write_all(&pcm) {
-                            Ok(()) => {
-                                self.bytes_written += pcm.len() as u64;
-                                return samples.len() / self.channels.max(1) as usize;
-                            }
-                            Err(e) => {
-                                error!(error = %e, "ALSA FLAC write failed");
-                                return 0;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "FLAC decode failed, skipping packet");
-                        return 0;
-                    }
+            match stdin.write_all(data) {
+                Ok(()) => {
+                    self.bytes_written += data.len() as u64;
+                    return data.len() / 4;
                 }
-            }
-            #[cfg(not(feature = "flac"))]
-            {
-                warn!("FLAC data received but flac feature not enabled");
-                return 0;
+                Err(e) => {
+                    error!(error = %e, "ALSA FLAC pipe write failed");
+                    return 0;
+                }
             }
         }
 
