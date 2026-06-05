@@ -77,6 +77,7 @@ pub struct Zone {
     sequence: u16,
     volume: VolumeMap,
     active_stream: Option<ActiveStream>,
+    fec_encoder: Option<oaat_core::fec::FecEncoder>,
 }
 
 impl Zone {
@@ -89,6 +90,7 @@ impl Zone {
             sequence: 0,
             volume: VolumeMap::new(),
             active_stream: None,
+            fec_encoder: None,
         }
     }
 
@@ -393,6 +395,22 @@ impl Zone {
         Ok(())
     }
 
+    // -- FEC --
+
+    /// Enable Forward Error Correction. Sends a parity packet every `group_size` data packets.
+    pub fn enable_fec(&mut self, group_size: u8) {
+        self.fec_encoder = Some(oaat_core::fec::FecEncoder::new(group_size));
+        info!(zone = %self.name, group_size, "FEC enabled");
+    }
+
+    pub fn disable_fec(&mut self) {
+        self.fec_encoder = None;
+    }
+
+    pub fn fec_enabled(&self) -> bool {
+        self.fec_encoder.is_some()
+    }
+
     // -- Audio --
 
     pub async fn send_audio_all(
@@ -440,6 +458,37 @@ impl Zone {
                 error!(endpoint = %id, error = %e, "audio send failed");
             }
         }
+
+        // FEC: accumulate and send parity packet when group is complete
+        if let Some(ref mut fec) = self.fec_encoder {
+            if let Some(parity_payload) = fec.feed(self.sequence.wrapping_sub(1), payload) {
+                let parity_header = oaat_core::wire::AudioPacketHeader {
+                    version: oaat_core::wire::AudioPacketHeader::CURRENT_VERSION,
+                    flags: PacketFlags::FEC,
+                    format,
+                    sequence: self.sequence,
+                    stream_id,
+                    pts_ns,
+                    sample_offset,
+                    payload_len: parity_payload.len() as u16,
+                };
+                self.sequence = self.sequence.wrapping_add(1);
+
+                let mut parity_buf =
+                    vec![0u8; oaat_core::wire::AUDIO_HEADER_SIZE + parity_payload.len()];
+                let mut ph_buf = [0u8; oaat_core::wire::AUDIO_HEADER_SIZE];
+                parity_header.encode(&mut ph_buf);
+                parity_buf[..oaat_core::wire::AUDIO_HEADER_SIZE].copy_from_slice(&ph_buf);
+                parity_buf[oaat_core::wire::AUDIO_HEADER_SIZE..].copy_from_slice(&parity_payload);
+
+                for (id, socket, target) in &targets {
+                    if let Err(e) = socket.send_to(&parity_buf, target).await {
+                        error!(endpoint = %id, error = %e, "FEC parity send failed");
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
