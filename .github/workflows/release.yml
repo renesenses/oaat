@@ -61,7 +61,7 @@ jobs:
         shell: bash
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
-          ARCHIVE="${BINARY_NAME}-${TAG}-${{ matrix.target }}.${archive}"
+          ARCHIVE="${BINARY_NAME}-${TAG}-${{ matrix.target }}.${{ matrix.archive }}"
           BIN="target/${{ matrix.target }}/release/${BINARY_NAME}"
           if [ ! -f "$BIN" ]; then
             echo "Binary not found at $BIN"
