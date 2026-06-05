@@ -113,10 +113,10 @@ impl AlsaDirectOutput {
             // Stream FLAC through ffmpeg → raw PCM → aplay.
             // Each write_audio() call writes FLAC data to ffmpeg's stdin;
             // ffmpeg handles the streaming decode (needs FLAC headers only once).
-            let bits = if channels <= 2 { "s24le" } else { "s16le" };
-            let alsa_fmt = if bits == "s24le" { "S24_3LE" } else { "S16_LE" };
+            let bits = if channels <= 2 { "s32le" } else { "s16le" };
+            let alsa_fmt = if bits == "s32le" { "S32_LE" } else { "S16_LE" };
             let cmd = format!(
-                "ffmpeg -hide_banner -loglevel error -f flac -i /dev/stdin -f {bits} -ar {sample_rate} -ac {channels} - | aplay -D {device} -f {alsa_fmt} -r {sample_rate} -c {channels} -t raw -q"
+                "ffmpeg -hide_banner -loglevel warning -err_detect ignore_err -f flac -i /dev/stdin -f {bits} -ar {sample_rate} -ac {channels} - | aplay -D {device} -f {alsa_fmt} -r {sample_rate} -c {channels} -t raw -q"
             );
             let child = Command::new("sh")
                 .args(["-c", &cmd])
@@ -242,12 +242,17 @@ impl AlsaDirectOutput {
             }
         }
 
-        let result = if (vol - 1.0).abs() < 0.001 {
-            stdin.write_all(data)
+        let write_data;
+        let to_write = if self.format == AudioFormat::PcmS24le {
+            write_data = pad_s24_to_s32(if (vol - 1.0).abs() < 0.001 { data } else { &apply_volume(self.format, data, vol) });
+            &write_data
+        } else if (vol - 1.0).abs() < 0.001 {
+            data
         } else {
-            let scaled = apply_volume(self.format, data, vol);
-            stdin.write_all(&scaled)
+            write_data = apply_volume(self.format, data, vol);
+            &write_data
         };
+        let result = stdin.write_all(to_write);
 
         match result {
             Ok(()) => {
@@ -273,10 +278,18 @@ impl Default for AlsaDirectOutput {
     }
 }
 
+fn pad_s24_to_s32(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() / 3 * 4);
+    for chunk in data.chunks_exact(3) {
+        out.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 0]);
+    }
+    out
+}
+
 fn format_to_alsa(format: AudioFormat) -> Option<&'static str> {
     match format {
         AudioFormat::PcmS16le => Some("S16_LE"),
-        AudioFormat::PcmS24le => Some("S24_3LE"),
+        AudioFormat::PcmS24le => Some("S32_LE"),
         AudioFormat::PcmS24le4 => Some("S24_LE"),
         AudioFormat::PcmS32le => Some("S32_LE"),
         AudioFormat::PcmF32le => Some("FLOAT_LE"),
