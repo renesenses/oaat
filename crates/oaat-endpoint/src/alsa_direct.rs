@@ -26,7 +26,7 @@ impl AlsaDirectOutput {
             .map(|o| {
                 String::from_utf8_lossy(&o.stdout)
                     .lines()
-                    .filter(|l| l.starts_with("card "))
+                    .filter(|l| l.starts_with("card ") || l.starts_with("carte "))
                     .map(|l| l.to_string())
                     .collect()
             })

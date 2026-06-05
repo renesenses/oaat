@@ -190,13 +190,11 @@ async fn main() {
                         println!("  (no devices found — check `aplay -l`)");
                     }
                     println!("\nUsable names for --audio-device:");
-                    // Parse card names from aplay -l output and show sysdefault:CARD=X
                     for d in &devices {
-                        if let Some(card) = d.split(':').next() {
-                            if let Some(num) = card.strip_prefix("card ") {
-                                if let Some(name) = d.split('[').nth(1).and_then(|s| s.split(']').next()) {
-                                    let short = name.trim();
-                                    println!("  sysdefault:CARD={short}");
+                        if let Some(card) = d.split(':').nth(0) {
+                            if let Some(_num) = card.strip_prefix("card ").or_else(|| card.strip_prefix("carte ")) {
+                                if let Some(short_name) = d.split(':').nth(1).map(|s| s.trim().split_whitespace().next()).flatten() {
+                                    println!("  sysdefault:CARD={short_name}");
                                 }
                             }
                         }
