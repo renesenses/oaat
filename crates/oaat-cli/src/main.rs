@@ -612,7 +612,7 @@ async fn run_endpoint(
                         if !payload.is_empty() {
                             audio.write_audio(&payload);
                         }
-                        if !daemon && (packet_count.is_multiple_of(200) || header.flags.contains(PacketFlags::FIRST_PACKET)) {
+                        if !daemon && (packet_count.is_multiple_of(5000) || header.flags.contains(PacketFlags::FIRST_PACKET)) {
                             println!(
                                 "  [{packet_count}] seq={} buf={}",
                                 header.sequence,

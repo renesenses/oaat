@@ -116,7 +116,7 @@ impl AlsaDirectOutput {
             let bits = if channels <= 2 { "s32le" } else { "s16le" };
             let alsa_fmt = if bits == "s32le" { "S32_LE" } else { "S16_LE" };
             let cmd = format!(
-                "ffmpeg -hide_banner -loglevel warning -err_detect ignore_err -f flac -i /dev/stdin -f {bits} -ar {sample_rate} -ac {channels} - | aplay -D {device} -f {alsa_fmt} -r {sample_rate} -c {channels} -t raw -q"
+                "ffmpeg -hide_banner -loglevel warning -err_detect ignore_err -f flac -i /dev/stdin -f {bits} -ar {sample_rate} -ac {channels} - | aplay -D {device} -f {alsa_fmt} -r {sample_rate} -c {channels} -t raw -q --buffer-time 500000"
             );
             let child = Command::new("sh")
                 .args(["-c", &cmd])
@@ -146,6 +146,7 @@ impl AlsaDirectOutput {
                     "-c", &channels.to_string(),
                     "-t", "raw",
                     "-q",
+                    "--buffer-time", "500000",
                 ])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
