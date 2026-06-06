@@ -288,7 +288,7 @@ impl Default for AlsaDirectOutput {
 fn pad_s24_to_s32(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() / 3 * 4);
     for chunk in data.chunks_exact(3) {
-        out.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 0]);
+        out.extend_from_slice(&[0, chunk[0], chunk[1], chunk[2]]);
     }
     out
 }
