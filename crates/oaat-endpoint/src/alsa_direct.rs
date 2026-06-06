@@ -288,7 +288,8 @@ impl Default for AlsaDirectOutput {
 fn pad_s24_to_s32(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() / 3 * 4);
     for chunk in data.chunks_exact(3) {
-        out.extend_from_slice(&[0, chunk[0], chunk[1], chunk[2]]);
+        let sign = if chunk[2] & 0x80 != 0 { 0xFF } else { 0x00 };
+        out.extend_from_slice(&[chunk[0], chunk[1], chunk[2], sign]);
     }
     out
 }
@@ -296,7 +297,7 @@ fn pad_s24_to_s32(data: &[u8]) -> Vec<u8> {
 fn format_to_alsa(format: AudioFormat) -> Option<&'static str> {
     match format {
         AudioFormat::PcmS16le => Some("S16_LE"),
-        AudioFormat::PcmS24le => Some("S32_LE"),
+        AudioFormat::PcmS24le => Some("S24_LE"),
         AudioFormat::PcmS24le4 => Some("S24_LE"),
         AudioFormat::PcmS32le => Some("S32_LE"),
         AudioFormat::PcmF32le => Some("FLOAT_LE"),
