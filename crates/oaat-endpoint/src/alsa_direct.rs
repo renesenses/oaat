@@ -242,9 +242,15 @@ impl AlsaDirectOutput {
             }
         }
 
+        let scaled;
         let write_data;
         let to_write = if self.format == AudioFormat::PcmS24le {
-            write_data = pad_s24_to_s32(if (vol - 1.0).abs() < 0.001 { data } else { &apply_volume(self.format, data, vol) });
+            if (vol - 1.0).abs() < 0.001 {
+                write_data = pad_s24_to_s32(data);
+            } else {
+                scaled = apply_volume(self.format, data, vol);
+                write_data = pad_s24_to_s32(&scaled);
+            }
             &write_data
         } else if (vol - 1.0).abs() < 0.001 {
             data
