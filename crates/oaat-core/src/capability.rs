@@ -10,6 +10,8 @@ pub struct Capabilities {
     pub dsd_max_multiplier: Option<u16>,
     pub flac: bool,
     pub opus: bool,
+    pub truehd: bool,
+    pub eac3: bool,
 }
 
 impl Capabilities {
@@ -19,6 +21,8 @@ impl Capabilities {
         let mut dsd_max_multiplier = None;
         let mut flac = false;
         let mut opus = false;
+        let mut truehd = false;
+        let mut eac3 = false;
 
         for part in s.split(',') {
             let part = part.trim();
@@ -41,6 +45,10 @@ impl Capabilities {
                 flac = true;
             } else if part == "opus" {
                 opus = true;
+            } else if part == "truehd" {
+                truehd = true;
+            } else if part == "eac3" {
+                eac3 = true;
             }
         }
 
@@ -54,6 +62,8 @@ impl Capabilities {
             dsd_max_multiplier,
             flac,
             opus,
+            truehd,
+            eac3,
         })
     }
 
@@ -73,6 +83,12 @@ impl std::fmt::Display for Capabilities {
         }
         if self.opus {
             write!(f, ",opus")?;
+        }
+        if self.truehd {
+            write!(f, ",truehd")?;
+        }
+        if self.eac3 {
+            write!(f, ",eac3")?;
         }
         Ok(())
     }

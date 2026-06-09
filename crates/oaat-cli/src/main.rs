@@ -389,6 +389,8 @@ async fn run_endpoint(
         dsd_max_multiplier: if caps_config.dsd { Some(64) } else { None },
         flac: caps_config.flac,
         opus: false,
+        truehd: false,
+        eac3: false,
     };
 
     // Bind TCP first to get actual port

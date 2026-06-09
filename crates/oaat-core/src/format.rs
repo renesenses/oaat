@@ -13,6 +13,8 @@ pub enum AudioFormat {
     DsdU32le,
     Flac,
     Opus,
+    TrueHd,
+    Eac3,
 }
 
 impl AudioFormat {
@@ -28,6 +30,8 @@ impl AudioFormat {
             Self::DsdU32le => 0x12,
             Self::Flac => 0x20,
             Self::Opus => 0x21,
+            Self::TrueHd => 0x30,
+            Self::Eac3 => 0x31,
         }
     }
 
@@ -43,6 +47,8 @@ impl AudioFormat {
             0x12 => Some(Self::DsdU32le),
             0x20 => Some(Self::Flac),
             0x21 => Some(Self::Opus),
+            0x30 => Some(Self::TrueHd),
+            0x31 => Some(Self::Eac3),
             _ => None,
         }
     }
@@ -60,6 +66,10 @@ impl AudioFormat {
 
     pub fn is_compressed(self) -> bool {
         matches!(self, Self::Flac | Self::Opus)
+    }
+
+    pub fn is_bitstream(self) -> bool {
+        matches!(self, Self::TrueHd | Self::Eac3)
     }
 
     pub fn bytes_per_sample(self) -> Option<usize> {
@@ -85,6 +95,8 @@ impl std::fmt::Display for AudioFormat {
             Self::DsdU32le => write!(f, "DSD_U32LE"),
             Self::Flac => write!(f, "FLAC"),
             Self::Opus => write!(f, "OPUS"),
+            Self::TrueHd => write!(f, "TRUEHD"),
+            Self::Eac3 => write!(f, "EAC3"),
         }
     }
 }
@@ -101,6 +113,16 @@ pub enum ChannelLayout {
     FivePointOne,
     #[serde(rename = "7.1")]
     SevenPointOne,
+    #[serde(rename = "5.1.2")]
+    FivePointOnePointTwo,
+    #[serde(rename = "5.1.4")]
+    FivePointOnePointFour,
+    #[serde(rename = "7.1.2")]
+    SevenPointOnePointTwo,
+    #[serde(rename = "7.1.4")]
+    SevenPointOnePointFour,
+    #[serde(rename = "7.1.6")]
+    SevenPointOnePointSix,
 }
 
 impl ChannelLayout {
@@ -112,6 +134,11 @@ impl ChannelLayout {
             Self::Quad => 4,
             Self::FivePointOne => 6,
             Self::SevenPointOne => 8,
+            Self::FivePointOnePointTwo => 8,
+            Self::FivePointOnePointFour => 10,
+            Self::SevenPointOnePointTwo => 10,
+            Self::SevenPointOnePointFour => 12,
+            Self::SevenPointOnePointSix => 14,
         }
     }
 }
@@ -179,6 +206,8 @@ mod tests {
             AudioFormat::DsdU32le,
             AudioFormat::Flac,
             AudioFormat::Opus,
+            AudioFormat::TrueHd,
+            AudioFormat::Eac3,
         ] {
             assert_eq!(AudioFormat::from_wire_id(fmt.wire_id()), Some(fmt));
         }

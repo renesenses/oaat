@@ -36,6 +36,8 @@ pub enum OaatAudioFormat {
     DsdU32le = 0x12,
     Flac = 0x20,
     Opus = 0x21,
+    TrueHd = 0x30,
+    Eac3 = 0x31,
 }
 
 impl From<AudioFormat> for OaatAudioFormat {
@@ -51,6 +53,8 @@ impl From<AudioFormat> for OaatAudioFormat {
             AudioFormat::DsdU32le => Self::DsdU32le,
             AudioFormat::Flac => Self::Flac,
             AudioFormat::Opus => Self::Opus,
+            AudioFormat::TrueHd => Self::TrueHd,
+            AudioFormat::Eac3 => Self::Eac3,
         }
     }
 }
