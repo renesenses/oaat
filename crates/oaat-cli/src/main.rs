@@ -496,6 +496,7 @@ async fn run_endpoint(
         if let Err(e) = EndpointTransport::run(ep_config, event_tx, ctrl_rx).await {
             error!(error = %e, "endpoint transport error");
         }
+        warn!("endpoint transport task exited — this should never happen");
     });
 
     #[cfg(target_os = "linux")]
@@ -527,7 +528,11 @@ async fn run_endpoint(
     loop {
         tokio::select! {
             event = event_rx.recv() => {
-                let Some(event) = event else { break };
+                let Some(event) = event else {
+                    warn!("event channel closed — transport task may have exited, waiting for restart");
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    continue;
+                };
                 match event {
                     EndpointEvent::Connected {
                         controller_id,

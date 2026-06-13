@@ -176,10 +176,11 @@ impl EndpointTransport {
             );
 
             // Run session inline — when it ends, loop back to accept
-            if let Err(e) = session.run().await {
-                warn!(%peer, error = %e, "session ended");
+            match session.run().await {
+                Ok(()) => info!(%peer, "session ended normally"),
+                Err(e) => warn!(%peer, error = %e, "session ended with error"),
             }
-            info!("waiting for next controller connection...");
+            info!("transport loop: back to accept, event_tx alive");
         }
     }
 }
