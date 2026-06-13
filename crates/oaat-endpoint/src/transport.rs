@@ -120,7 +120,14 @@ impl EndpointTransport {
         );
 
         loop {
-            let (stream, peer) = tcp_listener.accept().await?;
+            let (stream, peer) = match tcp_listener.accept().await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "accept failed, retrying in 1s");
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
             info!(%peer, tls = config.tls, "controller connected");
 
             // Wrap in TLS if configured
@@ -297,16 +304,26 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
             "handshake complete"
         );
 
-        // Spawn clock sync responder
-        tokio::spawn(async move {
+        // Spawn clock sync responder (abort handle stored for cleanup)
+        let clock_handle = tokio::spawn(async move {
             Self::clock_sync_loop(clock_socket).await;
         });
 
-        // Spawn audio receiver
+        // Spawn audio receiver (abort handle stored for cleanup)
         let audio_tx = event_tx.clone();
-        tokio::spawn(async move {
+        let audio_handle = tokio::spawn(async move {
             Self::audio_receive_loop(audio_socket, audio_tx).await;
         });
+
+        // Abort background tasks on any exit path
+        struct TaskGuard(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>);
+        impl Drop for TaskGuard {
+            fn drop(&mut self) {
+                self.0.abort();
+                self.1.abort();
+            }
+        }
+        let _guard = TaskGuard(clock_handle, audio_handle);
 
         // Main control message loop
         loop {
