@@ -818,10 +818,9 @@ async fn run_endpoint(
                         } else {
                             println!("\nDisconnected. {packet_count} packets, {total_bytes} bytes total.");
                         }
-                        // In daemon mode, don't break — keep waiting for the next connection
-                        if !daemon {
-                            break;
-                        }
+                        // Reset counters for next session, keep looping
+                        packet_count = 0;
+                        total_bytes = 0;
                     }
                     EndpointEvent::Error(e) => {
                         error!(error = %e, "endpoint error");
