@@ -669,8 +669,9 @@ async fn run_endpoint(
                             }).await;
                         }
                         PlaybackCommand::Seek(id, pos) => {
+                            audio.flush();
                             if daemon {
-                                info!(stream_id = %id, position_ms = pos, "seek");
+                                info!(stream_id = %id, position_ms = pos, "seek — ALSA flushed");
                             } else {
                                 println!("Seek: {id} -> {pos}ms");
                             }

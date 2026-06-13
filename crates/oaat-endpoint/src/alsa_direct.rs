@@ -15,6 +15,7 @@ pub struct AlsaDirectOutput {
     channels: u8,
     format: AudioFormat,
     bytes_written: u64,
+    device_name: Option<String>,
 }
 
 impl AlsaDirectOutput {
@@ -79,6 +80,7 @@ impl AlsaDirectOutput {
             channels: 0,
             format: AudioFormat::PcmS16le,
             bytes_written: 0,
+            device_name: None,
         }
     }
 
@@ -102,6 +104,7 @@ impl AlsaDirectOutput {
         self.format = format;
         self.sample_rate = sample_rate;
         self.channels = channels;
+        self.device_name = device_name.map(|s| s.to_string());
 
         let device = match device_name {
             Some(d) if d.starts_with("hw:") || d.starts_with("plughw:")
@@ -186,6 +189,18 @@ impl AlsaDirectOutput {
             let _ = child.wait();
         }
         self.bytes_written = 0;
+    }
+
+    pub fn flush(&mut self) {
+        let fmt = self.format;
+        let sr = self.sample_rate;
+        let ch = self.channels;
+        let dev = self.device_name.clone();
+        self.stop();
+        if let Err(e) = self.configure_with_device(fmt, sr, ch, dev.as_deref()) {
+            warn!(error = %e, "flush: reconfigure failed");
+        }
+        self.play();
     }
 
     pub fn set_volume(&self, level: u8) {

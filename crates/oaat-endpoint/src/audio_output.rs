@@ -257,6 +257,15 @@ impl CpalOutput {
         self.producer = None;
     }
 
+    pub fn flush(&mut self) {
+        let fmt = self.format;
+        let sr = self.sample_rate;
+        let ch = self.channels;
+        self.stop();
+        let _ = self.configure(fmt, sr, ch);
+        self.play();
+    }
+
     pub fn set_volume(&self, level: u8) {
         let scaled = (level as u32 * 1000) / 100;
         self.volume.store(scaled.min(1000), Ordering::Relaxed);
