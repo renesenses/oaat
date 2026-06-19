@@ -14,6 +14,8 @@ pub struct ClockState {
     rtt_ns: f64,
     samples: u32,
     bootstrap_count: u32,
+    offset_m2: f64,
+    offset_mean: f64,
 }
 
 impl ClockState {
@@ -24,6 +26,8 @@ impl ClockState {
             rtt_ns: 0.0,
             samples: 0,
             bootstrap_count: 10,
+            offset_m2: 0.0,
+            offset_mean: 0.0,
         }
     }
 
@@ -44,6 +48,12 @@ impl ClockState {
             self.rtt_ns = self.rtt_ns * (1.0 - alpha) + rtt * alpha;
         }
         self.samples += 1;
+
+        // Welford's online variance for jitter tracking
+        let delta = offset - self.offset_mean;
+        self.offset_mean += delta / self.samples as f64;
+        let delta2 = offset - self.offset_mean;
+        self.offset_m2 += delta * delta2;
     }
 
     pub fn offset_ns(&self) -> i64 {
@@ -60,6 +70,30 @@ impl ClockState {
 
     pub fn samples(&self) -> u32 {
         self.samples
+    }
+
+    /// Standard deviation of clock offset measurements in nanoseconds.
+    pub fn jitter_ns(&self) -> f64 {
+        if self.samples < 2 {
+            return 0.0;
+        }
+        (self.offset_m2 / (self.samples - 1) as f64).sqrt()
+    }
+
+    /// Suggested sync interval in milliseconds based on measured jitter.
+    /// High jitter (>1ms) → 500ms, low jitter (<100us) → 5s, else 2s.
+    pub fn suggested_interval_ms(&self) -> u64 {
+        if self.samples < self.bootstrap_count {
+            return 100;
+        }
+        let jitter_us = self.jitter_ns() / 1000.0;
+        if jitter_us > 1000.0 {
+            500
+        } else if jitter_us > 100.0 {
+            2000
+        } else {
+            5000
+        }
     }
 
     /// Convert a local timestamp to controller clock domain.
@@ -118,5 +152,49 @@ mod tests {
     fn bootstrap_phase() {
         let clock = ClockState::new();
         assert!(!clock.is_bootstrapped());
+    }
+
+    #[test]
+    fn jitter_low_stable() {
+        let mut clock = ClockState::new();
+        for i in 0..50u64 {
+            // Consistent offset ~50ns, very low jitter
+            clock.update(1000 + i, 1060 + i, 1065 + i, 1025 + i);
+        }
+        assert!(clock.jitter_ns() < 1000.0, "jitter should be very low for stable offsets");
+        assert_eq!(clock.suggested_interval_ms(), 5000);
+    }
+
+    #[test]
+    fn jitter_medium() {
+        let mut clock = ClockState::new();
+        for i in 0..50u64 {
+            // Alternating offset swings of 500us → medium jitter
+            let wobble = if i % 2 == 0 { 0 } else { 500_000 };
+            clock.update(1000, 1060 + wobble, 1065 + wobble, 1025);
+        }
+        let jitter_us = clock.jitter_ns() / 1000.0;
+        assert!(jitter_us > 100.0, "jitter should be medium: {jitter_us}us");
+        assert_eq!(clock.suggested_interval_ms(), 2000);
+    }
+
+    #[test]
+    fn jitter_very_high() {
+        let mut clock = ClockState::new();
+        for i in 0..50u64 {
+            // Wild offset swings: 0 and 5ms
+            let wobble = if i % 2 == 0 { 0 } else { 5_000_000 };
+            clock.update(1000, 1060 + wobble, 1065 + wobble, 1025);
+        }
+        let jitter_us = clock.jitter_ns() / 1000.0;
+        assert!(jitter_us > 1000.0, "jitter should be very high: {jitter_us}us");
+        assert_eq!(clock.suggested_interval_ms(), 500);
+    }
+
+    #[test]
+    fn suggested_interval_during_bootstrap() {
+        let mut clock = ClockState::new();
+        clock.update(1000, 1060, 1065, 1025);
+        assert_eq!(clock.suggested_interval_ms(), 100);
     }
 }

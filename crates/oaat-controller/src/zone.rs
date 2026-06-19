@@ -647,9 +647,9 @@ fn spawn_endpoint_clock_sync(ep: &ConnectedEndpoint) -> tokio::task::JoinHandle<
 
     tokio::spawn(async move {
         let mut seq = 0u16;
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+        let mut current_interval_ms: u64 = 2000;
         loop {
-            interval.tick().await;
+            tokio::time::sleep(std::time::Duration::from_millis(current_interval_ms)).await;
             let t1 = now_ns();
             let request = oaat_core::wire::ClockSyncPacket {
                 version: 1,
@@ -678,10 +678,12 @@ fn spawn_endpoint_clock_sync(ep: &ConnectedEndpoint) -> tokio::task::JoinHandle<
                     if let Ok(response) = oaat_core::wire::ClockSyncPacket::decode(&resp_buf) {
                         let mut state = clock_state.lock().await;
                         state.update(t1, response.t2, response.t3, t4);
+                        current_interval_ms = state.suggested_interval_ms();
                     }
                 }
                 _ => {
                     warn!(endpoint = %ep_id, "steady-state clock sync timeout");
+                    current_interval_ms = 500;
                 }
             }
             seq = seq.wrapping_add(1);

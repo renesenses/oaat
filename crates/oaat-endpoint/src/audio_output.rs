@@ -52,6 +52,8 @@ pub struct CpalOutput {
     channels: u8,
     format: AudioFormat,
     device_name: Option<String>,
+    #[cfg(feature = "flac")]
+    flac_stream: Option<crate::flac_decoder::FlacStreamDecoder>,
 }
 
 impl CpalOutput {
@@ -104,6 +106,8 @@ impl CpalOutput {
             channels: 0,
             format: AudioFormat::PcmS16le,
             device_name: None,
+            #[cfg(feature = "flac")]
+            flac_stream: None,
         }
     }
 
@@ -127,6 +131,15 @@ impl CpalOutput {
         self.format = format;
         self.sample_rate = sample_rate;
         self.channels = channels;
+
+        #[cfg(feature = "flac")]
+        {
+            self.flac_stream = if format == AudioFormat::Flac {
+                Some(crate::flac_decoder::FlacStreamDecoder::new())
+            } else {
+                None
+            };
+        }
 
         let host = cpal::default_host();
         let device = if let Some(name) = device_name {
@@ -283,9 +296,15 @@ impl CpalOutput {
         let samples = if self.format == AudioFormat::Flac {
             #[cfg(feature = "flac")]
             {
-                match crate::flac_decoder::decode_flac_to_f32(data) {
-                    Ok(s) => s,
-                    Err(_) => return 0,
+                if let Some(ref mut stream) = self.flac_stream {
+                    let s = stream.feed(data);
+                    if s.is_empty() { return 0; }
+                    s
+                } else {
+                    match crate::flac_decoder::decode_flac_to_f32(data) {
+                        Ok(s) => s,
+                        Err(_) => return 0,
+                    }
                 }
             }
             #[cfg(not(feature = "flac"))]
