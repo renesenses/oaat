@@ -14,8 +14,8 @@ pub struct ClockState {
     rtt_ns: f64,
     samples: u32,
     bootstrap_count: u32,
-    offset_m2: f64,
-    offset_mean: f64,
+    jitter_mean: f64,
+    jitter_var: f64,
 }
 
 impl ClockState {
@@ -26,18 +26,22 @@ impl ClockState {
             rtt_ns: 0.0,
             samples: 0,
             bootstrap_count: 10,
-            offset_m2: 0.0,
-            offset_mean: 0.0,
+            jitter_mean: 0.0,
+            jitter_var: 0.0,
         }
     }
 
     pub fn update(&mut self, t1: u64, t2: u64, t3: u64, t4: u64) {
         let offset = ((t2 as i128 - t1 as i128) + (t3 as i128 - t4 as i128)) as f64 / 2.0;
-        let rtt = ((t4 - t1) - (t3 - t2)) as f64;
+        // i128 then clamp: with measurement noise on a near-zero RTT,
+        // (t3-t2) can exceed (t4-t1); a plain u64 subtraction would panic in
+        // debug and poison the EMA with a wrapped huge value in release.
+        let rtt = ((t4 as i128 - t1 as i128) - (t3 as i128 - t2 as i128)).max(0) as f64;
 
         if self.samples == 0 {
             self.offset_ns = offset;
             self.rtt_ns = rtt;
+            self.jitter_mean = offset;
         } else {
             let alpha = if self.samples < self.bootstrap_count {
                 0.5
@@ -49,11 +53,14 @@ impl ClockState {
         }
         self.samples += 1;
 
-        // Welford's online variance for jitter tracking
-        let delta = offset - self.offset_mean;
-        self.offset_mean += delta / self.samples as f64;
-        let delta2 = offset - self.offset_mean;
-        self.offset_m2 += delta * delta2;
+        // Exponentially weighted variance for jitter tracking. Unlike a
+        // cumulative (Welford) variance, this forgets old samples: a slow
+        // clock drift shifts the mean instead of inflating the "jitter"
+        // forever, so the adaptive sync interval recovers on long sessions.
+        let diff = offset - self.jitter_mean;
+        let incr = self.alpha * diff;
+        self.jitter_mean += incr;
+        self.jitter_var = (1.0 - self.alpha) * (self.jitter_var + diff * incr);
     }
 
     pub fn offset_ns(&self) -> i64 {
@@ -72,12 +79,13 @@ impl ClockState {
         self.samples
     }
 
-    /// Standard deviation of clock offset measurements in nanoseconds.
+    /// Standard deviation of recent clock offset measurements in
+    /// nanoseconds (exponentially weighted).
     pub fn jitter_ns(&self) -> f64 {
         if self.samples < 2 {
             return 0.0;
         }
-        (self.offset_m2 / (self.samples - 1) as f64).sqrt()
+        self.jitter_var.max(0.0).sqrt()
     }
 
     /// Suggested sync interval in milliseconds based on measured jitter.

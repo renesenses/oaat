@@ -8,8 +8,12 @@ use tracing::{debug, error, info, warn};
 use oaat_core::codec::FrameCodec;
 use oaat_core::format::SampleRateFamily;
 use oaat_core::message::*;
-use oaat_core::wire::{AUDIO_HEADER_SIZE, AudioPacketHeader, ClockSyncPacket, ClockSyncType};
+use oaat_core::wire::{
+    AUDIO_HEADER_SIZE, AudioPacketHeader, ClockSyncPacket, ClockSyncType, PacketFlags,
+};
 use oaat_core::{Message, OaatError, PROTOCOL_VERSION};
+
+use crate::sync::SharedClock;
 
 pub struct EndpointConfig {
     pub endpoint_id: String,
@@ -21,6 +25,14 @@ pub struct EndpointConfig {
     pub buffer_size_ms: u32,
     /// Enable TLS 1.3 on the control channel (self-signed cert, TOFU).
     pub tls: bool,
+    /// Defer FormatAccept until the application confirms the audio device is
+    /// ready (by sending Message::FormatAccept — or FormatReject — on the
+    /// control channel). Without this, the accept is sent before the device
+    /// is opened, and the controller's play-delay lead time is eaten by the
+    /// device setup (~1-2 s on some hosts), defeating PTS scheduling.
+    /// Fail-open: if the application does not answer within 5 s, the accept
+    /// is sent anyway.
+    pub defer_format_accept: bool,
 }
 
 #[derive(Debug)]
@@ -87,7 +99,20 @@ impl EndpointTransport {
     pub async fn run(
         config: EndpointConfig,
         event_tx: mpsc::Sender<EndpointEvent>,
-        _control_rx: mpsc::Receiver<Message>,
+        control_rx: mpsc::Receiver<Message>,
+    ) -> Result<(), OaatError> {
+        Self::run_with_clock(config, event_tx, control_rx, Arc::new(SharedClock::new())).await
+    }
+
+    /// Like [`EndpointTransport::run`], but shares the clock sync state with
+    /// the caller. The transport keeps `clock` updated from its own
+    /// endpoint-initiated exchanges against the controller (RFC §6.2); the
+    /// application reads it to convert PTS values into the local clock domain.
+    pub async fn run_with_clock(
+        config: EndpointConfig,
+        event_tx: mpsc::Sender<EndpointEvent>,
+        mut control_rx: mpsc::Receiver<Message>,
+        clock: Arc<SharedClock>,
     ) -> Result<(), OaatError> {
         let tcp_listener = TcpListener::bind(config.control_addr).await?;
         let audio_socket = Arc::new(UdpSocket::bind(config.audio_addr).await?);
@@ -147,8 +172,13 @@ impl EndpointTransport {
                             actual_audio_port,
                             actual_clock_port,
                             config.buffer_size_ms,
+                            clock.clone(),
+                            peer.ip(),
                         );
-                        if let Err(e) = session.run().await {
+                        if let Err(e) = session
+                            .run(&mut control_rx, config.defer_format_accept)
+                            .await
+                        {
                             warn!(%peer, error = %e, "session ended");
                         }
                         info!("waiting for next controller connection...");
@@ -173,10 +203,15 @@ impl EndpointTransport {
                 actual_audio_port,
                 actual_clock_port,
                 config.buffer_size_ms,
+                clock.clone(),
+                peer.ip(),
             );
 
             // Run session inline — when it ends, loop back to accept
-            match session.run().await {
+            match session
+                .run(&mut control_rx, config.defer_format_accept)
+                .await
+            {
                 Ok(()) => info!(%peer, "session ended normally"),
                 Err(e) => warn!(%peer, error = %e, "session ended with error"),
             }
@@ -200,6 +235,10 @@ struct EndpointSession<S> {
     current_format: Option<oaat_core::format::AudioFormat>,
     /// Currently negotiated sample rate (set after FormatAccept).
     current_sample_rate: Option<u32>,
+    /// Endpoint-side clock sync state, updated by our own exchanges.
+    clock: Arc<SharedClock>,
+    /// Controller IP (from the TCP connection), target for clock sync requests.
+    controller_ip: std::net::IpAddr,
 }
 
 impl<S> EndpointSession<S> {
@@ -215,6 +254,8 @@ impl<S> EndpointSession<S> {
         audio_port: u16,
         clock_port: u16,
         buffer_size_ms: u32,
+        clock: Arc<SharedClock>,
+        controller_ip: std::net::IpAddr,
     ) -> Self {
         Self {
             stream,
@@ -229,12 +270,18 @@ impl<S> EndpointSession<S> {
             buffer_size_ms,
             current_format: None,
             current_sample_rate: None,
+            clock,
+            controller_ip,
         }
     }
 }
 
 impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> EndpointSession<S> {
-    async fn run(self) -> Result<(), OaatError> {
+    async fn run(
+        self,
+        control_rx: &mut mpsc::Receiver<Message>,
+        defer_format_accept: bool,
+    ) -> Result<(), OaatError> {
         // Destructure to get owned fields -- avoids borrow conflicts after split().
         let EndpointSession {
             stream,
@@ -249,6 +296,8 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
             buffer_size_ms,
             mut current_format,
             mut current_sample_rate,
+            clock,
+            controller_ip,
         } = self;
 
         let (mut reader, mut writer) = tokio::io::split(stream);
@@ -305,9 +354,16 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
             "handshake complete"
         );
 
-        // Spawn clock sync responder (abort handle stored for cleanup)
+        // Spawn clock sync loop: responds to controller-initiated exchanges
+        // AND runs our own endpoint-initiated exchanges (RFC §6.2) against the
+        // controller's announced clock port, feeding the shared ClockState.
+        let controller_clock_addr = if hello.clock_port != 0 {
+            Some(SocketAddr::new(controller_ip, hello.clock_port))
+        } else {
+            None
+        };
         let clock_handle = tokio::spawn(async move {
-            Self::clock_sync_loop(clock_socket).await;
+            Self::clock_sync_loop(clock_socket, clock, controller_clock_addr).await;
         });
 
         // Spawn audio receiver (abort handle stored for cleanup)
@@ -339,7 +395,16 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
                 match msg {
                     Message::FormatPropose(fp) => {
                         let response = negotiate_format(&capabilities, &fp);
-                        writer.write_all(&FrameCodec::encode(&response)).await?;
+                        // Deferred accept: hold the FormatAccept until the
+                        // application reports the audio device ready, so the
+                        // controller's play-delay lead time starts counting
+                        // from a ready endpoint. Counter/reject involve no
+                        // device setup and are sent immediately.
+                        let deferred =
+                            defer_format_accept && matches!(response, Message::FormatAccept(_));
+                        if !deferred {
+                            writer.write_all(&FrameCodec::encode(&response)).await?;
+                        }
 
                         match &response {
                             Message::FormatAccept(_) => {
@@ -362,7 +427,16 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
                             _ => {}
                         }
 
+                        let stream_id = fp.stream_id.clone();
                         let _ = event_tx.send(EndpointEvent::FormatProposed(fp)).await;
+
+                        if deferred {
+                            let final_response =
+                                await_device_ready(control_rx, &stream_id, response).await;
+                            writer
+                                .write_all(&FrameCodec::encode(&final_response))
+                                .await?;
+                        }
                     }
                     Message::NextTrackPrepare(ntp) => {
                         let same_format = current_format == Some(ntp.format)
@@ -493,7 +567,56 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
         Ok(())
     }
 
-    async fn clock_sync_loop(socket: Arc<UdpSocket>) {
+    /// Clock sync loop, both roles on the same socket:
+    /// - Responder: answer controller-initiated Requests (t2/t3 stamping),
+    ///   used by the controller for health monitoring.
+    /// - Client: periodically send our own Requests to the controller's
+    ///   announced clock port and feed completed exchanges into `clock`,
+    ///   so the endpoint can convert PTS values to its local clock domain.
+    async fn clock_sync_loop(
+        socket: Arc<UdpSocket>,
+        clock: Arc<SharedClock>,
+        controller_clock_addr: Option<SocketAddr>,
+    ) {
+        // Sender half: endpoint-initiated exchanges (only if the controller
+        // announced a clock port; legacy controllers without a responder are
+        // harmless — no responses simply means the clock never bootstraps).
+        let send_task = controller_clock_addr.map(|target| {
+            let socket = socket.clone();
+            let clock = clock.clone();
+            tokio::spawn(async move {
+                let mut sequence: u16 = 0;
+                loop {
+                    let request = ClockSyncPacket {
+                        version: 1,
+                        kind: ClockSyncType::Request,
+                        sequence,
+                        t1: now_ns(),
+                        t2: 0,
+                        t3: 0,
+                    };
+                    sequence = sequence.wrapping_add(1);
+                    let mut buf = [0u8; ClockSyncPacket::SIZE];
+                    request.encode(&mut buf);
+                    if let Err(e) = socket.send_to(&buf, target).await {
+                        warn!(error = %e, "clock sync request send failed");
+                    }
+                    let interval = clock.suggested_interval_ms();
+                    tokio::time::sleep(std::time::Duration::from_millis(interval)).await;
+                }
+            })
+        });
+
+        struct SendGuard(Option<tokio::task::JoinHandle<()>>);
+        impl Drop for SendGuard {
+            fn drop(&mut self) {
+                if let Some(h) = self.0.take() {
+                    h.abort();
+                }
+            }
+        }
+        let _send_guard = SendGuard(send_task);
+
         let mut buf = [0u8; ClockSyncPacket::SIZE];
         loop {
             let (n, peer) = match socket.recv_from(&mut buf).await {
@@ -510,23 +633,34 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
                 Ok(p) => p,
                 Err(_) => continue,
             };
-            if pkt.kind != ClockSyncType::Request {
-                continue;
-            }
 
-            let t2 = now_ns();
-            let t3 = now_ns();
-            let response = ClockSyncPacket {
-                version: 1,
-                kind: ClockSyncType::Response,
-                sequence: pkt.sequence,
-                t1: pkt.t1,
-                t2,
-                t3,
-            };
-            let mut resp_buf = [0u8; ClockSyncPacket::SIZE];
-            response.encode(&mut resp_buf);
-            let _ = socket.send_to(&resp_buf, peer).await;
+            match pkt.kind {
+                ClockSyncType::Request => {
+                    let t2 = now_ns();
+                    let t3 = now_ns();
+                    let response = ClockSyncPacket {
+                        version: 1,
+                        kind: ClockSyncType::Response,
+                        sequence: pkt.sequence,
+                        t1: pkt.t1,
+                        t2,
+                        t3,
+                    };
+                    let mut resp_buf = [0u8; ClockSyncPacket::SIZE];
+                    response.encode(&mut resp_buf);
+                    let _ = socket.send_to(&resp_buf, peer).await;
+                }
+                ClockSyncType::Response => {
+                    let t4 = now_ns();
+                    // Reject stale or corrupt exchanges: a response older than
+                    // one second would poison the EMA with a bogus RTT.
+                    if t4.saturating_sub(pkt.t1) > 1_000_000_000 {
+                        debug!(sequence = pkt.sequence, "stale clock sync response ignored");
+                        continue;
+                    }
+                    clock.update(pkt.t1, pkt.t2, pkt.t3, t4);
+                }
+            }
         }
     }
 
@@ -549,10 +683,55 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
                 Ok(h) => h,
                 Err(_) => continue,
             };
+            // FEC parity packets carry XOR data, not audio. Until a FecDecoder
+            // is wired in, they MUST be dropped: feeding them to the audio
+            // output would play a burst of noise every FEC group.
+            if header.flags.contains(PacketFlags::FEC) {
+                debug!(sequence = header.sequence, "FEC parity packet dropped (no decoder)");
+                continue;
+            }
             let payload = buf[AUDIO_HEADER_SIZE..n].to_vec();
             let _ = event_tx
                 .send(EndpointEvent::AudioPacket { header, payload })
                 .await;
+        }
+    }
+}
+
+/// Wait (up to 5 s) for the application to confirm the audio device is
+/// ready for `stream_id`. Returns the application's FormatAccept/FormatReject
+/// if it matches the stream, or falls open to `auto_response` on timeout —
+/// a slow device must not deadlock the negotiation.
+async fn await_device_ready(
+    control_rx: &mut mpsc::Receiver<Message>,
+    stream_id: &str,
+    auto_response: Message,
+) -> Message {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout_at(deadline, control_rx.recv()).await {
+            Ok(Some(msg)) => {
+                let matches_stream = match &msg {
+                    Message::FormatAccept(a) => a.stream_id == stream_id,
+                    Message::FormatReject(r) => r.stream_id == stream_id,
+                    _ => false,
+                };
+                if matches_stream {
+                    debug!(stream_id, "device ready, sending format response");
+                    return msg;
+                }
+                // Stale confirmation from a previous stream: drop and keep
+                // waiting, otherwise it would satisfy the wrong negotiation.
+                debug!("ignoring stale control message during device wait");
+            }
+            Ok(None) => {
+                warn!("control channel closed, sending auto response");
+                return auto_response;
+            }
+            Err(_) => {
+                warn!(stream_id, "device ready confirmation timed out (5s), sending auto accept");
+                return auto_response;
+            }
         }
     }
 }

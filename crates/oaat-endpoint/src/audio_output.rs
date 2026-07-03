@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleRate, StreamConfig};
@@ -52,6 +52,26 @@ pub struct CpalOutput {
     channels: u8,
     format: AudioFormat,
     device_name: Option<String>,
+    /// Samples actually consumed from the ring by the audio callback.
+    /// Divided by `channels`, this is the playback position in frames —
+    /// the reference the drift servo compares against the clock.
+    samples_played: Arc<AtomicU64>,
+    /// Pending drift correction in frames. Positive: playback is behind,
+    /// frames are dropped on write. Negative: playback is ahead, frames are
+    /// duplicated on write. Applied at most a few frames per packet so the
+    /// correction itself stays inaudible (bulk resync excepted, see
+    /// `write_audio`).
+    correction: Arc<AtomicI64>,
+    /// Net frames adjusted so far: dropped − duplicated. Content position at
+    /// the DAC = frames consumed + this adjustment; without it, skipping
+    /// would never show up in the measured drift and the servo would skip
+    /// forever.
+    net_adjust: Arc<AtomicI64>,
+    /// Resolved cpal device + f32 support, keyed by the requested name.
+    /// Device and config enumeration cost ~1-2 s on macOS: paying them on
+    /// every configure() eats the PTS scheduling lead time. `prewarm()`
+    /// fills this at startup.
+    cached_device: Option<(Option<String>, cpal::Device, bool)>,
     #[cfg(feature = "flac")]
     flac_stream: Option<crate::flac_decoder::FlacStreamDecoder>,
 }
@@ -106,8 +126,81 @@ impl CpalOutput {
             channels: 0,
             format: AudioFormat::PcmS16le,
             device_name: None,
+            samples_played: Arc::new(AtomicU64::new(0)),
+            correction: Arc::new(AtomicI64::new(0)),
+            net_adjust: Arc::new(AtomicI64::new(0)),
+            cached_device: None,
             #[cfg(feature = "flac")]
             flac_stream: None,
+        }
+    }
+
+    /// Resolve the output device by name (or default) plus its f32 support,
+    /// preferring the cache. On a cache miss the enumeration cost is paid
+    /// and the result cached for subsequent streams.
+    fn resolve_device(
+        &mut self,
+        device_name: Option<&str>,
+    ) -> Result<(cpal::Device, bool), Box<dyn std::error::Error>> {
+        if let Some((cached_key, device, supports_f32)) = &self.cached_device
+            && cached_key.as_deref() == device_name
+        {
+            return Ok((device.clone(), *supports_f32));
+        }
+
+        let host = cpal::default_host();
+        let device = if let Some(name) = device_name {
+            let found = host.output_devices()?.find(|d| {
+                d.name()
+                    .map(|n| n.to_lowercase().contains(&name.to_lowercase()))
+                    .unwrap_or(false)
+            });
+            match found {
+                Some(d) => {
+                    info!(requested = name, found = d.name().unwrap_or_default(), "audio device matched by name");
+                    d
+                }
+                None => {
+                    warn!(requested = name, "audio device not found, falling back to default");
+                    host.default_output_device()
+                        .ok_or("no audio output device found")?
+                }
+            }
+        } else {
+            host.default_output_device()
+                .ok_or("no audio output device found")?
+        };
+
+        // f32 preferred, i16/i32 fallback (I2S DACs, see configure). Probed
+        // here so the cost is paid once, not per stream.
+        let supports_f32 = device
+            .supported_output_configs()
+            .map(|cfgs| {
+                cfgs.into_iter()
+                    .any(|c| c.sample_format() == cpal::SampleFormat::F32)
+            })
+            .unwrap_or(false);
+
+        self.cached_device = Some((
+            device_name.map(|s| s.to_string()),
+            device.clone(),
+            supports_f32,
+        ));
+        Ok((device, supports_f32))
+    }
+
+    /// Pre-resolve and cache the output device so the first configure()
+    /// does not pay the enumeration cost during stream setup.
+    pub fn prewarm(&mut self, device_name: Option<&str>) {
+        let started = std::time::Instant::now();
+        match self.resolve_device(device_name) {
+            Ok((d, supports_f32)) => info!(
+                device = d.name().unwrap_or_default(),
+                supports_f32,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "audio device prewarmed"
+            ),
+            Err(e) => warn!(error = %e, "audio device prewarm failed"),
         }
     }
 
@@ -141,28 +234,8 @@ impl CpalOutput {
             };
         }
 
-        let host = cpal::default_host();
-        let device = if let Some(name) = device_name {
-            let found = host.output_devices()?.find(|d| {
-                d.name()
-                    .map(|n| n.to_lowercase().contains(&name.to_lowercase()))
-                    .unwrap_or(false)
-            });
-            match found {
-                Some(d) => {
-                    info!(requested = name, found = d.name().unwrap_or_default(), "audio device matched by name");
-                    d
-                }
-                None => {
-                    warn!(requested = name, "audio device not found, falling back to default");
-                    host.default_output_device()
-                        .ok_or("no audio output device found")?
-                }
-            }
-        } else {
-            host.default_output_device()
-                .ok_or("no audio output device found")?
-        };
+        let configure_started = std::time::Instant::now();
+        let (device, supports_f32) = self.resolve_device(device_name)?;
 
         let actual_device_name = device.name().unwrap_or_default();
         self.device_name = Some(actual_device_name.clone());
@@ -183,18 +256,16 @@ impl CpalOutput {
         let playing = self.playing.clone();
         let volume = self.volume.clone();
         let muted = self.muted.clone();
+        self.samples_played.store(0, Ordering::Relaxed);
+        self.correction.store(0, Ordering::Relaxed);
+        self.net_adjust.store(0, Ordering::Relaxed);
+        let samples_played = self.samples_played.clone();
+        let samples_played_i32 = self.samples_played.clone();
 
-        // Check supported formats: prefer f32, fallback to i16 (most compatible with I2S DACs).
-        // Many I2S DACs (ESS 9038 via hifiberry overlay) accept S32_LE in ALSA but
-        // only output sound with S16_LE. Use i16 as the safe fallback.
-        let supports_f32 = device
-            .supported_output_configs()
-            .map(|cfgs| {
-                cfgs.into_iter()
-                    .any(|c| c.sample_format() == cpal::SampleFormat::F32)
-            })
-            .unwrap_or(false);
-
+        // Prefer f32, fallback to i32 (most compatible with I2S DACs).
+        // Many I2S DACs (ESS 9038 via hifiberry overlay) accept S32_LE in
+        // ALSA but only output sound with S16_LE. The probe result comes
+        // from resolve_device's cache.
         let rb = HeapRb::<f32>::new(ring_size);
         let (producer, mut consumer) = rb.split();
 
@@ -209,6 +280,7 @@ impl CpalOutput {
                     }
                     let vol = volume.load(Ordering::Relaxed) as f32 / 1000.0;
                     let read = consumer.pop_slice(output);
+                    samples_played.fetch_add(read as u64, Ordering::Relaxed);
                     for sample in &mut output[..read] {
                         *sample *= vol;
                     }
@@ -219,6 +291,10 @@ impl CpalOutput {
             )?
         } else {
             info!("opening audio output (i32/S32_LE)");
+            // Scratch buffer allocated once, outside the callback: a heap
+            // allocation inside the real-time audio callback risks glitches.
+            // Grows only if the host ever delivers a larger buffer.
+            let mut tmp: Vec<f32> = vec![0.0f32; 8192];
             device.build_output_stream(
                 &config,
                 move |output: &mut [i32], _: &cpal::OutputCallbackInfo| {
@@ -227,8 +303,11 @@ impl CpalOutput {
                         return;
                     }
                     let vol = volume.load(Ordering::Relaxed) as f32 / 1000.0;
-                    let mut tmp = vec![0.0f32; output.len()];
-                    let read = consumer.pop_slice(&mut tmp);
+                    if tmp.len() < output.len() {
+                        tmp.resize(output.len(), 0.0);
+                    }
+                    let read = consumer.pop_slice(&mut tmp[..output.len()]);
+                    samples_played_i32.fetch_add(read as u64, Ordering::Relaxed);
                     for (i, sample) in output.iter_mut().enumerate() {
                         if i < read {
                             let s = (tmp[i] * vol).clamp(-1.0, 1.0);
@@ -243,25 +322,32 @@ impl CpalOutput {
             )?
         };
 
+        // Start the stream immediately: it outputs silence until the
+        // `playing` flag is set. Host-side stream start (CoreAudio, WASAPI)
+        // has tens of milliseconds of variable latency — paying it here, and
+        // making play() a plain atomic flip, keeps PTS-scheduled starts
+        // tight across a zone.
+        stream.play().ok();
         self.stream = Some(stream);
         self.producer = Some(producer);
 
+        info!(
+            elapsed_ms = configure_started.elapsed().as_millis() as u64,
+            "audio output configured"
+        );
         Ok(())
     }
 
     pub fn play(&self) {
-        if let Some(ref stream) = self.stream {
-            stream.play().ok();
+        if self.stream.is_some() {
             self.playing.store(true, Ordering::Relaxed);
             info!("audio output started");
         }
     }
 
     pub fn pause(&self) {
-        if let Some(ref stream) = self.stream {
-            stream.pause().ok();
-            self.playing.store(false, Ordering::Relaxed);
-        }
+        // Keep the stream running (silence): resuming stays a cheap flip.
+        self.playing.store(false, Ordering::Relaxed);
     }
 
     pub fn stop(&mut self) {
@@ -293,7 +379,7 @@ impl CpalOutput {
             return 0;
         };
 
-        let samples = if self.format == AudioFormat::Flac {
+        let mut samples = if self.format == AudioFormat::Flac {
             #[cfg(feature = "flac")]
             {
                 if let Some(ref mut stream) = self.flac_stream {
@@ -316,10 +402,51 @@ impl CpalOutput {
             convert_to_f32(self.format, data)
         };
 
+        let ch = self.channels.max(1) as usize;
+
+        // Drift correction, applied on the producer side (never in the RT
+        // callback). Two regimes:
+        // - Fine (crystal drift, a few ms): drop or duplicate at most
+        //   MAX_CORRECTION_FRAMES_PER_WRITE frames per packet — each
+        //   adjustment is inaudible.
+        // - Jump resync (late start, > JUMP_THRESHOLD_FRAMES behind): drop
+        //   the full deficit as content arrives, one perceptible jump. The
+        //   alternative — spreading a large skip over many seconds — keeps
+        //   the endpoint audibly out of sync with the rest of the zone.
+        const MAX_CORRECTION_FRAMES_PER_WRITE: i64 = 2;
+        const JUMP_THRESHOLD_FRAMES: i64 = 1200; // ~25 ms at 48 kHz
+        let pending = self.correction.load(Ordering::Relaxed);
+        let frames_in = (samples.len() / ch) as i64;
+        if pending > JUMP_THRESHOLD_FRAMES && frames_in > 0 {
+            let drop_frames = pending.min(frames_in);
+            self.correction.fetch_sub(drop_frames, Ordering::Relaxed);
+            self.net_adjust.fetch_add(drop_frames, Ordering::Relaxed);
+            if drop_frames == frames_in {
+                return 0;
+            }
+            samples.drain(..drop_frames as usize * ch);
+        } else if pending > 0 && samples.len() > ch {
+            let drop_frames = pending
+                .min(MAX_CORRECTION_FRAMES_PER_WRITE)
+                .min(frames_in - 1);
+            if drop_frames > 0 {
+                samples.drain(..drop_frames as usize * ch);
+                self.correction.fetch_sub(drop_frames, Ordering::Relaxed);
+                self.net_adjust.fetch_add(drop_frames, Ordering::Relaxed);
+            }
+        } else if pending < 0 && samples.len() >= ch {
+            let dup_frames = (-pending).min(MAX_CORRECTION_FRAMES_PER_WRITE);
+            for _ in 0..dup_frames {
+                let first_frame: Vec<f32> = samples[..ch].to_vec();
+                samples.splice(0..0, first_frame);
+            }
+            self.correction.fetch_add(dup_frames, Ordering::Relaxed);
+            self.net_adjust.fetch_sub(dup_frames, Ordering::Relaxed);
+        }
+
         // Only push complete frames to maintain channel alignment.
         // A partial push (odd number of samples for stereo) would permanently
         // swap L/R channels for all subsequent audio → distortion.
-        let ch = self.channels.max(1) as usize;
         let available = producer.vacant_len();
         let frames_to_push = (available / ch).min(samples.len() / ch);
         let samples_to_push = frames_to_push * ch;
@@ -332,6 +459,33 @@ impl CpalOutput {
             .as_ref()
             .map(|p| p.occupied_len())
             .unwrap_or(0)
+    }
+
+    /// Playback position in frames: what the audio callback has actually
+    /// consumed since the last `configure()`. `None` if not configured.
+    pub fn frames_played(&self) -> Option<u64> {
+        if self.channels == 0 {
+            return None;
+        }
+        Some(self.samples_played.load(Ordering::Relaxed) / self.channels as u64)
+    }
+
+    /// Content position in frames on the stream timeline: frames consumed
+    /// plus the net frames skipped by drift correction. This is what the
+    /// servo must compare against the clock — otherwise applied skips never
+    /// show up in the measured drift.
+    pub fn content_position(&self) -> Option<u64> {
+        let played = self.frames_played()? as i64;
+        let adjusted = played + self.net_adjust.load(Ordering::Relaxed);
+        Some(adjusted.max(0) as u64)
+    }
+
+    /// Queue a drift correction. Positive `frames`: playback is behind, frames
+    /// will be skipped. Negative: playback is ahead, frames will be duplicated.
+    /// Replaces (not accumulates) the pending correction so a stale command
+    /// can never pile up with a fresh one.
+    pub fn set_correction(&self, frames: i64) {
+        self.correction.store(frames, Ordering::Relaxed);
     }
 }
 

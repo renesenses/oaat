@@ -78,6 +78,7 @@ pub struct Zone {
     volume: VolumeMap,
     active_stream: Option<ActiveStream>,
     fec_encoder: Option<oaat_core::fec::FecEncoder>,
+    play_delay_override_ms: Option<u64>,
 }
 
 impl Zone {
@@ -91,6 +92,7 @@ impl Zone {
             volume: VolumeMap::new(),
             active_stream: None,
             fec_encoder: None,
+            play_delay_override_ms: None,
         }
     }
 
@@ -125,11 +127,21 @@ impl Zone {
     }
 
     pub fn play_delay_ms(&self) -> u64 {
+        if let Some(delay) = self.play_delay_override_ms {
+            return delay;
+        }
         if self.is_multiroom() {
             DEFAULT_MULTIROOM_PLAY_DELAY_MS
         } else {
             DEFAULT_SINGLE_PLAY_DELAY_MS
         }
+    }
+
+    /// Override the play delay (time between the first packet's send instant
+    /// and its PTS). Endpoints with slow audio device setup need more lead
+    /// time to hit the scheduled start.
+    pub fn set_play_delay_ms(&mut self, delay_ms: Option<u64>) {
+        self.play_delay_override_ms = delay_ms;
     }
 
     pub fn volume_map(&self) -> &VolumeMap {
@@ -460,31 +472,31 @@ impl Zone {
         }
 
         // FEC: accumulate and send parity packet when group is complete
-        if let Some(ref mut fec) = self.fec_encoder {
-            if let Some(parity_payload) = fec.feed(self.sequence.wrapping_sub(1), payload) {
-                let parity_header = oaat_core::wire::AudioPacketHeader {
-                    version: oaat_core::wire::AudioPacketHeader::CURRENT_VERSION,
-                    flags: PacketFlags::FEC,
-                    format,
-                    sequence: self.sequence,
-                    stream_id,
-                    pts_ns,
-                    sample_offset,
-                    payload_len: parity_payload.len() as u16,
-                };
-                self.sequence = self.sequence.wrapping_add(1);
+        if let Some(ref mut fec) = self.fec_encoder
+            && let Some(parity_payload) = fec.feed(self.sequence.wrapping_sub(1), payload)
+        {
+            let parity_header = oaat_core::wire::AudioPacketHeader {
+                version: oaat_core::wire::AudioPacketHeader::CURRENT_VERSION,
+                flags: PacketFlags::FEC,
+                format,
+                sequence: self.sequence,
+                stream_id,
+                pts_ns,
+                sample_offset,
+                payload_len: parity_payload.len() as u16,
+            };
+            self.sequence = self.sequence.wrapping_add(1);
 
-                let mut parity_buf =
-                    vec![0u8; oaat_core::wire::AUDIO_HEADER_SIZE + parity_payload.len()];
-                let mut ph_buf = [0u8; oaat_core::wire::AUDIO_HEADER_SIZE];
-                parity_header.encode(&mut ph_buf);
-                parity_buf[..oaat_core::wire::AUDIO_HEADER_SIZE].copy_from_slice(&ph_buf);
-                parity_buf[oaat_core::wire::AUDIO_HEADER_SIZE..].copy_from_slice(&parity_payload);
+            let mut parity_buf =
+                vec![0u8; oaat_core::wire::AUDIO_HEADER_SIZE + parity_payload.len()];
+            let mut ph_buf = [0u8; oaat_core::wire::AUDIO_HEADER_SIZE];
+            parity_header.encode(&mut ph_buf);
+            parity_buf[..oaat_core::wire::AUDIO_HEADER_SIZE].copy_from_slice(&ph_buf);
+            parity_buf[oaat_core::wire::AUDIO_HEADER_SIZE..].copy_from_slice(&parity_payload);
 
-                for (id, socket, target) in &targets {
-                    if let Err(e) = socket.send_to(&parity_buf, target).await {
-                        error!(endpoint = %id, error = %e, "FEC parity send failed");
-                    }
+            for (id, socket, target) in &targets {
+                if let Err(e) = socket.send_to(&parity_buf, target).await {
+                    error!(endpoint = %id, error = %e, "FEC parity send failed");
                 }
             }
         }
