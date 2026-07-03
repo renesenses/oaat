@@ -9,6 +9,7 @@ pub mod discovery;
 pub mod flac_decoder;
 pub mod hal;
 pub mod session;
+pub mod sync;
 pub mod transport;
 #[cfg(feature = "web-ui")]
 pub mod web_ui;
@@ -20,6 +21,7 @@ pub use alsa_mixer::AlsaMixer;
 #[cfg(feature = "audio-output")]
 pub use audio_output::CpalOutput;
 pub use hal::OaatHal;
+pub use sync::{PtsTracker, SharedClock};
 pub use transport::{EndpointConfig, EndpointEvent, EndpointTransport};
 #[cfg(feature = "web-ui")]
 pub use web_ui::{BridgeStatus, BridgeStatusHandle, start_web_ui};

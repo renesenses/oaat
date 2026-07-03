@@ -292,6 +292,20 @@ impl AlsaDirectOutput {
     pub fn buffer_level(&self) -> usize {
         0
     }
+
+    /// Playback position is not observable through the aplay pipe.
+    /// Drift correction is unavailable on this output (see CpalOutput).
+    pub fn frames_played(&self) -> Option<u64> {
+        None
+    }
+
+    /// See `frames_played`: no position tracking on this output.
+    pub fn content_position(&self) -> Option<u64> {
+        None
+    }
+
+    /// No-op: the aplay pipe offers no sample-accurate insertion point.
+    pub fn set_correction(&self, _frames: i64) {}
 }
 
 impl Default for AlsaDirectOutput {

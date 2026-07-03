@@ -165,11 +165,7 @@ impl FlacStreamDecoder {
         };
 
         let mut samples = Vec::new();
-        loop {
-            let packet = match format.next_packet() {
-                Ok(p) => p,
-                Err(_) => break,
-            };
+        while let Ok(packet) = format.next_packet() {
             if packet.track_id() != self.track_id {
                 continue;
             }
@@ -187,6 +183,12 @@ impl FlacStreamDecoder {
             }
         }
         samples
+    }
+}
+
+impl Default for FlacStreamDecoder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

@@ -6,12 +6,13 @@ use clap::{Parser, Subcommand};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use oaat_controller::{ConnectedEndpoint, ControllerConfig, ControllerDiscovery};
+use oaat_controller::{ClockResponder, ConnectedEndpoint, ControllerConfig, ControllerDiscovery};
 use oaat_core::ChannelLayout;
 use oaat_core::format::AudioFormat;
 use oaat_core::message::{EndpointCapabilities, TrackMetadata};
 use oaat_core::wire::PacketFlags;
 use oaat_endpoint::discovery::EndpointAnnouncement;
+use oaat_endpoint::sync::{PtsTracker, SharedClock};
 use oaat_endpoint::transport::{PlaybackCommand, VolumeCommand};
 #[cfg(target_os = "linux")]
 use oaat_endpoint::{AlsaDirectOutput, EndpointConfig, EndpointEvent, EndpointTransport};
@@ -105,6 +106,10 @@ enum Command {
         /// Duration in seconds
         #[arg(long, default_value = "5")]
         duration: u64,
+        /// Play delay in ms (lead time between send and PTS; default 500).
+        /// Increase for endpoints with slow audio device setup.
+        #[arg(long)]
+        play_delay: Option<u64>,
     },
 
     /// Discover OAAT endpoints on the network
@@ -290,7 +295,8 @@ async fn main() {
             targets,
             freq,
             duration,
-        } => run_multiroom(targets, freq, duration).await,
+            play_delay,
+        } => run_multiroom(targets, freq, duration, play_delay).await,
         Command::Discover { timeout } => run_discover(timeout),
     }
 }
@@ -492,8 +498,16 @@ async fn run_endpoint(
     let (event_tx, mut event_rx) = mpsc::channel(256);
     let (_ctrl_tx, ctrl_rx) = mpsc::channel(32);
 
+    // Endpoint-side clock sync state: the transport runs its own exchanges
+    // against the controller and keeps this updated. We read it to convert
+    // audio packet PTS values into the local clock domain.
+    let clock = std::sync::Arc::new(SharedClock::new());
+    let transport_clock = clock.clone();
+
     tokio::spawn(async move {
-        if let Err(e) = EndpointTransport::run(ep_config, event_tx, ctrl_rx).await {
+        if let Err(e) =
+            EndpointTransport::run_with_clock(ep_config, event_tx, ctrl_rx, transport_clock).await
+        {
             error!(error = %e, "endpoint transport error");
         }
         warn!("endpoint transport task exited — this should never happen");
@@ -506,6 +520,24 @@ async fn run_endpoint(
     let mut packet_count: u64 = 0;
     let mut total_bytes: u64 = 0;
     let mut current_audio_device = audio_device;
+
+    // -- PTS-scheduled playback state --
+    // armed: Play received, output start deferred until the first audio
+    //        packet reveals the stream's PTS.
+    // started: output is running.
+    // start_deadline: local instant at which the deferred start fires.
+    // tracker: expected playback position; drives the drift servo.
+    // tracker_is_controller_domain: whether tracker timestamps live in the
+    //        controller clock domain (absolute PTS) or local domain (fallback).
+    let mut armed = false;
+    let mut started = false;
+    let mut start_deadline: Option<tokio::time::Instant> = None;
+    let mut tracker: Option<PtsTracker> = None;
+    let mut tracker_is_controller_domain = false;
+    let mut stream_sample_rate: u32 = 0;
+    let mut last_drift: i64 = 0;
+    let mut servo_interval = tokio::time::interval(Duration::from_secs(1));
+    servo_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Initialize hardware DAC mixer (Linux only)
     #[cfg(target_os = "linux")]
@@ -526,7 +558,77 @@ async fn run_endpoint(
     tokio::pin!(sigint);
 
     loop {
+        // Deferred-start deadline for the select arm below. When no start is
+        // scheduled the arm is disabled by its guard, the value is unused.
+        let start_at = start_deadline
+            .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
+
         tokio::select! {
+            // PTS-scheduled playback start: fires at the local instant the
+            // first packet's PTS maps to, so all endpoints of a zone start
+            // on the same controller-clock tick.
+            _ = tokio::time::sleep_until(start_at), if start_deadline.is_some() => {
+                start_deadline = None;
+                started = true;
+                audio.play();
+                if daemon {
+                    info!("PTS-scheduled playback started");
+                } else {
+                    println!("Playback started (PTS-scheduled)");
+                }
+            }
+            // Drift servo: compare actual playback position (frames consumed
+            // by the audio callback) with the position the clock says we
+            // should be at, and queue a skip/duplicate correction.
+            _ = servo_interval.tick() => {
+                if started && let (Some(t), Some(frames)) = (tracker.as_ref(), audio.content_position()) {
+                    let now = if tracker_is_controller_domain {
+                        clock.local_to_controller(now_ns())
+                    } else {
+                        now_ns()
+                    };
+                    let drift = t.drift_frames(now, frames);
+                    // Deadband of 0.5 ms: below that, jitter dominates and
+                    // correcting would cause hunting.
+                    let deadband = (stream_sample_rate / 2000).max(4) as i64;
+                    // Stalled catch-up: more than 0.5 s behind and the drift
+                    // barely moved since the last tick — the content needed to
+                    // catch up was lost (e.g. socket overflow on a very late
+                    // start), it will never arrive. Skipping further would
+                    // only produce silence: accept the residual latency by
+                    // rebasing the timeline, and keep the servo for rate
+                    // drift only.
+                    let progress = last_drift - drift;
+                    let stalled = drift > (stream_sample_rate / 2) as i64
+                        && last_drift != 0
+                        && progress < (stream_sample_rate / 10) as i64;
+                    if stalled {
+                        let shift_ns = drift as u64 * 1_000_000_000 / stream_sample_rate.max(1) as u64;
+                        tracker = Some(PtsTracker::new(t.start_ns() + shift_ns, stream_sample_rate));
+                        audio.set_correction(0);
+                        last_drift = 0;
+                        if daemon {
+                            info!(residual_ms = shift_ns / 1_000_000, "catch-up stalled, timeline rebased");
+                        } else {
+                            println!("Catch-up stalled, accepting {} ms residual latency", shift_ns / 1_000_000);
+                        }
+                    } else if drift.abs() > deadband {
+                        // Cap at 1 s of frames: beyond that something is
+                        // broken and skipping forever would only mangle audio.
+                        let capped = drift.clamp(-(stream_sample_rate as i64), stream_sample_rate as i64);
+                        audio.set_correction(capped);
+                        last_drift = drift;
+                        if daemon {
+                            info!(drift_frames = drift, "drift correction queued");
+                        } else if drift.abs() > 1000 {
+                            println!("Drift: {drift} frames, correction queued");
+                        }
+                    } else {
+                        audio.set_correction(0);
+                        last_drift = drift;
+                    }
+                }
+            }
             event = event_rx.recv() => {
                 let Some(event) = event else {
                     warn!("event channel closed — transport task may have exited, waiting for restart");
@@ -581,6 +683,13 @@ async fn run_endpoint(
                                 fp.format, fp.sample_rate, fp.channels, fp.bits_per_sample
                             );
                         }
+                        stream_sample_rate = fp.sample_rate;
+                        // configure() tears down the stream: reset scheduling state.
+                        armed = false;
+                        started = false;
+                        start_deadline = None;
+                        tracker = None;
+                        last_drift = 0;
                         match audio.configure_with_device(fp.format, fp.sample_rate, fp.channels, current_audio_device.as_deref()) {
                             Ok(()) => {
                                 #[cfg(feature = "web-ui")]
@@ -619,6 +728,68 @@ async fn run_endpoint(
                         if !payload.is_empty() {
                             audio.write_audio(&payload);
                         }
+
+                        // Deferred start: the first packet carries the PTS at
+                        // which its first frame should hit the DAC. Convert it
+                        // to the local clock and schedule the output start.
+                        if armed && !started {
+                            armed = false;
+                            let now = now_ns();
+                            let pts_local = clock.controller_to_local(header.pts_ns);
+                            let lead_ns = pts_local.saturating_sub(now);
+                            // Schedule only with a bootstrapped clock and a
+                            // plausible lead time (relative PTS from legacy
+                            // controllers lands in the past → play now).
+                            if clock.is_bootstrapped() && lead_ns > 0 && lead_ns < 5_000_000_000 {
+                                start_deadline = Some(
+                                    tokio::time::Instant::now()
+                                        + Duration::from_nanos(lead_ns),
+                                );
+                                tracker = Some(PtsTracker::new(header.pts_ns, stream_sample_rate));
+                                tracker_is_controller_domain = true;
+                                if daemon {
+                                    info!(lead_ms = lead_ns / 1_000_000, offset_ns = clock.offset_ns(), "playback scheduled on PTS");
+                                } else {
+                                    println!("Playback scheduled in {} ms (clock offset {} ns)", lead_ns / 1_000_000, clock.offset_ns());
+                                }
+                            } else {
+                                started = true;
+                                audio.play();
+                                // Late or unscheduled start. If the clock is
+                                // usable and the PTS is plausibly absolute
+                                // (age < 30 s — a relative PTS from a legacy
+                                // controller would be hours in the past),
+                                // track against the controller timeline: the
+                                // servo will skip forward and realign with
+                                // the rest of the zone. Otherwise fall back
+                                // to local-clock rate stabilization.
+                                let pts_age_ns = clock
+                                    .local_to_controller(now)
+                                    .saturating_sub(header.pts_ns);
+                                if clock.is_bootstrapped() && pts_age_ns < 30_000_000_000 {
+                                    tracker = Some(PtsTracker::new(header.pts_ns, stream_sample_rate));
+                                    tracker_is_controller_domain = true;
+                                } else {
+                                    tracker = Some(PtsTracker::new(now, stream_sample_rate));
+                                    tracker_is_controller_domain = false;
+                                }
+                                let late_ms = pts_age_ns / 1_000_000;
+                                if daemon {
+                                    info!(
+                                        bootstrapped = clock.is_bootstrapped(),
+                                        late_ms,
+                                        realign = tracker_is_controller_domain,
+                                        "playback started immediately (missed PTS deadline)"
+                                    );
+                                } else {
+                                    println!(
+                                        "Playback started immediately ({} ms late, realign: {})",
+                                        late_ms, tracker_is_controller_domain,
+                                    );
+                                }
+                            }
+                        }
+
                         if !daemon && (packet_count.is_multiple_of(5000) || header.flags.contains(PacketFlags::FIRST_PACKET)) {
                             println!(
                                 "  [{packet_count}] seq={} buf={}",
@@ -634,7 +805,24 @@ async fn run_endpoint(
                             } else {
                                 println!("Play: {id}");
                             }
-                            audio.play();
+                            if started {
+                                // Resume from pause: output is already
+                                // positioned, restart immediately. Drift
+                                // tracking restarts on the next stream.
+                                audio.play();
+                            } else if audio.frames_played().is_some() {
+                                // Defer the actual start until the first
+                                // audio packet reveals the stream PTS. Only
+                                // valid on outputs that buffer while stopped
+                                // and expose their position (CpalOutput).
+                                armed = true;
+                            } else {
+                                // AlsaDirectOutput drops writes while
+                                // stopped: start immediately (pre-fix
+                                // behavior, no PTS scheduling).
+                                started = true;
+                                audio.play();
+                            }
                         }
                         PlaybackCommand::Pause(id) => {
                             if daemon {
@@ -643,6 +831,11 @@ async fn run_endpoint(
                                 println!("Pause: {id}");
                             }
                             audio.pause();
+                            // Frames stop advancing while the clock keeps
+                            // running: position tracking is meaningless from
+                            // here on, disable the servo for this stream.
+                            tracker = None;
+                            audio.set_correction(0);
                         }
                         PlaybackCommand::Stop(id) => {
                             if daemon {
@@ -655,6 +848,11 @@ async fn run_endpoint(
                                 );
                             }
                             audio.stop();
+                            armed = false;
+                            started = false;
+                            start_deadline = None;
+                            tracker = None;
+                            last_drift = 0;
                             #[cfg(feature = "web-ui")]
                             status_handle.update(|s| {
                                 s.stream_format = None;
@@ -670,6 +868,10 @@ async fn run_endpoint(
                         }
                         PlaybackCommand::Seek(id, pos) => {
                             audio.flush();
+                            // PTS continuity is broken by a seek: disable the
+                            // servo, playback re-arms on the next stream.
+                            tracker = None;
+                            audio.set_correction(0);
                             if daemon {
                                 info!(stream_id = %id, position_ms = pos, "seek — ALSA flushed");
                             } else {
@@ -892,11 +1094,13 @@ async fn run_controller(
         }
     };
 
+    let clock_port = spawn_clock_responder().await;
+
     let config = ControllerConfig {
         controller_id,
         controller_name: name.clone(),
         features: vec![],
-        clock_port: oaat_core::DEFAULT_CLOCK_PORT,
+        clock_port,
         tls,
     };
 
@@ -971,6 +1175,11 @@ async fn run_controller(
     let total_samples = sample_rate as u64 * duration;
     let mut sample_offset: u64 = 0;
     let start = std::time::Instant::now();
+    // Absolute PTS (controller clock domain): frame 0 should hit the DAC
+    // 200 ms from now (RFC §6.4 single-endpoint target play delay). The
+    // endpoint converts via its clock offset and schedules the start.
+    let play_delay_ns: u64 = 200_000_000;
+    let start_ns = now_ns() + play_delay_ns;
 
     while sample_offset < total_samples {
         let chunk = samples_per_packet.min((total_samples - sample_offset) as usize);
@@ -983,7 +1192,7 @@ async fn run_controller(
             payload.extend_from_slice(&sample.to_le_bytes());
         }
 
-        let pts_ns = (sample_offset as f64 / sample_rate as f64 * 1e9) as u64;
+        let pts_ns = start_ns + (sample_offset as f64 / sample_rate as f64 * 1e9) as u64;
         let flags = if sample_offset == 0 {
             PacketFlags::FIRST_PACKET
         } else {
@@ -1081,7 +1290,8 @@ async fn run_controller(
             payload.extend_from_slice(&sample.to_le_bytes());
         }
 
-        let pts_ns = ((sample_offset + sample_offset2) as f64 / sample_rate as f64 * 1e9) as u64;
+        let pts_ns = start_ns
+            + ((sample_offset + sample_offset2) as f64 / sample_rate as f64 * 1e9) as u64;
         let flags = if sample_offset2 == 0 {
             PacketFlags::FIRST_PACKET
         } else {
@@ -1121,7 +1331,7 @@ async fn run_controller(
         .send_audio(
             2,
             format,
-            (total_offset as f64 / sample_rate as f64 * 1e9) as u64,
+            start_ns + (total_offset as f64 / sample_rate as f64 * 1e9) as u64,
             total_offset,
             &[],
             PacketFlags::LAST_PACKET,
@@ -1233,7 +1443,7 @@ async fn run_controller_file(name: String, target: Option<SocketAddr>, path: &st
         controller_id,
         controller_name: name,
         features: vec![],
-        clock_port: oaat_core::DEFAULT_CLOCK_PORT,
+        clock_port: spawn_clock_responder().await,
         tls,
     };
 
@@ -1289,13 +1499,15 @@ async fn run_controller_file(name: String, target: Option<SocketAddr>, path: &st
     let mut sample_offset: u64 = 0;
     let start = std::time::Instant::now();
     let mut last_print = 0u64;
+    // Absolute PTS: frame 0 hits the DAC 200 ms from now (RFC §6.4).
+    let start_ns = now_ns() + 200_000_000;
 
     while offset < data_len {
         let chunk_bytes = packet_bytes.min(data_len - offset);
         let chunk_samples = chunk_bytes / bytes_per_sample;
         let payload = &pcm_data[offset..offset + chunk_bytes];
 
-        let pts_ns = (sample_offset as f64 / sample_rate as f64 * 1e9) as u64;
+        let pts_ns = start_ns + (sample_offset as f64 / sample_rate as f64 * 1e9) as u64;
         let flags = if offset == 0 {
             PacketFlags::FIRST_PACKET
         } else {
@@ -1331,7 +1543,7 @@ async fn run_controller_file(name: String, target: Option<SocketAddr>, path: &st
         .send_audio(
             1,
             format,
-            (sample_offset as f64 / sample_rate as f64 * 1e9) as u64,
+            start_ns + (sample_offset as f64 / sample_rate as f64 * 1e9) as u64,
             sample_offset,
             &[],
             PacketFlags::LAST_PACKET,
@@ -1343,7 +1555,12 @@ async fn run_controller_file(name: String, target: Option<SocketAddr>, path: &st
     println!("\nDone. {sample_offset} samples sent ({duration_s:.1}s).");
 }
 
-async fn run_multiroom(targets: Vec<SocketAddr>, freq: f64, duration: u64) {
+async fn run_multiroom(
+    targets: Vec<SocketAddr>,
+    freq: f64,
+    duration: u64,
+    play_delay: Option<u64>,
+) {
     use oaat_controller::{ControllerConfig, Zone};
 
     println!("Multi-room: streaming to {} endpoints\n", targets.len());
@@ -1352,11 +1569,12 @@ async fn run_multiroom(targets: Vec<SocketAddr>, freq: f64, duration: u64) {
         controller_id: uuid::Uuid::new_v4().to_string(),
         controller_name: "OAAT Multi-Room".into(),
         features: vec![],
-        clock_port: oaat_core::DEFAULT_CLOCK_PORT,
+        clock_port: spawn_clock_responder().await,
         tls: false,
     };
 
     let mut zone = Zone::new("zone-1".into(), "Demo Zone".into(), config);
+    zone.set_play_delay_ms(play_delay);
 
     for addr in &targets {
         print!("  Connecting to {addr}... ");
@@ -1476,6 +1694,26 @@ fn now_ns() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos() as u64
+}
+
+/// Answer endpoint-initiated clock sync (RFC §6.2) so endpoints can schedule
+/// playback against our clock. Tries the default clock port, falls back to an
+/// ephemeral one. Returns 0 (announced as "no responder") if binding fails.
+async fn spawn_clock_responder() -> u16 {
+    match ClockResponder::spawn(
+        (std::net::Ipv4Addr::UNSPECIFIED, oaat_core::DEFAULT_CLOCK_PORT).into(),
+    )
+    .await
+    {
+        Ok((port, _handle)) => port,
+        Err(_) => match ClockResponder::spawn((std::net::Ipv4Addr::UNSPECIFIED, 0).into()).await {
+            Ok((port, _handle)) => port,
+            Err(e) => {
+                warn!(error = %e, "clock responder unavailable, endpoints cannot sync");
+                0
+            }
+        },
+    }
 }
 
 fn run_discover(timeout: u64) {
