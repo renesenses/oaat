@@ -67,6 +67,11 @@ pub struct CpalOutput {
     /// would never show up in the measured drift and the servo would skip
     /// forever.
     net_adjust: Arc<AtomicI64>,
+    /// Resolved cpal device + f32 support, keyed by the requested name.
+    /// Device and config enumeration cost ~1-2 s on macOS: paying them on
+    /// every configure() eats the PTS scheduling lead time. `prewarm()`
+    /// fills this at startup.
+    cached_device: Option<(Option<String>, cpal::Device, bool)>,
     #[cfg(feature = "flac")]
     flac_stream: Option<crate::flac_decoder::FlacStreamDecoder>,
 }
@@ -124,8 +129,78 @@ impl CpalOutput {
             samples_played: Arc::new(AtomicU64::new(0)),
             correction: Arc::new(AtomicI64::new(0)),
             net_adjust: Arc::new(AtomicI64::new(0)),
+            cached_device: None,
             #[cfg(feature = "flac")]
             flac_stream: None,
+        }
+    }
+
+    /// Resolve the output device by name (or default) plus its f32 support,
+    /// preferring the cache. On a cache miss the enumeration cost is paid
+    /// and the result cached for subsequent streams.
+    fn resolve_device(
+        &mut self,
+        device_name: Option<&str>,
+    ) -> Result<(cpal::Device, bool), Box<dyn std::error::Error>> {
+        if let Some((cached_key, device, supports_f32)) = &self.cached_device
+            && cached_key.as_deref() == device_name
+        {
+            return Ok((device.clone(), *supports_f32));
+        }
+
+        let host = cpal::default_host();
+        let device = if let Some(name) = device_name {
+            let found = host.output_devices()?.find(|d| {
+                d.name()
+                    .map(|n| n.to_lowercase().contains(&name.to_lowercase()))
+                    .unwrap_or(false)
+            });
+            match found {
+                Some(d) => {
+                    info!(requested = name, found = d.name().unwrap_or_default(), "audio device matched by name");
+                    d
+                }
+                None => {
+                    warn!(requested = name, "audio device not found, falling back to default");
+                    host.default_output_device()
+                        .ok_or("no audio output device found")?
+                }
+            }
+        } else {
+            host.default_output_device()
+                .ok_or("no audio output device found")?
+        };
+
+        // f32 preferred, i16/i32 fallback (I2S DACs, see configure). Probed
+        // here so the cost is paid once, not per stream.
+        let supports_f32 = device
+            .supported_output_configs()
+            .map(|cfgs| {
+                cfgs.into_iter()
+                    .any(|c| c.sample_format() == cpal::SampleFormat::F32)
+            })
+            .unwrap_or(false);
+
+        self.cached_device = Some((
+            device_name.map(|s| s.to_string()),
+            device.clone(),
+            supports_f32,
+        ));
+        Ok((device, supports_f32))
+    }
+
+    /// Pre-resolve and cache the output device so the first configure()
+    /// does not pay the enumeration cost during stream setup.
+    pub fn prewarm(&mut self, device_name: Option<&str>) {
+        let started = std::time::Instant::now();
+        match self.resolve_device(device_name) {
+            Ok((d, supports_f32)) => info!(
+                device = d.name().unwrap_or_default(),
+                supports_f32,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "audio device prewarmed"
+            ),
+            Err(e) => warn!(error = %e, "audio device prewarm failed"),
         }
     }
 
@@ -159,28 +234,8 @@ impl CpalOutput {
             };
         }
 
-        let host = cpal::default_host();
-        let device = if let Some(name) = device_name {
-            let found = host.output_devices()?.find(|d| {
-                d.name()
-                    .map(|n| n.to_lowercase().contains(&name.to_lowercase()))
-                    .unwrap_or(false)
-            });
-            match found {
-                Some(d) => {
-                    info!(requested = name, found = d.name().unwrap_or_default(), "audio device matched by name");
-                    d
-                }
-                None => {
-                    warn!(requested = name, "audio device not found, falling back to default");
-                    host.default_output_device()
-                        .ok_or("no audio output device found")?
-                }
-            }
-        } else {
-            host.default_output_device()
-                .ok_or("no audio output device found")?
-        };
+        let configure_started = std::time::Instant::now();
+        let (device, supports_f32) = self.resolve_device(device_name)?;
 
         let actual_device_name = device.name().unwrap_or_default();
         self.device_name = Some(actual_device_name.clone());
@@ -207,17 +262,10 @@ impl CpalOutput {
         let samples_played = self.samples_played.clone();
         let samples_played_i32 = self.samples_played.clone();
 
-        // Check supported formats: prefer f32, fallback to i16 (most compatible with I2S DACs).
-        // Many I2S DACs (ESS 9038 via hifiberry overlay) accept S32_LE in ALSA but
-        // only output sound with S16_LE. Use i16 as the safe fallback.
-        let supports_f32 = device
-            .supported_output_configs()
-            .map(|cfgs| {
-                cfgs.into_iter()
-                    .any(|c| c.sample_format() == cpal::SampleFormat::F32)
-            })
-            .unwrap_or(false);
-
+        // Prefer f32, fallback to i32 (most compatible with I2S DACs).
+        // Many I2S DACs (ESS 9038 via hifiberry overlay) accept S32_LE in
+        // ALSA but only output sound with S16_LE. The probe result comes
+        // from resolve_device's cache.
         let rb = HeapRb::<f32>::new(ring_size);
         let (producer, mut consumer) = rb.split();
 
@@ -274,25 +322,32 @@ impl CpalOutput {
             )?
         };
 
+        // Start the stream immediately: it outputs silence until the
+        // `playing` flag is set. Host-side stream start (CoreAudio, WASAPI)
+        // has tens of milliseconds of variable latency — paying it here, and
+        // making play() a plain atomic flip, keeps PTS-scheduled starts
+        // tight across a zone.
+        stream.play().ok();
         self.stream = Some(stream);
         self.producer = Some(producer);
 
+        info!(
+            elapsed_ms = configure_started.elapsed().as_millis() as u64,
+            "audio output configured"
+        );
         Ok(())
     }
 
     pub fn play(&self) {
-        if let Some(ref stream) = self.stream {
-            stream.play().ok();
+        if self.stream.is_some() {
             self.playing.store(true, Ordering::Relaxed);
             info!("audio output started");
         }
     }
 
     pub fn pause(&self) {
-        if let Some(ref stream) = self.stream {
-            stream.pause().ok();
-            self.playing.store(false, Ordering::Relaxed);
-        }
+        // Keep the stream running (silence): resuming stays a cheap flip.
+        self.playing.store(false, Ordering::Relaxed);
     }
 
     pub fn stop(&mut self) {

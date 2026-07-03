@@ -58,6 +58,12 @@ impl AudioPacketHeader {
 
     pub fn decode(buf: &[u8; AUDIO_HEADER_SIZE]) -> Result<Self, OaatError> {
         let version = buf[0] >> 4;
+        if version != Self::CURRENT_VERSION {
+            return Err(OaatError::VersionMismatch {
+                expected: Self::CURRENT_VERSION as u32,
+                got: version as u32,
+            });
+        }
         let flags = PacketFlags::from_bits(buf[0] & 0x0F)
             .ok_or(OaatError::InvalidPacketFlags(buf[0] & 0x0F))?;
         let format = AudioFormat::from_wire_id(buf[1]).ok_or(OaatError::UnknownFormat(buf[1]))?;
@@ -111,8 +117,16 @@ impl ClockSyncPacket {
         buf[20..28].copy_from_slice(&self.t3.to_be_bytes());
     }
 
+    pub const CURRENT_VERSION: u8 = 1;
+
     pub fn decode(buf: &[u8; Self::SIZE]) -> Result<Self, OaatError> {
         let version = buf[0] >> 4;
+        if version != Self::CURRENT_VERSION {
+            return Err(OaatError::VersionMismatch {
+                expected: Self::CURRENT_VERSION as u32,
+                got: version as u32,
+            });
+        }
         let kind = match buf[0] & 0x0F {
             0x01 => ClockSyncType::Request,
             0x02 => ClockSyncType::Response,
@@ -133,17 +147,6 @@ impl ClockSyncPacket {
         })
     }
 
-    pub fn compute_offset(t1: u64, t2: u64, t3: u64, t4: u64) -> i64 {
-        let a = t2 as i64 - t1 as i64;
-        let b = t3 as i64 - t4 as i64;
-        (a + b) / 2
-    }
-
-    pub fn compute_rtt(t1: u64, t2: u64, t3: u64, t4: u64) -> u64 {
-        let total = t4.wrapping_sub(t1);
-        let server = t3.wrapping_sub(t2);
-        total.wrapping_sub(server)
-    }
 }
 
 #[cfg(test)]
@@ -185,11 +188,42 @@ mod tests {
     }
 
     #[test]
-    fn clock_offset_calculation() {
-        let offset = ClockSyncPacket::compute_offset(100, 200, 210, 310);
-        assert_eq!(offset, 0);
+    fn audio_header_rejects_unknown_version() {
+        let hdr = AudioPacketHeader {
+            version: 1,
+            flags: PacketFlags::empty(),
+            format: AudioFormat::PcmS16le,
+            sequence: 1,
+            stream_id: 1,
+            pts_ns: 0,
+            sample_offset: 0,
+            payload_len: 0,
+        };
+        let mut buf = [0u8; AUDIO_HEADER_SIZE];
+        hdr.encode(&mut buf);
+        buf[0] = (2 << 4) | (buf[0] & 0x0F); // forge version 2
+        assert!(matches!(
+            AudioPacketHeader::decode(&buf),
+            Err(OaatError::VersionMismatch { expected: 1, got: 2 })
+        ));
+    }
 
-        let rtt = ClockSyncPacket::compute_rtt(100, 200, 210, 310);
-        assert_eq!(rtt, 200);
+    #[test]
+    fn clock_sync_rejects_unknown_version() {
+        let pkt = ClockSyncPacket {
+            version: 1,
+            kind: ClockSyncType::Request,
+            sequence: 1,
+            t1: 1,
+            t2: 0,
+            t3: 0,
+        };
+        let mut buf = [0u8; ClockSyncPacket::SIZE];
+        pkt.encode(&mut buf);
+        buf[0] = (3 << 4) | (buf[0] & 0x0F); // forge version 3
+        assert!(matches!(
+            ClockSyncPacket::decode(&buf),
+            Err(OaatError::VersionMismatch { expected: 1, got: 3 })
+        ));
     }
 }

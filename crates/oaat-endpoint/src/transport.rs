@@ -25,6 +25,14 @@ pub struct EndpointConfig {
     pub buffer_size_ms: u32,
     /// Enable TLS 1.3 on the control channel (self-signed cert, TOFU).
     pub tls: bool,
+    /// Defer FormatAccept until the application confirms the audio device is
+    /// ready (by sending Message::FormatAccept — or FormatReject — on the
+    /// control channel). Without this, the accept is sent before the device
+    /// is opened, and the controller's play-delay lead time is eaten by the
+    /// device setup (~1-2 s on some hosts), defeating PTS scheduling.
+    /// Fail-open: if the application does not answer within 5 s, the accept
+    /// is sent anyway.
+    pub defer_format_accept: bool,
 }
 
 #[derive(Debug)]
@@ -103,7 +111,7 @@ impl EndpointTransport {
     pub async fn run_with_clock(
         config: EndpointConfig,
         event_tx: mpsc::Sender<EndpointEvent>,
-        _control_rx: mpsc::Receiver<Message>,
+        mut control_rx: mpsc::Receiver<Message>,
         clock: Arc<SharedClock>,
     ) -> Result<(), OaatError> {
         let tcp_listener = TcpListener::bind(config.control_addr).await?;
@@ -167,7 +175,10 @@ impl EndpointTransport {
                             clock.clone(),
                             peer.ip(),
                         );
-                        if let Err(e) = session.run().await {
+                        if let Err(e) = session
+                            .run(&mut control_rx, config.defer_format_accept)
+                            .await
+                        {
                             warn!(%peer, error = %e, "session ended");
                         }
                         info!("waiting for next controller connection...");
@@ -197,7 +208,10 @@ impl EndpointTransport {
             );
 
             // Run session inline — when it ends, loop back to accept
-            match session.run().await {
+            match session
+                .run(&mut control_rx, config.defer_format_accept)
+                .await
+            {
                 Ok(()) => info!(%peer, "session ended normally"),
                 Err(e) => warn!(%peer, error = %e, "session ended with error"),
             }
@@ -263,7 +277,11 @@ impl<S> EndpointSession<S> {
 }
 
 impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> EndpointSession<S> {
-    async fn run(self) -> Result<(), OaatError> {
+    async fn run(
+        self,
+        control_rx: &mut mpsc::Receiver<Message>,
+        defer_format_accept: bool,
+    ) -> Result<(), OaatError> {
         // Destructure to get owned fields -- avoids borrow conflicts after split().
         let EndpointSession {
             stream,
@@ -377,7 +395,16 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
                 match msg {
                     Message::FormatPropose(fp) => {
                         let response = negotiate_format(&capabilities, &fp);
-                        writer.write_all(&FrameCodec::encode(&response)).await?;
+                        // Deferred accept: hold the FormatAccept until the
+                        // application reports the audio device ready, so the
+                        // controller's play-delay lead time starts counting
+                        // from a ready endpoint. Counter/reject involve no
+                        // device setup and are sent immediately.
+                        let deferred =
+                            defer_format_accept && matches!(response, Message::FormatAccept(_));
+                        if !deferred {
+                            writer.write_all(&FrameCodec::encode(&response)).await?;
+                        }
 
                         match &response {
                             Message::FormatAccept(_) => {
@@ -400,7 +427,16 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
                             _ => {}
                         }
 
+                        let stream_id = fp.stream_id.clone();
                         let _ = event_tx.send(EndpointEvent::FormatProposed(fp)).await;
+
+                        if deferred {
+                            let final_response =
+                                await_device_ready(control_rx, &stream_id, response).await;
+                            writer
+                                .write_all(&FrameCodec::encode(&final_response))
+                                .await?;
+                        }
                     }
                     Message::NextTrackPrepare(ntp) => {
                         let same_format = current_format == Some(ntp.format)
@@ -658,6 +694,44 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
             let _ = event_tx
                 .send(EndpointEvent::AudioPacket { header, payload })
                 .await;
+        }
+    }
+}
+
+/// Wait (up to 5 s) for the application to confirm the audio device is
+/// ready for `stream_id`. Returns the application's FormatAccept/FormatReject
+/// if it matches the stream, or falls open to `auto_response` on timeout —
+/// a slow device must not deadlock the negotiation.
+async fn await_device_ready(
+    control_rx: &mut mpsc::Receiver<Message>,
+    stream_id: &str,
+    auto_response: Message,
+) -> Message {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout_at(deadline, control_rx.recv()).await {
+            Ok(Some(msg)) => {
+                let matches_stream = match &msg {
+                    Message::FormatAccept(a) => a.stream_id == stream_id,
+                    Message::FormatReject(r) => r.stream_id == stream_id,
+                    _ => false,
+                };
+                if matches_stream {
+                    debug!(stream_id, "device ready, sending format response");
+                    return msg;
+                }
+                // Stale confirmation from a previous stream: drop and keep
+                // waiting, otherwise it would satisfy the wrong negotiation.
+                debug!("ignoring stale control message during device wait");
+            }
+            Ok(None) => {
+                warn!("control channel closed, sending auto response");
+                return auto_response;
+            }
+            Err(_) => {
+                warn!(stream_id, "device ready confirmation timed out (5s), sending auto accept");
+                return auto_response;
+            }
         }
     }
 }

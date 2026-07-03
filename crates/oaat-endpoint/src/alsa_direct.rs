@@ -304,6 +304,9 @@ impl AlsaDirectOutput {
         None
     }
 
+    /// No-op: aplay is spawned per stream, there is nothing to prewarm.
+    pub fn prewarm(&mut self, _device_name: Option<&str>) {}
+
     /// No-op: the aplay pipe offers no sample-accurate insertion point.
     pub fn set_correction(&self, _frames: i64) {}
 }

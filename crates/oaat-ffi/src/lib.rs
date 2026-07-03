@@ -301,6 +301,7 @@ pub unsafe extern "C" fn oaat_endpoint_new(name: *const c_char, port: u16) -> *m
         },
         buffer_size_ms: 200,
         tls: false,
+        defer_format_accept: false,
     };
 
     // Spawn the endpoint transport on the runtime

@@ -62,6 +62,7 @@ async fn controller_connects_to_endpoint_and_handshakes() {
         capabilities: test_capabilities(),
         buffer_size_ms: 1000,
         tls: false,
+        defer_format_accept: false,
     };
 
     let (event_tx, mut event_rx) = mpsc::channel(32);
@@ -137,6 +138,7 @@ async fn controller_sends_format_propose_and_audio() {
         capabilities: test_capabilities(),
         buffer_size_ms: 1000,
         tls: false,
+        defer_format_accept: false,
     };
 
     let (event_tx, mut event_rx) = mpsc::channel(64);
@@ -267,6 +269,7 @@ async fn clock_sync_bootstrap() {
         capabilities: test_capabilities(),
         buffer_size_ms: 1000,
         tls: false,
+        defer_format_accept: false,
     };
 
     let (event_tx, _event_rx) = mpsc::channel(32);
@@ -326,6 +329,7 @@ async fn setup_endpoint_and_controller(
         capabilities: caps,
         buffer_size_ms: 1000,
         tls: false,
+        defer_format_accept: false,
     };
 
     let (event_tx, mut event_rx) = mpsc::channel(64);
@@ -812,6 +816,7 @@ async fn multiroom_zone_streams_to_two_endpoints() {
             capabilities: test_capabilities(),
             buffer_size_ms: 1000,
             tls: false,
+            defer_format_accept: false,
         };
 
         let (event_tx, event_rx) = mpsc::channel(256);
@@ -953,6 +958,7 @@ async fn spawn_test_endpoint(index: usize) -> (SocketAddr, mpsc::Receiver<Endpoi
         capabilities: test_capabilities(),
         buffer_size_ms: 1000,
         tls: false,
+        defer_format_accept: false,
     };
 
     let (event_tx, event_rx) = mpsc::channel(256);

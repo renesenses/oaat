@@ -9,7 +9,7 @@ use tracing::{error, info, warn};
 use oaat_controller::{ClockResponder, ConnectedEndpoint, ControllerConfig, ControllerDiscovery};
 use oaat_core::ChannelLayout;
 use oaat_core::format::AudioFormat;
-use oaat_core::message::{EndpointCapabilities, TrackMetadata};
+use oaat_core::message::{EndpointCapabilities, FormatAccept, FormatReject, TrackMetadata};
 use oaat_core::wire::PacketFlags;
 use oaat_endpoint::discovery::EndpointAnnouncement;
 use oaat_endpoint::sync::{PtsTracker, SharedClock};
@@ -493,10 +493,14 @@ async fn run_endpoint(
         capabilities,
         buffer_size_ms: 1000,
         tls,
+        // Hold FormatAccept until our audio device is actually open (we
+        // confirm through ctrl_tx below), so the controller's play-delay
+        // lead time starts from a ready endpoint.
+        defer_format_accept: true,
     };
 
     let (event_tx, mut event_rx) = mpsc::channel(256);
-    let (_ctrl_tx, ctrl_rx) = mpsc::channel(32);
+    let (ctrl_tx, ctrl_rx) = mpsc::channel(32);
 
     // Endpoint-side clock sync state: the transport runs its own exchanges
     // against the controller and keeps this updated. We read it to convert
@@ -521,6 +525,11 @@ async fn run_endpoint(
     let mut total_bytes: u64 = 0;
     let mut current_audio_device = audio_device;
 
+    // Resolve the audio device now: enumeration costs ~1 s on macOS and
+    // would otherwise be paid during format negotiation, eating the PTS
+    // scheduling lead time.
+    audio.prewarm(current_audio_device.as_deref());
+
     // -- PTS-scheduled playback state --
     // armed: Play received, output start deferred until the first audio
     //        packet reveals the stream's PTS.
@@ -535,6 +544,7 @@ async fn run_endpoint(
     let mut tracker: Option<PtsTracker> = None;
     let mut tracker_is_controller_domain = false;
     let mut stream_sample_rate: u32 = 0;
+    let mut stream_channels: u8 = 2;
     let mut last_drift: i64 = 0;
     let mut servo_interval = tokio::time::interval(Duration::from_secs(1));
     servo_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -564,17 +574,25 @@ async fn run_endpoint(
             .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
 
         tokio::select! {
+            // biased: the scheduled start must win over the packet stream —
+            // with random polling it can lose the race for many packet
+            // intervals in a row, adding tens of ms of start skew.
+            biased;
+
             // PTS-scheduled playback start: fires at the local instant the
             // first packet's PTS maps to, so all endpoints of a zone start
             // on the same controller-clock tick.
             _ = tokio::time::sleep_until(start_at), if start_deadline.is_some() => {
+                let late_us = tokio::time::Instant::now()
+                    .saturating_duration_since(start_at)
+                    .as_micros() as u64;
                 start_deadline = None;
                 started = true;
                 audio.play();
                 if daemon {
-                    info!("PTS-scheduled playback started");
+                    info!(late_us, "PTS-scheduled playback started");
                 } else {
-                    println!("Playback started (PTS-scheduled)");
+                    println!("Playback started (PTS-scheduled, timer late by {late_us} µs)");
                 }
             }
             // Drift servo: compare actual playback position (frames consumed
@@ -684,6 +702,7 @@ async fn run_endpoint(
                             );
                         }
                         stream_sample_rate = fp.sample_rate;
+                        stream_channels = fp.channels.max(1);
                         // configure() tears down the stream: reset scheduling state.
                         armed = false;
                         started = false;
@@ -712,6 +731,14 @@ async fn run_endpoint(
                                 } else {
                                     println!("Audio output configured");
                                 }
+                                // Device is open: release the deferred
+                                // FormatAccept so the controller starts its
+                                // play-delay countdown from a ready endpoint.
+                                let _ = ctrl_tx
+                                    .send(oaat_core::Message::FormatAccept(FormatAccept {
+                                        stream_id: fp.stream_id.clone(),
+                                    }))
+                                    .await;
                             }
                             Err(e) => {
                                 if daemon {
@@ -719,23 +746,38 @@ async fn run_endpoint(
                                 } else {
                                     eprintln!("Audio output error: {e}");
                                 }
+                                let _ = ctrl_tx
+                                    .send(oaat_core::Message::FormatReject(FormatReject {
+                                        stream_id: fp.stream_id.clone(),
+                                        reason: format!("audio device configuration failed: {e}"),
+                                    }))
+                                    .await;
                             }
                         }
                     }
                     EndpointEvent::AudioPacket { header, payload } => {
                         packet_count += 1;
                         total_bytes += payload.len() as u64;
+                        // Sampled before writing this packet: needed to relate
+                        // this packet's PTS to the ring head (see below).
+                        let buffered_before = audio.buffer_level() as u64;
                         if !payload.is_empty() {
                             audio.write_audio(&payload);
                         }
 
-                        // Deferred start: the first packet carries the PTS at
-                        // which its first frame should hit the DAC. Convert it
-                        // to the local clock and schedule the output start.
+                        // Deferred start. The deadline is the presentation
+                        // time of the RING HEAD, not of this packet: packets
+                        // may have been buffered before the Play command was
+                        // processed (UDP outruns TCP), so this packet's PTS
+                        // is offset by the already-buffered content.
                         if armed && !started {
                             armed = false;
                             let now = now_ns();
-                            let pts_local = clock.controller_to_local(header.pts_ns);
+                            let buffered_frames = buffered_before / stream_channels as u64;
+                            let head_pts_ns = header.pts_ns.saturating_sub(
+                                buffered_frames * 1_000_000_000 / stream_sample_rate.max(1) as u64,
+                            );
+                            let pts_local = clock.controller_to_local(head_pts_ns);
                             let lead_ns = pts_local.saturating_sub(now);
                             // Schedule only with a bootstrapped clock and a
                             // plausible lead time (relative PTS from legacy
@@ -745,7 +787,7 @@ async fn run_endpoint(
                                     tokio::time::Instant::now()
                                         + Duration::from_nanos(lead_ns),
                                 );
-                                tracker = Some(PtsTracker::new(header.pts_ns, stream_sample_rate));
+                                tracker = Some(PtsTracker::new(head_pts_ns, stream_sample_rate));
                                 tracker_is_controller_domain = true;
                                 if daemon {
                                     info!(lead_ms = lead_ns / 1_000_000, offset_ns = clock.offset_ns(), "playback scheduled on PTS");
@@ -765,9 +807,9 @@ async fn run_endpoint(
                                 // to local-clock rate stabilization.
                                 let pts_age_ns = clock
                                     .local_to_controller(now)
-                                    .saturating_sub(header.pts_ns);
+                                    .saturating_sub(head_pts_ns);
                                 if clock.is_bootstrapped() && pts_age_ns < 30_000_000_000 {
-                                    tracker = Some(PtsTracker::new(header.pts_ns, stream_sample_rate));
+                                    tracker = Some(PtsTracker::new(head_pts_ns, stream_sample_rate));
                                     tracker_is_controller_domain = true;
                                 } else {
                                     tracker = Some(PtsTracker::new(now, stream_sample_rate));

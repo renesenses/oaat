@@ -60,6 +60,7 @@ fn endpoint_config(
         capabilities: test_capabilities(),
         buffer_size_ms: 1000,
         tls: false,
+        defer_format_accept: false,
     }
 }
 
