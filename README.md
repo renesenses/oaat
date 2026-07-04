@@ -1,7 +1,7 @@
 # OAAT — Open Advanced Audio Transport
 
 [![CI](https://github.com/renesenses/oaat/actions/workflows/ci.yml/badge.svg)](https://github.com/renesenses/oaat/actions/workflows/ci.yml)
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![License: BSL 1.1](https://img.shields.io/badge/License-BSL_1.1-orange.svg)](LICENSE)
 
 An open-source, bit-perfect, multi-room audio streaming protocol.
 
@@ -117,7 +117,7 @@ oaat-test 192.168.1.50:9740
 
 | Feature | OAAT | RAAT | DLNA | AirPlay 2 | OpenHome |
 |---------|------|------|------|-----------|----------|
-| License | Apache 2.0 | Proprietary | UPnP Forum | Apple | BSD |
+| License | BSL 1.1* | Proprietary | UPnP Forum | Apple | BSD |
 | Bit-perfect | Yes | Yes | Depends | No | Yes |
 | DSD native | Yes | Yes | DoP only | No | DoP |
 | Multi-room sync | < 1 ms | < 1 ms | None | Apple | Limited |
@@ -129,7 +129,7 @@ oaat-test 192.168.1.50:9740
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE).
+Business Source License 1.1 — see [LICENSE](LICENSE). Free for non-commercial use and internal production; commercial licensing: contact@mozaiklabs.fr. Each version converts to Apache 2.0 four years after publication.
 
 ## Author
 

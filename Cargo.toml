@@ -13,7 +13,7 @@ members = [
 [workspace.package]
 version = "0.2.3"
 edition = "2024"
-license = "Apache-2.0"
+license = "BUSL-1.1"
 repository = "https://github.com/renesenses/oaat"
 homepage = "https://mozaiklabs.fr/docs/oaat"
 authors = ["Bertrand Clech <renesenses@gmail.com>"]

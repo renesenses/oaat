@@ -4,7 +4,7 @@
 **Date**: 2026-07-04
 **Author**: Bertrand Clech / MozAIk Labs
 **Status**: Draft
-**License**: Apache 2.0
+**License**: Business Source License 1.1 (converts to Apache 2.0 four years after each version's publication; free for non-commercial and internal production use)
 
 > Changes in 0.3.0: FEC is fully specified on the wire (group size, index,
 > length-XOR recovery); FormatAccept now signals device readiness; clock sync
@@ -830,7 +830,7 @@ trait OaatHal {
 
 | Feature | OAAT | RAAT | DLNA | AirPlay 2 | Chromecast | OpenHome |
 |---------|------|------|------|-----------|------------|----------|
-| License | Apache 2.0 | Proprietary | UPnP Forum | Apple | Google | BSD |
+| License | BSL 1.1* | Proprietary | UPnP Forum | Apple | Google | BSD |
 | Cert cost | Free | Paid | Fee | MFi | Cast SDK | Free |
 | Bit-perfect | Yes | Yes | Depends | No | No | Yes |
 | Max PCM | 768/32 | 768/32 | Varies | 48/24 | 48/24 | Varies |
@@ -841,6 +841,8 @@ trait OaatHal {
 | DRM | None | MQA | None | FairPlay | Widevine | None |
 | Endpoint LOC | ~1500 | N/A | ~5000+ | N/A | N/A | ~3000+ |
 | Open source | Yes | No | Yes | Reverse-eng | No | Yes |
+
+\* BSL 1.1: free for non-commercial and internal production use; converts to Apache 2.0 four years after each version. Commercial licensing: contact@mozaiklabs.fr.
 
 ---
 
