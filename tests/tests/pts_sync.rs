@@ -142,6 +142,173 @@ async fn fec_parity_packets_never_reach_the_audio_path() {
 }
 
 #[tokio::test]
+async fn fec_recovers_lost_packet_through_endpoint_transport() {
+    use oaat_core::fec::FecEncoder;
+    use oaat_core::wire::{AUDIO_HEADER_SIZE, AudioPacketHeader};
+
+    init_tracing();
+
+    let (control, audio, clock) = reserve_endpoint_ports().await;
+    let ep_config = endpoint_config(control, audio, clock);
+
+    let (event_tx, mut event_rx) = mpsc::channel(64);
+    let (_ctrl_tx, ctrl_rx) = mpsc::channel(32);
+    let _ep = tokio::spawn(async move {
+        EndpointTransport::run(ep_config, event_tx, ctrl_rx)
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let ctrl_config = ControllerConfig {
+        controller_id: "ctrl-fec-rec".into(),
+        controller_name: "FEC Recovery Controller".into(),
+        features: vec![],
+        clock_port: 0,
+        tls: false,
+    };
+    let _endpoint = ConnectedEndpoint::connect(&ctrl_config, control).await.unwrap();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Craft a FEC group of 3 raw UDP packets and drop the middle one.
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let group: u8 = 3;
+    let payloads = vec![vec![0x11u8; 100], vec![0x22u8; 80], vec![0x33u8; 100]];
+    let mut enc = FecEncoder::new(group);
+    let mut parity = None;
+    for p in &payloads {
+        parity = enc.feed(p);
+    }
+    let parity = parity.unwrap();
+
+    let send = |seq: u16, index: u8, len_xor: u16, flags: PacketFlags, payload: Vec<u8>| {
+        let header = AudioPacketHeader {
+            version: 1,
+            flags,
+            format: AudioFormat::PcmS16le,
+            sequence: seq,
+            stream_id: 1,
+            pts_ns: 1_000_000 * seq as u64,
+            sample_offset: 480 * seq as u64,
+            payload_len: payload.len() as u16,
+            fec_group_size: group,
+            fec_index: index,
+            fec_len_xor: len_xor,
+        };
+        let mut buf = vec![0u8; AUDIO_HEADER_SIZE + payload.len()];
+        let mut hdr = [0u8; AUDIO_HEADER_SIZE];
+        header.encode(&mut hdr);
+        buf[..AUDIO_HEADER_SIZE].copy_from_slice(&hdr);
+        buf[AUDIO_HEADER_SIZE..].copy_from_slice(&payload);
+        buf
+    };
+
+    sock.send_to(&send(0, 0, 0, PacketFlags::empty(), payloads[0].clone()), audio)
+        .await
+        .unwrap();
+    // seq 1 (index 1, 80 bytes) intentionally NOT sent — simulated loss
+    sock.send_to(&send(2, 2, 0, PacketFlags::empty(), payloads[2].clone()), audio)
+        .await
+        .unwrap();
+    sock.send_to(
+        &send(3, 0, parity.len_xor, PacketFlags::FEC, parity.payload.clone()),
+        audio,
+    )
+    .await
+    .unwrap();
+
+    // The endpoint must deliver ALL THREE data packets, in order, with the
+    // lost one recovered at its exact length (80 bytes, not padded to 100).
+    let mut received = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while received.len() < 3 {
+        let event = tokio::time::timeout_at(deadline, event_rx.recv())
+            .await
+            .expect("timed out waiting for FEC-recovered packets")
+            .unwrap();
+        if let EndpointEvent::AudioPacket { header, payload } = event {
+            received.push((header, payload));
+        }
+    }
+
+    for (i, (h, p)) in received.iter().enumerate() {
+        assert_eq!(h.sequence, i as u16, "packets must arrive in order");
+        assert_eq!(*p, payloads[i]);
+        assert!(!h.flags.contains(PacketFlags::FEC));
+    }
+    assert_eq!(received[1].1.len(), 80, "recovered packet must keep its exact length");
+    // PTS of the recovered packet is interpolated exactly (uniform spacing).
+    assert_eq!(received[1].0.pts_ns, 1_000_000);
+}
+
+#[tokio::test]
+async fn stream_stats_flow_from_endpoint_app_to_controller() {
+    use oaat_controller::EndpointResponse;
+    use oaat_core::message::StreamStats;
+
+    init_tracing();
+
+    let (control, audio, clock) = reserve_endpoint_ports().await;
+    let ep_config = endpoint_config(control, audio, clock);
+
+    let (event_tx, mut event_rx) = mpsc::channel(64);
+    let (ctrl_tx, ctrl_rx) = mpsc::channel(32);
+    let _ep = tokio::spawn(async move {
+        EndpointTransport::run(ep_config, event_tx, ctrl_rx)
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let ctrl_config = ControllerConfig {
+        controller_id: "ctrl-stats".into(),
+        controller_name: "Stats Controller".into(),
+        features: vec![],
+        clock_port: 0,
+        tls: false,
+    };
+    let mut endpoint = ConnectedEndpoint::connect(&ctrl_config, control).await.unwrap();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    // The endpoint application publishes a health report through the
+    // control channel; the transport forwards it to the controller.
+    ctrl_tx
+        .send(oaat_core::Message::StreamStats(StreamStats {
+            stream_id: "stats-stream".into(),
+            buffer_frames: 4800,
+            drift_us: -250,
+            corrections_net_frames: 12,
+            packets_lost: 1,
+            packets_recovered: 3,
+            bit_perfect: true,
+        }))
+        .await
+        .unwrap();
+
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(2), endpoint.response_rx.recv())
+        .await
+        .expect("timed out waiting for stream stats")
+        .unwrap();
+    match resp {
+        EndpointResponse::StreamStats(ss) => {
+            assert_eq!(ss.stream_id, "stats-stream");
+            assert_eq!(ss.buffer_frames, 4800);
+            assert_eq!(ss.drift_us, -250);
+            assert_eq!(ss.packets_lost, 1);
+            assert_eq!(ss.packets_recovered, 3);
+            assert!(ss.bit_perfect);
+        }
+        other => panic!("expected StreamStats, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn endpoint_clock_bootstraps_against_controller_responder() {
     init_tracing();
 

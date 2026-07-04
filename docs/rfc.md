@@ -1,10 +1,16 @@
 # RFC: OAAT -- Open Advanced Audio Transport
 
-**Version**: 0.2.0 (Draft)
-**Date**: 2026-06-04
+**Version**: 0.3.0 (Draft)
+**Date**: 2026-07-04
 **Author**: Bertrand Clech / MozAIk Labs
 **Status**: Draft
 **License**: Apache 2.0
+
+> Changes in 0.3.0: FEC is fully specified on the wire (group size, index,
+> length-XOR recovery); FormatAccept now signals device readiness; clock sync
+> is normatively endpoint-initiated with a mandatory controller responder;
+> PTS-scheduled playback start and drift compensation are normative;
+> bit-perfect output path requirements clarified.
 
 ---
 
@@ -270,7 +276,31 @@ The Endpoint responds with one of:
 
 The Controller MUST NOT send audio data until it receives `FORMAT_ACCEPT`.
 
+**Readiness semantics**: `FORMAT_ACCEPT` means the Endpoint is *ready to
+render* — its audio device is open and configured for the proposed format,
+not merely that the format is acceptable. Opening an audio device can take
+hundreds of milliseconds to seconds on some hosts; an accept sent before the
+device is ready silently consumes the Controller's play-delay lead time and
+defeats PTS-scheduled starts (§6.4). Endpoints SHOULD defer the accept until
+the device is open, with a bounded fail-open (RECOMMENDED: 5 s) so a stuck
+device cannot deadlock the negotiation. `FORMAT_COUNTER` and `FORMAT_REJECT`
+involve no device setup and are sent immediately.
+
 **Bit-perfect guarantee**: When the Endpoint accepts a format, it commits to delivering those exact samples to the DAC with no modification. If the Endpoint needs to resample (e.g., DAC fixed at 48 kHz), it MUST counter-propose the native rate so the Controller can perform the conversion server-side with a high-quality resampler, rather than having the Endpoint do it with potentially inferior quality.
+
+Bit-perfection constrains the entire output path, not just the wire:
+
+- The Endpoint MUST buffer and deliver samples in the negotiated format's
+  native representation. Intermediate float normalization is only
+  acceptable when the scaling is a power of two (bijective for the source
+  bit depth) — arbitrary scale factors like `i32::MAX` are not.
+- Sample width adaptation MUST be limited to exact operations (e.g. 24-bit
+  samples left-shifted into a 32-bit device slot).
+- Software volume at any setting other than unity breaks bit-perfection;
+  endpoints advertising `vol: hw` or `fixed` (§3.3) preserve it. Endpoints
+  SHOULD expose whether the active output path is bit-exact.
+- Lossless compressed transport (FLAC) preserves the guarantee provided
+  decode and delivery follow the rules above.
 
 ### 5.4 Channel Layouts
 
@@ -327,7 +357,8 @@ OAAT uses a PTP-inspired (IEEE 1588) clock synchronization mechanism, simplified
 
 ### 6.2 Clock Sync Protocol
 
-The Controller is the **clock master**. Clock sync runs over UDP:
+The Controller is the **clock master**. Clock sync is **endpoint-initiated**
+and runs over UDP:
 
 ```
 Endpoint                          Controller
@@ -340,24 +371,68 @@ Endpoint                          Controller
 ```
 
 The Endpoint computes:
-- **Round-trip delay**: `d = (t4 - t1) - (t3 - t2)`
+- **Round-trip delay**: `d = (t4 - t1) - (t3 - t2)` (clamped to 0:
+  measurement noise on a near-zero RTT can make it transiently negative)
 - **Clock offset**: `offset = ((t2 - t1) + (t3 - t4)) / 2`
+
+The Controller MUST run a clock sync responder on the clock port announced
+in its `hello` message — without it, Endpoints can never learn their offset
+and PTS scheduling (§6.4) is impossible. The Controller MAY additionally
+poll Endpoints with its own exchanges for health monitoring (§7.5.6);
+Endpoints MUST answer those with t2/t3 stamping. Endpoints SHOULD reject
+sync responses older than 1 second (stale datagrams poison the filter).
+
+Timestamps are nanoseconds. Implementations SHOULD use a clock source that
+is not stepped by NTP adjustments; a wall-clock step degrades sync until the
+filter re-converges.
 
 ### 6.3 Sync Cadence
 
-- During initial handshake: 10 rapid exchanges over 1 second (bootstrap).
-- Steady state: 1 exchange every 2 seconds.
+- During initial handshake: 10 rapid exchanges at 100 ms (bootstrap,
+  alpha = 0.5).
+- Steady state: adaptive on measured jitter — 5 s when jitter < 100 µs,
+  2 s below 1 ms, 500 ms above.
 - Offset is filtered through an exponential moving average (alpha = 0.125).
+- Jitter MUST be estimated with a forgetting statistic (e.g. exponentially
+  weighted variance), not a cumulative one: slow clock drift would otherwise
+  inflate the jitter estimate forever and pin the cadence at its fastest.
 
-### 6.4 Audio Timestamps
+### 6.4 Audio Timestamps and Scheduled Start
 
-Every audio packet carries a **presentation timestamp** (PTS) in the Controller's clock domain:
+Every audio packet carries a **presentation timestamp** (PTS) in the
+Controller's clock domain: the instant the packet's FIRST frame should hit
+the DAC. The Controller stamps absolute PTS values:
 
 ```
-PTS = controller_clock_ns + target_play_delay_ns
+PTS(packet) = play_start_ns + sample_offset / sample_rate * 1e9
+play_start_ns = controller_clock_ns_at_play + target_play_delay_ns
 ```
 
 Default target play delay: 200 ms (single endpoint), 500 ms (multi-room).
+Controllers SHOULD make the delay configurable for endpoints with slow
+device setup.
+
+**Scheduled start (normative)**: on `play`, the Endpoint MUST NOT start
+output immediately. It buffers incoming audio and starts output at the local
+instant corresponding to the stream's start:
+
+```
+head_pts = packet.pts_ns − buffered_frames_before_packet / sample_rate * 1e9
+local_start = head_pts − clock_offset
+```
+
+The ring-head correction matters: UDP audio can outrun the TCP `play`
+command, so the first packet observed *after* `play` is not necessarily the
+first packet of the stream. Anchoring on the buffer head makes all endpoints
+of a zone converge on the same absolute instant regardless of when each one
+armed. Measured on a LAN reference implementation: 38–880 µs start skew
+between two endpoints.
+
+Fallbacks: if the clock is not bootstrapped or the PTS is implausible
+(relative timestamps from a legacy controller), the Endpoint starts
+immediately. If the deadline is already past (late join, slow device), the
+Endpoint starts immediately and realigns to the controller timeline through
+drift compensation (§6.6).
 
 ### 6.5 Buffer Management
 
@@ -367,10 +442,44 @@ Buffer states: Filling → Playing → Underrun/Overflow (with reporting).
 
 ### 6.6 Drift Compensation
 
-Options (in order of preference):
+The Endpoint MUST track its **content position** — frames actually consumed
+by the output device *plus* the net frames skipped or duplicated so far —
+and compare it against the position the clock dictates
+(`(now − head_pts) × sample_rate`). Tracking raw consumed frames alone is
+insufficient: applied corrections would never show up in the measured drift
+and the servo would skip forever.
+
+Correction mechanisms (in order of preference):
 1. Micro-adjust output clock (hardware)
-2. Skip/duplicate single sample at inaudible intervals (software)
+2. Skip/duplicate frames at inaudible rates (software; RECOMMENDED: a few
+   frames per packet within a ±0.5 ms deadband, evaluated at ~1 Hz)
 3. Report drift to Controller for PTS adjustment (universal fallback)
+
+Two special regimes are RECOMMENDED for software correction:
+- **Jump resync**: when the deficit exceeds ~25 ms (late start), drop it in
+  one jump as content arrives — one audible discontinuity beats seconds of
+  audible desynchronization.
+- **Timeline rebase**: when catch-up stalls (the content needed to catch up
+  was lost, e.g. socket overflow during a very late start), accept the
+  residual latency by shifting the reference start instead of skipping
+  arriving audio forever.
+
+**Health reporting**: while streaming, Endpoints SHOULD send a periodic
+`stream_stats` message (RECOMMENDED: every 5 s) so the Controller can see
+buffer health, residual drift and link quality without polling:
+
+```json
+{
+  "type": "stream_stats",
+  "stream_id": "abc123",
+  "buffer_frames": 22050,
+  "drift_us": -120,
+  "corrections_net_frames": 27405,
+  "packets_lost": 0,
+  "packets_recovered": 3,
+  "bit_perfect": true
+}
+```
 
 ### 6.7 Sync Accuracy Target
 
@@ -442,6 +551,7 @@ JSON objects over TCP, framed with 4-byte big-endian length prefix:
 | `volume_set` | C → E | Set volume (0-100 or dB) |
 | `volume_get` | C → E | Query volume |
 | `volume_report` | E → C | Report volume |
+| `stream_stats` | E → C | Periodic health report: buffer, drift, losses (§6.6) |
 | `mute` | C → E | Mute/unmute |
 
 ### 7.4 Metadata
@@ -598,7 +708,9 @@ The Controller SHOULD monitor endpoint health:
 |                    Sample Offset (u64 BE)                     |
 |                                                               |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|        Payload Length (u16 BE)      |       Reserved (u16)    |
+|        Payload Length (u16 BE)      | FEC grp size |FEC index |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|        FEC length XOR (u16 BE)      |       Reserved (u16)    |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |                                                               |
 |                     Audio Payload                             |
@@ -606,7 +718,9 @@ The Controller SHOULD monitor endpoint health:
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
-Header: 32 bytes. Max payload: 1440 bytes (fits single Ethernet frame).
+Header: 32 bytes. Senders MUST NOT exceed 1440 payload bytes (fits a single
+Ethernet frame — larger payloads fragment at the IP layer and amplify
+loss); receivers SHOULD accept payloads up to 8192 bytes.
 
 **Format enum**:
 
@@ -625,6 +739,38 @@ Header: 32 bytes. Max payload: 1440 bytes (fits single Ethernet frame).
 
 **Flags**: `0x01` = first packet, `0x02` = last packet, `0x04` = FEC, `0x08` = format change boundary.
 
+#### 9.1.1 Forward Error Correction
+
+FEC is XOR parity over groups of consecutive data packets. All FEC fields
+are zero when FEC is disabled.
+
+- **Data packets** carry `fec_group_size` (2–16, number of data packets per
+  parity packet) and `fec_index` (this packet's position in its group,
+  `0..group_size-1`). A group's base sequence is
+  `sequence − fec_index` (wrapping).
+- **Parity packets** carry the `0x04` flag, the same `fec_group_size`, and
+  consume the sequence number following the group's last data packet. The
+  payload is the XOR of all data payloads in the group, each zero-extended
+  to the longest; `payload_len` is that longest length. `fec_len_xor` is
+  the XOR of the `payload_len` of all data packets in the group.
+- **Recovery**: with exactly one data packet missing and the parity
+  received, the missing payload is the XOR of the parity payload with all
+  received payloads (zero-extended), truncated to
+  `fec_len_xor XOR (received lengths)` — the exact original length, so no
+  padding is injected into the stream. The recovered packet's PTS and
+  sample offset are interpolated from neighbors (exact for uniform packet
+  durations). Two or more losses in a group are unrecoverable.
+- **Receiver behavior**: packets within a group are reordered by index and
+  emitted in order once the group completes (or recovers). Buffering one
+  group adds `group_size × packet_duration` latency (≈90 ms for 8 × 480
+  frames at 44.1 kHz) — receivers MUST account for this within the play
+  delay. An incomplete group is flushed when the next group starts, on
+  `0x02` (last packet), or on stream teardown; missing packets are counted
+  as lost. Parity packets MUST NOT be delivered to the audio path.
+- **Overhead**: `1/group_size` bandwidth (6–50%). Intended for Wi-Fi links
+  with occasional single-packet loss; it does not replace adequate
+  buffering.
+
 ### 9.2 Clock Sync Packets (UDP)
 
 28 bytes: Ver (4 bits) + Type (4 bits) + Sequence (u16) + T1/T2/T3 (u64 each).
@@ -641,6 +787,9 @@ struct OaatAudioHeader {
     pts: u64,
     sample_offset: u64,
     payload_len: u16,
+    fec_group_size: u8,
+    fec_index: u8,
+    fec_len_xor: u16,
     reserved: u16,
 }
 ```
@@ -711,6 +860,15 @@ TLS 1.3 (TOFU), reconnection logic, `oaat-test` conformance tool, ALSA direct ou
 
 ### Phase 5: Dynamic Multi-Device ✅
 Zone Manager with event system, dynamic join/leave during playback, per-device volume (master + offset model), zone protocol messages (ZoneAssign/ZoneUpdate/ZoneRelease/ZoneAck), endpoint health monitoring, graceful degradation, C FFI bindings.
+
+### Phase 5.5: Sync & Resilience (v0.3) ✅
+Endpoint-initiated clock sync with mandatory controller responder,
+PTS-scheduled playback start (measured 38–880 µs start skew between two
+LAN endpoints), content-position drift servo (fine skip/dup, jump resync,
+timeline rebase), deferred FormatAccept (device readiness), FEC fully
+specified on the wire and implemented end-to-end (reorder + single-loss
+recovery with exact length restoration), bit-perfect native-format output
+path.
 
 ### Phase 6: Ecosystem -- In progress
 Tune server integration (OaatOutput/OaatMultiroomOutput), crates.io publication, Raspberry Pi deployment, outreach to Volumio/moOde/HiFiBerryOS.

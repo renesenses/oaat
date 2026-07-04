@@ -1,5 +1,20 @@
+//! cpal audio output with a bit-perfect native-format ring buffer.
+//!
+//! The ring stores the negotiated wire format's raw bytes — no intermediate
+//! float normalization. When the device accepts a matching integer sample
+//! type and the volume is at 100% unmuted, samples reach the DAC untouched:
+//! - PCM_S16LE → i16 stream (exact)
+//! - PCM_S24LE / PCM_S24LE4 → i32 stream, shifted left 8 (exact)
+//! - PCM_S32LE → i32 stream (exact)
+//! - PCM_F32LE → f32 stream (exact)
+//!
+//! FLAC decodes to normalized f32; DSD is decimated to f32 (software
+//! fallback). Both use power-of-two scaling, so FLAC ≤ 24-bit remains
+//! lossless end-to-end. Software volume (≠ 100%) necessarily breaks
+//! bit-perfection; hardware volume (`vol=hw`) keeps it.
+
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleRate, StreamConfig};
@@ -42,15 +57,96 @@ fn is_usb_dac(name: &str) -> bool {
     true
 }
 
+/// Sample layout of the bytes stored in the ring buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RingFormat {
+    S16,
+    S24,
+    S24In32,
+    S32,
+    F32,
+}
+
+impl RingFormat {
+    fn bytes_per_sample(self) -> usize {
+        match self {
+            RingFormat::S16 => 2,
+            RingFormat::S24 => 3,
+            RingFormat::S24In32 | RingFormat::S32 | RingFormat::F32 => 4,
+        }
+    }
+
+    fn of(format: AudioFormat) -> Self {
+        match format {
+            AudioFormat::PcmS16le => RingFormat::S16,
+            AudioFormat::PcmS24le => RingFormat::S24,
+            AudioFormat::PcmS24le4 => RingFormat::S24In32,
+            AudioFormat::PcmS32le => RingFormat::S32,
+            // FLAC decodes to normalized f32 (power-of-two scaling: exact
+            // for ≤ 24-bit sources); DSD decimates to f32.
+            _ => RingFormat::F32,
+        }
+    }
+
+    /// Decode one sample from ring bytes to i32, left-justified to 32 bits
+    /// (so an i32 stream gets full-scale output and S32 is a passthrough).
+    #[inline]
+    fn to_i32(self, b: &[u8]) -> i32 {
+        match self {
+            RingFormat::S16 => (i16::from_le_bytes([b[0], b[1]]) as i32) << 16,
+            RingFormat::S24 => {
+                let sign = if b[2] & 0x80 != 0 { 0xFF } else { 0 };
+                i32::from_le_bytes([b[0], b[1], b[2], sign]) << 8
+            }
+            RingFormat::S24In32 => i32::from_le_bytes([b[0], b[1], b[2], b[3]]) << 8,
+            RingFormat::S32 => i32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+            RingFormat::F32 => {
+                let f = f32::from_le_bytes([b[0], b[1], b[2], b[3]]).clamp(-1.0, 1.0);
+                // 2^31 scaling: exact for power-of-two normalized sources.
+                (f as f64 * 2_147_483_648.0).clamp(i32::MIN as f64, i32::MAX as f64) as i32
+            }
+        }
+    }
+
+    /// Decode one sample from ring bytes to normalized f32 (power-of-two
+    /// divisors: bijective for ≤ 24-bit integer sources).
+    #[inline]
+    fn to_f32(self, b: &[u8]) -> f32 {
+        match self {
+            RingFormat::S16 => i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0,
+            RingFormat::S24 => {
+                let sign = if b[2] & 0x80 != 0 { 0xFF } else { 0 };
+                i32::from_le_bytes([b[0], b[1], b[2], sign]) as f32 / 8_388_608.0
+            }
+            RingFormat::S24In32 => {
+                i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32 / 8_388_608.0
+            }
+            RingFormat::S32 => {
+                i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32 / 2_147_483_648.0
+            }
+            RingFormat::F32 => f32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+        }
+    }
+}
+
+/// Which sample types the device advertises.
+#[derive(Debug, Clone, Copy, Default)]
+struct DeviceSampleSupport {
+    f32: bool,
+    i16: bool,
+    i32: bool,
+}
+
 pub struct CpalOutput {
     stream: Option<cpal::Stream>,
-    producer: Option<ringbuf::HeapProd<f32>>,
+    producer: Option<ringbuf::HeapProd<u8>>,
     playing: Arc<AtomicBool>,
     volume: Arc<AtomicU32>, // 0-1000 (0.0-1.0 * 1000)
     muted: Arc<AtomicBool>,
     sample_rate: u32,
     channels: u8,
     format: AudioFormat,
+    ring_format: RingFormat,
     device_name: Option<String>,
     /// Samples actually consumed from the ring by the audio callback.
     /// Divided by `channels`, this is the playback position in frames —
@@ -59,7 +155,7 @@ pub struct CpalOutput {
     /// Pending drift correction in frames. Positive: playback is behind,
     /// frames are dropped on write. Negative: playback is ahead, frames are
     /// duplicated on write. Applied at most a few frames per packet so the
-    /// correction itself stays inaudible (bulk resync excepted, see
+    /// correction itself stays inaudible (jump resync excepted, see
     /// `write_audio`).
     correction: Arc<AtomicI64>,
     /// Net frames adjusted so far: dropped − duplicated. Content position at
@@ -67,11 +163,15 @@ pub struct CpalOutput {
     /// would never show up in the measured drift and the servo would skip
     /// forever.
     net_adjust: Arc<AtomicI64>,
-    /// Resolved cpal device + f32 support, keyed by the requested name.
-    /// Device and config enumeration cost ~1-2 s on macOS: paying them on
-    /// every configure() eats the PTS scheduling lead time. `prewarm()`
-    /// fills this at startup.
-    cached_device: Option<(Option<String>, cpal::Device, bool)>,
+    /// True while the DAC receives the exact negotiated samples (matching
+    /// stream type, volume 100%, unmuted). Diagnostic, refreshed on
+    /// configure.
+    bit_perfect: Arc<AtomicU8>,
+    /// Resolved cpal device + sample type support, keyed by the requested
+    /// name. Device and config enumeration cost ~1-2 s on macOS: paying
+    /// them on every configure() eats the PTS scheduling lead time.
+    /// `prewarm()` fills this at startup.
+    cached_device: Option<(Option<String>, cpal::Device, DeviceSampleSupport)>,
     #[cfg(feature = "flac")]
     flac_stream: Option<crate::flac_decoder::FlacStreamDecoder>,
 }
@@ -125,27 +225,29 @@ impl CpalOutput {
             sample_rate: 0,
             channels: 0,
             format: AudioFormat::PcmS16le,
+            ring_format: RingFormat::S16,
             device_name: None,
             samples_played: Arc::new(AtomicU64::new(0)),
             correction: Arc::new(AtomicI64::new(0)),
             net_adjust: Arc::new(AtomicI64::new(0)),
+            bit_perfect: Arc::new(AtomicU8::new(0)),
             cached_device: None,
             #[cfg(feature = "flac")]
             flac_stream: None,
         }
     }
 
-    /// Resolve the output device by name (or default) plus its f32 support,
-    /// preferring the cache. On a cache miss the enumeration cost is paid
-    /// and the result cached for subsequent streams.
+    /// Resolve the output device by name (or default) plus its sample type
+    /// support, preferring the cache. On a cache miss the enumeration cost
+    /// is paid and the result cached for subsequent streams.
     fn resolve_device(
         &mut self,
         device_name: Option<&str>,
-    ) -> Result<(cpal::Device, bool), Box<dyn std::error::Error>> {
-        if let Some((cached_key, device, supports_f32)) = &self.cached_device
+    ) -> Result<(cpal::Device, DeviceSampleSupport), Box<dyn std::error::Error>> {
+        if let Some((cached_key, device, support)) = &self.cached_device
             && cached_key.as_deref() == device_name
         {
-            return Ok((device.clone(), *supports_f32));
+            return Ok((device.clone(), *support));
         }
 
         let host = cpal::default_host();
@@ -171,22 +273,25 @@ impl CpalOutput {
                 .ok_or("no audio output device found")?
         };
 
-        // f32 preferred, i16/i32 fallback (I2S DACs, see configure). Probed
-        // here so the cost is paid once, not per stream.
-        let supports_f32 = device
-            .supported_output_configs()
-            .map(|cfgs| {
-                cfgs.into_iter()
-                    .any(|c| c.sample_format() == cpal::SampleFormat::F32)
-            })
-            .unwrap_or(false);
+        // Probed here so the cost is paid once, not per stream.
+        let mut support = DeviceSampleSupport::default();
+        if let Ok(cfgs) = device.supported_output_configs() {
+            for c in cfgs {
+                match c.sample_format() {
+                    cpal::SampleFormat::F32 => support.f32 = true,
+                    cpal::SampleFormat::I16 => support.i16 = true,
+                    cpal::SampleFormat::I32 => support.i32 = true,
+                    _ => {}
+                }
+            }
+        }
 
         self.cached_device = Some((
             device_name.map(|s| s.to_string()),
             device.clone(),
-            supports_f32,
+            support,
         ));
-        Ok((device, supports_f32))
+        Ok((device, support))
     }
 
     /// Pre-resolve and cache the output device so the first configure()
@@ -194,9 +299,9 @@ impl CpalOutput {
     pub fn prewarm(&mut self, device_name: Option<&str>) {
         let started = std::time::Instant::now();
         match self.resolve_device(device_name) {
-            Ok((d, supports_f32)) => info!(
+            Ok((d, support)) => info!(
                 device = d.name().unwrap_or_default(),
-                supports_f32,
+                supports = ?support,
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "audio device prewarmed"
             ),
@@ -224,6 +329,7 @@ impl CpalOutput {
         self.format = format;
         self.sample_rate = sample_rate;
         self.channels = channels;
+        self.ring_format = RingFormat::of(format);
 
         #[cfg(feature = "flac")]
         {
@@ -235,7 +341,7 @@ impl CpalOutput {
         }
 
         let configure_started = std::time::Instant::now();
-        let (device, supports_f32) = self.resolve_device(device_name)?;
+        let (device, support) = self.resolve_device(device_name)?;
 
         let actual_device_name = device.name().unwrap_or_default();
         self.device_name = Some(actual_device_name.clone());
@@ -246,7 +352,9 @@ impl CpalOutput {
             "Tune Bridge using: {}{}", actual_device_name, usb_hint
         );
 
-        let ring_size = RING_BUFFER_FRAMES * channels as usize;
+        let ring_format = self.ring_format;
+        let bps = ring_format.bytes_per_sample();
+        let ring_size = RING_BUFFER_FRAMES * channels as usize * bps;
         let config = StreamConfig {
             channels: channels as u16,
             sample_rate: SampleRate(sample_rate),
@@ -260,66 +368,97 @@ impl CpalOutput {
         self.correction.store(0, Ordering::Relaxed);
         self.net_adjust.store(0, Ordering::Relaxed);
         let samples_played = self.samples_played.clone();
-        let samples_played_i32 = self.samples_played.clone();
 
-        // Prefer f32, fallback to i32 (most compatible with I2S DACs).
-        // Many I2S DACs (ESS 9038 via hifiberry overlay) accept S32_LE in
-        // ALSA but only output sound with S16_LE. The probe result comes
-        // from resolve_device's cache.
-        let rb = HeapRb::<f32>::new(ring_size);
+        let rb = HeapRb::<u8>::new(ring_size);
         let (producer, mut consumer) = rb.split();
 
-        let stream = if supports_f32 {
-            info!("opening audio output (f32)");
-            device.build_output_stream(
-                &config,
-                move |output: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    if !playing.load(Ordering::Relaxed) || muted.load(Ordering::Relaxed) {
-                        output.fill(0.0);
-                        return;
-                    }
-                    let vol = volume.load(Ordering::Relaxed) as f32 / 1000.0;
-                    let read = consumer.pop_slice(output);
-                    samples_played.fetch_add(read as u64, Ordering::Relaxed);
-                    for sample in &mut output[..read] {
-                        *sample *= vol;
-                    }
-                    output[read..].fill(0.0);
-                },
-                |err| error!(error = %err, "audio output error"),
-                None,
-            )?
-        } else {
-            info!("opening audio output (i32/S32_LE)");
-            // Scratch buffer allocated once, outside the callback: a heap
-            // allocation inside the real-time audio callback risks glitches.
-            // Grows only if the host ever delivers a larger buffer.
-            let mut tmp: Vec<f32> = vec![0.0f32; 8192];
-            device.build_output_stream(
-                &config,
-                move |output: &mut [i32], _: &cpal::OutputCallbackInfo| {
-                    if !playing.load(Ordering::Relaxed) || muted.load(Ordering::Relaxed) {
-                        output.fill(0);
-                        return;
-                    }
-                    let vol = volume.load(Ordering::Relaxed) as f32 / 1000.0;
-                    if tmp.len() < output.len() {
-                        tmp.resize(output.len(), 0.0);
-                    }
-                    let read = consumer.pop_slice(&mut tmp[..output.len()]);
-                    samples_played_i32.fetch_add(read as u64, Ordering::Relaxed);
-                    for (i, sample) in output.iter_mut().enumerate() {
-                        if i < read {
-                            let s = (tmp[i] * vol).clamp(-1.0, 1.0);
-                            *sample = (s * (i32::MAX - 256) as f32) as i32;
-                        } else {
-                            *sample = 0;
+        // Pick the output sample type that preserves the negotiated samples:
+        // matching integer type when the device offers it, f32 fallback
+        // (power-of-two scaling: still exact for ≤ 24-bit content).
+        enum OutKind {
+            I16,
+            I32,
+            F32,
+        }
+        let out_kind = match ring_format {
+            RingFormat::S16 if support.i16 => OutKind::I16,
+            RingFormat::S16 | RingFormat::S24 | RingFormat::S24In32 | RingFormat::S32
+                if support.i32 =>
+            {
+                OutKind::I32
+            }
+            RingFormat::F32 if support.f32 => OutKind::F32,
+            _ if support.f32 => OutKind::F32,
+            _ if support.i32 => OutKind::I32,
+            _ => OutKind::I16,
+        };
+        let integer_out = !matches!(out_kind, OutKind::F32) || ring_format == RingFormat::F32;
+        self.bit_perfect.store(integer_out as u8, Ordering::Relaxed);
+        info!(
+            out = match out_kind { OutKind::I16 => "i16", OutKind::I32 => "i32", OutKind::F32 => "f32" },
+            ring = ?ring_format,
+            bit_perfect_path = integer_out,
+            "audio output path selected"
+        );
+
+        // Scratch buffer allocated once, outside the callback: a heap
+        // allocation inside the real-time audio callback risks glitches.
+        let mut scratch: Vec<u8> = vec![0u8; 16384 * bps];
+
+        macro_rules! build_stream {
+            ($sample:ty, $convert:expr) => {{
+                let convert = $convert;
+                device.build_output_stream(
+                    &config,
+                    move |output: &mut [$sample], _: &cpal::OutputCallbackInfo| {
+                        if !playing.load(Ordering::Relaxed) || muted.load(Ordering::Relaxed) {
+                            output.fill(Default::default());
+                            return;
                         }
-                    }
-                },
-                |err| error!(error = %err, "audio output error"),
-                None,
-            )?
+                        let vol = volume.load(Ordering::Relaxed);
+                        let want_bytes = output.len() * bps;
+                        if scratch.len() < want_bytes {
+                            scratch.resize(want_bytes, 0);
+                        }
+                        let got = consumer.pop_slice(&mut scratch[..want_bytes]);
+                        let samples = got / bps;
+                        samples_played.fetch_add(samples as u64, Ordering::Relaxed);
+                        for (i, out) in output.iter_mut().enumerate() {
+                            *out = if i < samples {
+                                convert(&scratch[i * bps..(i + 1) * bps], vol)
+                            } else {
+                                Default::default()
+                            };
+                        }
+                    },
+                    |err| error!(error = %err, "audio output error"),
+                    None,
+                )?
+            }};
+        }
+
+        let stream = match out_kind {
+            OutKind::I16 => build_stream!(i16, move |b: &[u8], vol: u32| -> i16 {
+                // Ring is S16 on this path: exact passthrough at unity volume.
+                let s = i16::from_le_bytes([b[0], b[1]]);
+                if vol == 1000 {
+                    s
+                } else {
+                    (s as i64 * vol as i64 / 1000) as i16
+                }
+            }),
+            OutKind::I32 => build_stream!(i32, move |b: &[u8], vol: u32| -> i32 {
+                let s = ring_format.to_i32(b);
+                if vol == 1000 {
+                    s
+                } else {
+                    (s as i64 * vol as i64 / 1000) as i32
+                }
+            }),
+            OutKind::F32 => build_stream!(f32, move |b: &[u8], vol: u32| -> f32 {
+                let s = ring_format.to_f32(b);
+                if vol == 1000 { s } else { s * (vol as f32 / 1000.0) }
+            }),
         };
 
         // Start the stream immediately: it outputs silence until the
@@ -374,35 +513,56 @@ impl CpalOutput {
         self.muted.store(muted, Ordering::Relaxed);
     }
 
+    /// True when the negotiated samples reach the DAC bit-exact (matching
+    /// output path; software volume at 100% and unmuted preserve this).
+    pub fn bit_perfect_path(&self) -> bool {
+        self.bit_perfect.load(Ordering::Relaxed) != 0
+    }
+
+    /// Write audio payload bytes (in the negotiated wire format) to the ring.
+    /// Returns the number of frames enqueued.
     pub fn write_audio(&mut self, data: &[u8]) -> usize {
         let Some(producer) = self.producer.as_mut() else {
             return 0;
         };
 
-        let mut samples = if self.format == AudioFormat::Flac {
-            #[cfg(feature = "flac")]
-            {
-                if let Some(ref mut stream) = self.flac_stream {
-                    let s = stream.feed(data);
-                    if s.is_empty() { return 0; }
-                    s
-                } else {
-                    match crate::flac_decoder::decode_flac_to_f32(data) {
-                        Ok(s) => s,
-                        Err(_) => return 0,
+        // Convert to ring bytes. Native PCM passes through untouched —
+        // this is the bit-perfect path. FLAC and DSD decode to f32.
+        let decoded: Vec<u8>;
+        let mut bytes: &[u8] = match self.format {
+            AudioFormat::Flac => {
+                #[cfg(feature = "flac")]
+                {
+                    let samples = if let Some(ref mut stream) = self.flac_stream {
+                        stream.feed(data)
+                    } else {
+                        crate::flac_decoder::decode_flac_to_f32(data).unwrap_or_default()
+                    };
+                    if samples.is_empty() {
+                        return 0;
                     }
+                    decoded = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+                    &decoded
+                }
+                #[cfg(not(feature = "flac"))]
+                {
+                    warn!("FLAC data received but flac feature not enabled");
+                    return 0;
                 }
             }
-            #[cfg(not(feature = "flac"))]
-            {
-                warn!("FLAC data received but flac feature not enabled");
-                return 0;
+            AudioFormat::DsdU8 | AudioFormat::DsdU16le | AudioFormat::DsdU32le => {
+                let samples = dsd_to_f32(data, dsd_rate_multiplier(self.format));
+                if samples.is_empty() {
+                    return 0;
+                }
+                decoded = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+                &decoded
             }
-        } else {
-            convert_to_f32(self.format, data)
+            _ => data,
         };
 
         let ch = self.channels.max(1) as usize;
+        let frame_bytes = ch * self.ring_format.bytes_per_sample();
 
         // Drift correction, applied on the producer side (never in the RT
         // callback). Two regimes:
@@ -416,7 +576,8 @@ impl CpalOutput {
         const MAX_CORRECTION_FRAMES_PER_WRITE: i64 = 2;
         const JUMP_THRESHOLD_FRAMES: i64 = 1200; // ~25 ms at 48 kHz
         let pending = self.correction.load(Ordering::Relaxed);
-        let frames_in = (samples.len() / ch) as i64;
+        let frames_in = (bytes.len() / frame_bytes) as i64;
+        let mut duplicated: Vec<u8> = Vec::new();
         if pending > JUMP_THRESHOLD_FRAMES && frames_in > 0 {
             let drop_frames = pending.min(frames_in);
             self.correction.fetch_sub(drop_frames, Ordering::Relaxed);
@@ -424,40 +585,41 @@ impl CpalOutput {
             if drop_frames == frames_in {
                 return 0;
             }
-            samples.drain(..drop_frames as usize * ch);
-        } else if pending > 0 && samples.len() > ch {
-            let drop_frames = pending
-                .min(MAX_CORRECTION_FRAMES_PER_WRITE)
-                .min(frames_in - 1);
+            bytes = &bytes[drop_frames as usize * frame_bytes..];
+        } else if pending > 0 && frames_in > 1 {
+            let drop_frames = pending.min(MAX_CORRECTION_FRAMES_PER_WRITE).min(frames_in - 1);
             if drop_frames > 0 {
-                samples.drain(..drop_frames as usize * ch);
+                bytes = &bytes[drop_frames as usize * frame_bytes..];
                 self.correction.fetch_sub(drop_frames, Ordering::Relaxed);
                 self.net_adjust.fetch_add(drop_frames, Ordering::Relaxed);
             }
-        } else if pending < 0 && samples.len() >= ch {
-            let dup_frames = (-pending).min(MAX_CORRECTION_FRAMES_PER_WRITE);
+        } else if pending < 0 && bytes.len() >= frame_bytes {
+            let dup_frames = (-pending).min(MAX_CORRECTION_FRAMES_PER_WRITE) as usize;
+            duplicated.reserve(dup_frames * frame_bytes + bytes.len());
             for _ in 0..dup_frames {
-                let first_frame: Vec<f32> = samples[..ch].to_vec();
-                samples.splice(0..0, first_frame);
+                duplicated.extend_from_slice(&bytes[..frame_bytes]);
             }
-            self.correction.fetch_add(dup_frames, Ordering::Relaxed);
-            self.net_adjust.fetch_sub(dup_frames, Ordering::Relaxed);
+            duplicated.extend_from_slice(bytes);
+            self.correction.fetch_add(dup_frames as i64, Ordering::Relaxed);
+            self.net_adjust.fetch_sub(dup_frames as i64, Ordering::Relaxed);
+            bytes = &duplicated;
         }
 
         // Only push complete frames to maintain channel alignment.
         // A partial push (odd number of samples for stereo) would permanently
         // swap L/R channels for all subsequent audio → distortion.
         let available = producer.vacant_len();
-        let frames_to_push = (available / ch).min(samples.len() / ch);
-        let samples_to_push = frames_to_push * ch;
-        producer.push_slice(&samples[..samples_to_push]);
+        let frames_to_push = (available / frame_bytes).min(bytes.len() / frame_bytes);
+        producer.push_slice(&bytes[..frames_to_push * frame_bytes]);
         frames_to_push
     }
 
+    /// Ring buffer fill level, in frames.
     pub fn buffer_level(&self) -> usize {
+        let frame_bytes = self.channels.max(1) as usize * self.ring_format.bytes_per_sample();
         self.producer
             .as_ref()
-            .map(|p| p.occupied_len())
+            .map(|p| p.occupied_len() / frame_bytes)
             .unwrap_or(0)
     }
 
@@ -492,38 +654,6 @@ impl CpalOutput {
 impl Default for CpalOutput {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-fn convert_to_f32(format: AudioFormat, data: &[u8]) -> Vec<f32> {
-    match format {
-        AudioFormat::PcmS16le => data
-            .chunks_exact(2)
-            .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / i16::MAX as f32)
-            .collect(),
-        AudioFormat::PcmS24le => data
-            .chunks_exact(3)
-            .map(|b| {
-                let sign = if b[2] & 0x80 != 0 { 0xFF } else { 0 };
-                let val = i32::from_le_bytes([b[0], b[1], b[2], sign]);
-                val as f32 / 8_388_607.0
-            })
-            .collect(),
-        AudioFormat::PcmS24le4 | AudioFormat::PcmS32le => data
-            .chunks_exact(4)
-            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32 / i32::MAX as f32)
-            .collect(),
-        AudioFormat::PcmF32le => data
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .collect(),
-        AudioFormat::DsdU8 | AudioFormat::DsdU16le | AudioFormat::DsdU32le => {
-            dsd_to_f32(data, dsd_rate_multiplier(format))
-        }
-        _ => {
-            warn!(format = %format, "unsupported format, silence");
-            vec![0.0f32; data.len() / 2]
-        }
     }
 }
 
@@ -576,4 +706,49 @@ fn dsd_to_f32(data: &[u8], rate_multiplier: u32) -> Vec<f32> {
             (2.0 * ones as f32 / total_bits as f32) - 1.0
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ring_format_s16_roundtrip_exact() {
+        for v in [i16::MIN, -1, 0, 1, 12345, i16::MAX] {
+            let b = v.to_le_bytes();
+            assert_eq!(RingFormat::S16.to_i32(&b) >> 16, v as i32);
+            // f32 path: /32768 then *32768 is exact (power of two)
+            let f = RingFormat::S16.to_f32(&b);
+            assert_eq!((f * 32768.0) as i32, v as i32);
+        }
+    }
+
+    #[test]
+    fn ring_format_s24_roundtrip_exact() {
+        for v in [-8_388_608i32, -1, 0, 1, 4_194_304, 8_388_607] {
+            let full = v.to_le_bytes();
+            let b = [full[0], full[1], full[2]];
+            assert_eq!(RingFormat::S24.to_i32(&b) >> 8, v);
+            let f = RingFormat::S24.to_f32(&b);
+            assert_eq!((f as f64 * 8_388_608.0) as i32, v);
+        }
+    }
+
+    #[test]
+    fn ring_format_s32_is_passthrough() {
+        for v in [i32::MIN, -1, 0, 1, 123_456_789, i32::MAX] {
+            let b = v.to_le_bytes();
+            assert_eq!(RingFormat::S32.to_i32(&b), v);
+        }
+    }
+
+    #[test]
+    fn ring_format_f32_normalized_to_i32_exact_for_24bit() {
+        // A 24-bit sample normalized by 2^23 must come back exact at 2^31.
+        for v in [-8_388_608i32, -1, 0, 1, 8_388_607] {
+            let f = v as f32 / 8_388_608.0;
+            let b = f.to_le_bytes();
+            assert_eq!(RingFormat::F32.to_i32(&b) >> 8, v);
+        }
+    }
 }

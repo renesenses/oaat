@@ -29,6 +29,7 @@ pub enum EndpointResponse {
     FormatReject(FormatReject),
     NextTrackReady(NextTrackReady),
     NextTrackReformat(NextTrackReformat),
+    StreamStats(StreamStats),
 }
 
 pub struct ConnectedEndpoint {
@@ -216,6 +217,20 @@ impl ConnectedEndpoint {
                                         .send(EndpointResponse::NextTrackReformat(ntf))
                                         .await;
                                 }
+                                Message::StreamStats(ss) => {
+                                    info!(
+                                        stream_id = %ss.stream_id,
+                                        buffer_frames = ss.buffer_frames,
+                                        drift_us = ss.drift_us,
+                                        lost = ss.packets_lost,
+                                        recovered = ss.packets_recovered,
+                                        bit_perfect = ss.bit_perfect,
+                                        "endpoint stream stats"
+                                    );
+                                    let _ = response_tx
+                                        .send(EndpointResponse::StreamStats(ss))
+                                        .await;
+                                }
                                 other => {
                                     debug!("received: {:?}", std::mem::discriminant(&other));
                                 }
@@ -290,6 +305,9 @@ impl ConnectedEndpoint {
             pts_ns,
             sample_offset,
             payload_len: payload.len() as u16,
+            fec_group_size: 0,
+            fec_index: 0,
+            fec_len_xor: 0,
         };
         self.sequence = self.sequence.wrapping_add(1);
 

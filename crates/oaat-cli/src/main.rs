@@ -110,6 +110,10 @@ enum Command {
         /// Increase for endpoints with slow audio device setup.
         #[arg(long)]
         play_delay: Option<u64>,
+        /// Enable FEC with the given group size (2-16): one parity packet
+        /// per N data packets, recovers single losses (Wi-Fi).
+        #[arg(long, value_parser = clap::value_parser!(u8).range(2..=16))]
+        fec: Option<u8>,
     },
 
     /// Discover OAAT endpoints on the network
@@ -296,7 +300,8 @@ async fn main() {
             freq,
             duration,
             play_delay,
-        } => run_multiroom(targets, freq, duration, play_delay).await,
+            fec,
+        } => run_multiroom(targets, freq, duration, play_delay, fec).await,
         Command::Discover { timeout } => run_discover(timeout),
     }
 }
@@ -544,8 +549,9 @@ async fn run_endpoint(
     let mut tracker: Option<PtsTracker> = None;
     let mut tracker_is_controller_domain = false;
     let mut stream_sample_rate: u32 = 0;
-    let mut stream_channels: u8 = 2;
     let mut last_drift: i64 = 0;
+    let mut current_stream_id = String::new();
+    let mut servo_ticks: u64 = 0;
     let mut servo_interval = tokio::time::interval(Duration::from_secs(1));
     servo_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -599,6 +605,33 @@ async fn run_endpoint(
             // by the audio callback) with the position the clock says we
             // should be at, and queue a skip/duplicate correction.
             _ = servo_interval.tick() => {
+                servo_ticks += 1;
+                // Periodic health report to the controller (RFC §6.6/§7.3).
+                if started && servo_ticks.is_multiple_of(5) && !current_stream_id.is_empty() {
+                    let (lost, recovered) = clock.link_stats();
+                    let drift_us = if let (Some(t), Some(frames)) = (tracker.as_ref(), audio.content_position()) {
+                        let now = if tracker_is_controller_domain {
+                            clock.local_to_controller(now_ns())
+                        } else {
+                            now_ns()
+                        };
+                        t.drift_frames(now, frames) * 1_000_000 / stream_sample_rate.max(1) as i64
+                    } else {
+                        0
+                    };
+                    let _ = ctrl_tx
+                        .send(oaat_core::Message::StreamStats(oaat_core::message::StreamStats {
+                            stream_id: current_stream_id.clone(),
+                            buffer_frames: audio.buffer_level() as u64,
+                            drift_us,
+                            corrections_net_frames: audio.content_position().unwrap_or(0) as i64
+                                - audio.frames_played().unwrap_or(0) as i64,
+                            packets_lost: lost,
+                            packets_recovered: recovered,
+                            bit_perfect: audio.bit_perfect_path(),
+                        }))
+                        .await;
+                }
                 if started && let (Some(t), Some(frames)) = (tracker.as_ref(), audio.content_position()) {
                     let now = if tracker_is_controller_domain {
                         clock.local_to_controller(now_ns())
@@ -702,7 +735,7 @@ async fn run_endpoint(
                             );
                         }
                         stream_sample_rate = fp.sample_rate;
-                        stream_channels = fp.channels.max(1);
+                        current_stream_id = fp.stream_id.clone();
                         // configure() tears down the stream: reset scheduling state.
                         armed = false;
                         started = false;
@@ -758,9 +791,9 @@ async fn run_endpoint(
                     EndpointEvent::AudioPacket { header, payload } => {
                         packet_count += 1;
                         total_bytes += payload.len() as u64;
-                        // Sampled before writing this packet: needed to relate
-                        // this packet's PTS to the ring head (see below).
-                        let buffered_before = audio.buffer_level() as u64;
+                        // Sampled before writing this packet (in frames):
+                        // needed to relate this packet's PTS to the ring head.
+                        let buffered_frames_before = audio.buffer_level() as u64;
                         if !payload.is_empty() {
                             audio.write_audio(&payload);
                         }
@@ -773,9 +806,9 @@ async fn run_endpoint(
                         if armed && !started {
                             armed = false;
                             let now = now_ns();
-                            let buffered_frames = buffered_before / stream_channels as u64;
                             let head_pts_ns = header.pts_ns.saturating_sub(
-                                buffered_frames * 1_000_000_000 / stream_sample_rate.max(1) as u64,
+                                buffered_frames_before * 1_000_000_000
+                                    / stream_sample_rate.max(1) as u64,
                             );
                             let pts_local = clock.controller_to_local(head_pts_ns);
                             let lead_ns = pts_local.saturating_sub(now);
@@ -1602,6 +1635,7 @@ async fn run_multiroom(
     freq: f64,
     duration: u64,
     play_delay: Option<u64>,
+    fec: Option<u8>,
 ) {
     use oaat_controller::{ControllerConfig, Zone};
 
@@ -1617,6 +1651,10 @@ async fn run_multiroom(
 
     let mut zone = Zone::new("zone-1".into(), "Demo Zone".into(), config);
     zone.set_play_delay_ms(play_delay);
+    if let Some(group_size) = fec {
+        zone.enable_fec(group_size);
+        println!("FEC enabled: 1 parity packet per {group_size} data packets");
+    }
 
     for addr in &targets {
         print!("  Connecting to {addr}... ");

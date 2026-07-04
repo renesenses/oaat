@@ -53,7 +53,10 @@ cargo run --bin tune-bridge -- discover --timeout 5
 ## Key types
 
 - `AudioFormat` — 10 formats: PCM (S16/S24/S24LE4/S32/F32), DSD (U8/U16/U32), FLAC, Opus
-- `AudioPacketHeader` — 32-byte wire header (version, flags, format, sequence, stream_id, PTS, sample_offset, payload_len)
+- `AudioPacketHeader` — 32-byte wire header (version, flags, format, sequence, stream_id, PTS, sample_offset, payload_len, fec_group_size, fec_index, fec_len_xor)
+- `FecEncoder`/`FecReceiver` — XOR parity per group; receiver reorders, recovers single losses with exact length (len_xor), counts lost/recovered
+- `SharedClock`/`PtsTracker` (oaat-endpoint) — endpoint-side clock sync state + expected-position tracking for the drift servo
+- `ClockResponder` (oaat-controller) — answers endpoint-initiated clock sync on the port announced in Hello
 - `ClockSyncPacket` — 28-byte PTP exchange (t1/t2/t3 timestamps)
 - `Message` — All JSON control messages (hello, format_propose/accept/counter/reject, play/pause/stop, metadata, zone_*, next_track_*)
 - `SessionState` — 8-state machine (Discovery → Handshake → Idle → Negotiation → Streaming → Paused → Stopped → Disconnected)

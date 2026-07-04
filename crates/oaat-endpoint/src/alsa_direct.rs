@@ -307,6 +307,12 @@ impl AlsaDirectOutput {
     /// No-op: aplay is spawned per stream, there is nothing to prewarm.
     pub fn prewarm(&mut self, _device_name: Option<&str>) {}
 
+    /// Raw wire bytes are piped to aplay with the matching ALSA format:
+    /// bit-perfect by construction (software volume aside).
+    pub fn bit_perfect_path(&self) -> bool {
+        true
+    }
+
     /// No-op: the aplay pipe offers no sample-accurate insertion point.
     pub fn set_correction(&self, _frames: i64) {}
 }

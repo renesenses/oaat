@@ -21,6 +21,10 @@ pub struct SharedClock {
     offset_ns: AtomicI64,
     rtt_ns: AtomicU64,
     bootstrapped: AtomicBool,
+    /// Link quality counters, updated by the transport's audio receive loop
+    /// (FEC receiver) and read by the application for stream_stats reports.
+    packets_lost: AtomicU64,
+    packets_recovered: AtomicU64,
 }
 
 impl SharedClock {
@@ -30,7 +34,23 @@ impl SharedClock {
             offset_ns: AtomicI64::new(0),
             rtt_ns: AtomicU64::new(0),
             bootstrapped: AtomicBool::new(false),
+            packets_lost: AtomicU64::new(0),
+            packets_recovered: AtomicU64::new(0),
         }
+    }
+
+    /// Publish link quality counters (transport side).
+    pub fn set_link_stats(&self, lost: u64, recovered: u64) {
+        self.packets_lost.store(lost, Ordering::Release);
+        self.packets_recovered.store(recovered, Ordering::Release);
+    }
+
+    /// (packets lost beyond recovery, packets recovered from FEC parity).
+    pub fn link_stats(&self) -> (u64, u64) {
+        (
+            self.packets_lost.load(Ordering::Acquire),
+            self.packets_recovered.load(Ordering::Acquire),
+        )
     }
 
     /// Feed a completed 4-timestamp exchange (t1/t4 local, t2/t3 controller).
