@@ -290,6 +290,9 @@ impl ConnectedEndpoint {
             pts_ns,
             sample_offset,
             payload_len: payload.len() as u16,
+            fec_group_size: 0,
+            fec_index: 0,
+            fec_len_xor: 0,
         };
         self.sequence = self.sequence.wrapping_add(1);
 

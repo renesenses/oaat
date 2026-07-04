@@ -666,6 +666,11 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
 
     async fn audio_receive_loop(socket: Arc<UdpSocket>, event_tx: mpsc::Sender<EndpointEvent>) {
         let mut buf = vec![0u8; AUDIO_HEADER_SIZE + oaat_core::MAX_AUDIO_PAYLOAD];
+        // Reorders within FEC groups, recovers single losses from parity and
+        // emits packets in order. Packets without FEC pass through directly.
+        let mut fec_rx = oaat_core::fec::FecReceiver::new();
+        let mut last_recovered: u64 = 0;
+        let mut last_lost: u64 = 0;
         loop {
             let n = match socket.recv(&mut buf).await {
                 Ok(n) => n,
@@ -683,17 +688,30 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
                 Ok(h) => h,
                 Err(_) => continue,
             };
-            // FEC parity packets carry XOR data, not audio. Until a FecDecoder
-            // is wired in, they MUST be dropped: feeding them to the audio
-            // output would play a burst of noise every FEC group.
-            if header.flags.contains(PacketFlags::FEC) {
-                debug!(sequence = header.sequence, "FEC parity packet dropped (no decoder)");
-                continue;
-            }
             let payload = buf[AUDIO_HEADER_SIZE..n].to_vec();
-            let _ = event_tx
-                .send(EndpointEvent::AudioPacket { header, payload })
-                .await;
+
+            // Flush the group on stream end so trailing packets are not
+            // held back waiting for a group that will never complete.
+            let last_packet = header.flags.contains(PacketFlags::LAST_PACKET);
+            let mut deliverable = fec_rx.feed(header, payload);
+            if last_packet {
+                deliverable.extend(fec_rx.flush());
+            }
+
+            if fec_rx.recovered() != last_recovered {
+                last_recovered = fec_rx.recovered();
+                info!(total = last_recovered, "packet recovered from FEC parity");
+            }
+            if fec_rx.lost() != last_lost {
+                last_lost = fec_rx.lost();
+                warn!(total = last_lost, "packet lost beyond FEC recovery");
+            }
+
+            for (header, payload) in deliverable {
+                let _ = event_tx
+                    .send(EndpointEvent::AudioPacket { header, payload })
+                    .await;
+            }
         }
     }
 }

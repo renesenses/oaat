@@ -25,9 +25,19 @@ bitflags::bitflags! {
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 /// |                    Sample Offset (u64 BE)                     |
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-/// |     Payload Length (u16 BE)    |       Reserved (u16)         |
+/// |     Payload Length (u16 BE)    | FEC grp size  |  FEC index   |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |     FEC length XOR (u16 BE)    |       Reserved (u16)         |
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 /// ```
+///
+/// FEC fields (all zero when FEC is disabled):
+/// - `fec_group_size`: number of data packets per parity packet (2-16).
+/// - `fec_index`: this data packet's position within its group
+///   (0..group_size-1). Unused (0) on parity packets.
+/// - `fec_len_xor`: on parity packets only, XOR of the `payload_len` of all
+///   data packets in the group — lets the receiver restore the exact length
+///   of a recovered packet (payloads are XORed zero-extended to the longest).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AudioPacketHeader {
     pub version: u8,
@@ -38,6 +48,9 @@ pub struct AudioPacketHeader {
     pub pts_ns: u64,
     pub sample_offset: u64,
     pub payload_len: u16,
+    pub fec_group_size: u8,
+    pub fec_index: u8,
+    pub fec_len_xor: u16,
 }
 
 impl AudioPacketHeader {
@@ -52,8 +65,10 @@ impl AudioPacketHeader {
         buf[8..16].copy_from_slice(&self.pts_ns.to_be_bytes());
         buf[16..24].copy_from_slice(&self.sample_offset.to_be_bytes());
         buf[24..26].copy_from_slice(&self.payload_len.to_be_bytes());
-        buf[26..28].copy_from_slice(&0u16.to_be_bytes());
-        buf[28..32].fill(0);
+        buf[26] = self.fec_group_size;
+        buf[27] = self.fec_index;
+        buf[28..30].copy_from_slice(&self.fec_len_xor.to_be_bytes());
+        buf[30..32].fill(0);
     }
 
     pub fn decode(buf: &[u8; AUDIO_HEADER_SIZE]) -> Result<Self, OaatError> {
@@ -72,6 +87,9 @@ impl AudioPacketHeader {
         let pts_ns = u64::from_be_bytes(buf[8..16].try_into().unwrap());
         let sample_offset = u64::from_be_bytes(buf[16..24].try_into().unwrap());
         let payload_len = u16::from_be_bytes([buf[24], buf[25]]);
+        let fec_group_size = buf[26];
+        let fec_index = buf[27];
+        let fec_len_xor = u16::from_be_bytes([buf[28], buf[29]]);
 
         Ok(Self {
             version,
@@ -82,6 +100,9 @@ impl AudioPacketHeader {
             pts_ns,
             sample_offset,
             payload_len,
+            fec_group_size,
+            fec_index,
+            fec_len_xor,
         })
     }
 }
@@ -164,6 +185,9 @@ mod tests {
             pts_ns: 1_000_000_000,
             sample_offset: 192000,
             payload_len: 1440,
+            fec_group_size: 8,
+            fec_index: 3,
+            fec_len_xor: 0,
         };
         let mut buf = [0u8; AUDIO_HEADER_SIZE];
         hdr.encode(&mut buf);
@@ -198,6 +222,9 @@ mod tests {
             pts_ns: 0,
             sample_offset: 0,
             payload_len: 0,
+            fec_group_size: 0,
+            fec_index: 0,
+            fec_len_xor: 0,
         };
         let mut buf = [0u8; AUDIO_HEADER_SIZE];
         hdr.encode(&mut buf);

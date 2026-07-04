@@ -434,6 +434,10 @@ impl Zone {
         payload: &[u8],
         flags: PacketFlags,
     ) -> Result<(), OaatError> {
+        let (fec_group_size, fec_index) = match self.fec_encoder {
+            Some(ref fec) => (fec.group_size(), fec.next_index()),
+            None => (0, 0),
+        };
         let header = oaat_core::wire::AudioPacketHeader {
             version: oaat_core::wire::AudioPacketHeader::CURRENT_VERSION,
             flags,
@@ -443,6 +447,9 @@ impl Zone {
             pts_ns,
             sample_offset,
             payload_len: payload.len() as u16,
+            fec_group_size,
+            fec_index,
+            fec_len_xor: 0,
         };
         self.sequence = self.sequence.wrapping_add(1);
 
@@ -473,7 +480,7 @@ impl Zone {
 
         // FEC: accumulate and send parity packet when group is complete
         if let Some(ref mut fec) = self.fec_encoder
-            && let Some(parity_payload) = fec.feed(self.sequence.wrapping_sub(1), payload)
+            && let Some(parity) = fec.feed(payload)
         {
             let parity_header = oaat_core::wire::AudioPacketHeader {
                 version: oaat_core::wire::AudioPacketHeader::CURRENT_VERSION,
@@ -483,16 +490,19 @@ impl Zone {
                 stream_id,
                 pts_ns,
                 sample_offset,
-                payload_len: parity_payload.len() as u16,
+                payload_len: parity.payload.len() as u16,
+                fec_group_size,
+                fec_index: 0,
+                fec_len_xor: parity.len_xor,
             };
             self.sequence = self.sequence.wrapping_add(1);
 
             let mut parity_buf =
-                vec![0u8; oaat_core::wire::AUDIO_HEADER_SIZE + parity_payload.len()];
+                vec![0u8; oaat_core::wire::AUDIO_HEADER_SIZE + parity.payload.len()];
             let mut ph_buf = [0u8; oaat_core::wire::AUDIO_HEADER_SIZE];
             parity_header.encode(&mut ph_buf);
             parity_buf[..oaat_core::wire::AUDIO_HEADER_SIZE].copy_from_slice(&ph_buf);
-            parity_buf[oaat_core::wire::AUDIO_HEADER_SIZE..].copy_from_slice(&parity_payload);
+            parity_buf[oaat_core::wire::AUDIO_HEADER_SIZE..].copy_from_slice(&parity.payload);
 
             for (id, socket, target) in &targets {
                 if let Err(e) = socket.send_to(&parity_buf, target).await {
