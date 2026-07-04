@@ -42,6 +42,9 @@ pub enum Message {
     NextTrackReady(NextTrackReady),
     NextTrackReformat(NextTrackReformat),
 
+    // -- Health --
+    StreamStats(StreamStats),
+
     // -- Error --
     Error(ErrorMsg),
 }
@@ -176,6 +179,27 @@ pub struct VolumeGet {}
 pub struct VolumeReport {
     pub level: u8,
     pub muted: bool,
+}
+
+/// Periodic endpoint → controller health report (RFC §6.6, §7.3): lets the
+/// controller see buffer health, residual drift and link quality without
+/// polling. Sent every few seconds while streaming.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamStats {
+    pub stream_id: String,
+    /// Ring buffer fill level, in frames.
+    pub buffer_frames: u64,
+    /// Measured playback drift vs the controller clock, in microseconds.
+    /// Positive: playback is behind schedule.
+    pub drift_us: i64,
+    /// Net frames skipped (−duplicated) by drift correction so far.
+    pub corrections_net_frames: i64,
+    /// Packets lost beyond FEC recovery since stream start.
+    pub packets_lost: u64,
+    /// Packets recovered from FEC parity since stream start.
+    pub packets_recovered: u64,
+    /// Whether the active output path delivers samples bit-exact.
+    pub bit_perfect: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

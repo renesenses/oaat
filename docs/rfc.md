@@ -464,6 +464,23 @@ Two special regimes are RECOMMENDED for software correction:
   residual latency by shifting the reference start instead of skipping
   arriving audio forever.
 
+**Health reporting**: while streaming, Endpoints SHOULD send a periodic
+`stream_stats` message (RECOMMENDED: every 5 s) so the Controller can see
+buffer health, residual drift and link quality without polling:
+
+```json
+{
+  "type": "stream_stats",
+  "stream_id": "abc123",
+  "buffer_frames": 22050,
+  "drift_us": -120,
+  "corrections_net_frames": 27405,
+  "packets_lost": 0,
+  "packets_recovered": 3,
+  "bit_perfect": true
+}
+```
+
 ### 6.7 Sync Accuracy Target
 
 | Scenario | Target | Acceptable |
@@ -534,6 +551,7 @@ JSON objects over TCP, framed with 4-byte big-endian length prefix:
 | `volume_set` | C → E | Set volume (0-100 or dB) |
 | `volume_get` | C → E | Query volume |
 | `volume_report` | E → C | Report volume |
+| `stream_stats` | E → C | Periodic health report: buffer, drift, losses (§6.6) |
 | `mute` | C → E | Mute/unmute |
 
 ### 7.4 Metadata

@@ -362,14 +362,15 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
         } else {
             None
         };
+        let clock_for_sync = clock.clone();
         let clock_handle = tokio::spawn(async move {
-            Self::clock_sync_loop(clock_socket, clock, controller_clock_addr).await;
+            Self::clock_sync_loop(clock_socket, clock_for_sync, controller_clock_addr).await;
         });
 
         // Spawn audio receiver (abort handle stored for cleanup)
         let audio_tx = event_tx.clone();
         let audio_handle = tokio::spawn(async move {
-            Self::audio_receive_loop(audio_socket, audio_tx).await;
+            Self::audio_receive_loop(audio_socket, audio_tx, clock).await;
         });
 
         // Abort background tasks on any exit path
@@ -382,9 +383,52 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
         }
         let _guard = TaskGuard(clock_handle, audio_handle);
 
-        // Main control message loop
+        // Deferred FormatAccept state: (stream_id, auto response, fail-open
+        // deadline). While set, the accept is withheld until the application
+        // confirms the audio device is ready through the control channel.
+        let mut pending_accept: Option<(String, Message, tokio::time::Instant)> = None;
+
+        // Main control message loop: TCP messages from the controller,
+        // application messages to forward (device-ready confirmations,
+        // stream_stats reports…), and the deferred-accept fail-open timer.
         loop {
-            let n = reader.read(&mut read_buf).await?;
+            let accept_deadline = pending_accept
+                .as_ref()
+                .map(|(_, _, d)| *d)
+                .unwrap_or_else(|| {
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(3600)
+                });
+
+            tokio::select! {
+                _ = tokio::time::sleep_until(accept_deadline), if pending_accept.is_some() => {
+                    let (sid, auto, _) = pending_accept.take().expect("guarded by is_some");
+                    warn!(stream_id = %sid, "device ready confirmation timed out (5s), sending auto accept");
+                    writer.write_all(&FrameCodec::encode(&auto)).await?;
+                }
+
+                Some(msg) = control_rx.recv() => {
+                    let resolves_pending = match (&pending_accept, &msg) {
+                        (Some((sid, _, _)), Message::FormatAccept(a)) => a.stream_id == *sid,
+                        (Some((sid, _, _)), Message::FormatReject(r)) => r.stream_id == *sid,
+                        _ => false,
+                    };
+                    if resolves_pending {
+                        pending_accept = None;
+                        debug!("device ready, sending format response");
+                        writer.write_all(&FrameCodec::encode(&msg)).await?;
+                    } else if pending_accept.is_some() {
+                        // Stale confirmation from a previous stream: drop it,
+                        // it must not satisfy the wrong negotiation.
+                        debug!("ignoring stale control message during device wait");
+                    } else {
+                        // Generic application → controller channel
+                        // (stream_stats, volume_report, …).
+                        writer.write_all(&FrameCodec::encode(&msg)).await?;
+                    }
+                }
+
+                result = reader.read(&mut read_buf) => {
+            let n = result?;
             if n == 0 {
                 let _ = event_tx.send(EndpointEvent::Disconnected).await;
                 break;
@@ -431,11 +475,14 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
                         let _ = event_tx.send(EndpointEvent::FormatProposed(fp)).await;
 
                         if deferred {
-                            let final_response =
-                                await_device_ready(control_rx, &stream_id, response).await;
-                            writer
-                                .write_all(&FrameCodec::encode(&final_response))
-                                .await?;
+                            // Resolved by the control_rx select arm (device
+                            // ready confirmation) or the fail-open timer.
+                            pending_accept = Some((
+                                stream_id,
+                                response,
+                                tokio::time::Instant::now()
+                                    + std::time::Duration::from_secs(5),
+                            ));
                         }
                     }
                     Message::NextTrackPrepare(ntp) => {
@@ -562,6 +609,8 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
                     }
                 }
             }
+                }
+            }
         }
 
         Ok(())
@@ -664,7 +713,11 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
         }
     }
 
-    async fn audio_receive_loop(socket: Arc<UdpSocket>, event_tx: mpsc::Sender<EndpointEvent>) {
+    async fn audio_receive_loop(
+        socket: Arc<UdpSocket>,
+        event_tx: mpsc::Sender<EndpointEvent>,
+        clock: Arc<SharedClock>,
+    ) {
         let mut buf = vec![0u8; AUDIO_HEADER_SIZE + oaat_core::MAX_AUDIO_PAYLOAD];
         // Reorders within FEC groups, recovers single losses from parity and
         // emits packets in order. Packets without FEC pass through directly.
@@ -706,6 +759,7 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
                 last_lost = fec_rx.lost();
                 warn!(total = last_lost, "packet lost beyond FEC recovery");
             }
+            clock.set_link_stats(fec_rx.lost(), fec_rx.recovered());
 
             for (header, payload) in deliverable {
                 let _ = event_tx
@@ -716,43 +770,6 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
     }
 }
 
-/// Wait (up to 5 s) for the application to confirm the audio device is
-/// ready for `stream_id`. Returns the application's FormatAccept/FormatReject
-/// if it matches the stream, or falls open to `auto_response` on timeout —
-/// a slow device must not deadlock the negotiation.
-async fn await_device_ready(
-    control_rx: &mut mpsc::Receiver<Message>,
-    stream_id: &str,
-    auto_response: Message,
-) -> Message {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        match tokio::time::timeout_at(deadline, control_rx.recv()).await {
-            Ok(Some(msg)) => {
-                let matches_stream = match &msg {
-                    Message::FormatAccept(a) => a.stream_id == stream_id,
-                    Message::FormatReject(r) => r.stream_id == stream_id,
-                    _ => false,
-                };
-                if matches_stream {
-                    debug!(stream_id, "device ready, sending format response");
-                    return msg;
-                }
-                // Stale confirmation from a previous stream: drop and keep
-                // waiting, otherwise it would satisfy the wrong negotiation.
-                debug!("ignoring stale control message during device wait");
-            }
-            Ok(None) => {
-                warn!("control channel closed, sending auto response");
-                return auto_response;
-            }
-            Err(_) => {
-                warn!(stream_id, "device ready confirmation timed out (5s), sending auto accept");
-                return auto_response;
-            }
-        }
-    }
-}
 
 /// Decide whether to accept, counter-propose, or reject a format proposal.
 fn negotiate_format(caps: &EndpointCapabilities, fp: &FormatPropose) -> Message {

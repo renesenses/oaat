@@ -550,6 +550,8 @@ async fn run_endpoint(
     let mut tracker_is_controller_domain = false;
     let mut stream_sample_rate: u32 = 0;
     let mut last_drift: i64 = 0;
+    let mut current_stream_id = String::new();
+    let mut servo_ticks: u64 = 0;
     let mut servo_interval = tokio::time::interval(Duration::from_secs(1));
     servo_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -603,6 +605,33 @@ async fn run_endpoint(
             // by the audio callback) with the position the clock says we
             // should be at, and queue a skip/duplicate correction.
             _ = servo_interval.tick() => {
+                servo_ticks += 1;
+                // Periodic health report to the controller (RFC §6.6/§7.3).
+                if started && servo_ticks.is_multiple_of(5) && !current_stream_id.is_empty() {
+                    let (lost, recovered) = clock.link_stats();
+                    let drift_us = if let (Some(t), Some(frames)) = (tracker.as_ref(), audio.content_position()) {
+                        let now = if tracker_is_controller_domain {
+                            clock.local_to_controller(now_ns())
+                        } else {
+                            now_ns()
+                        };
+                        t.drift_frames(now, frames) * 1_000_000 / stream_sample_rate.max(1) as i64
+                    } else {
+                        0
+                    };
+                    let _ = ctrl_tx
+                        .send(oaat_core::Message::StreamStats(oaat_core::message::StreamStats {
+                            stream_id: current_stream_id.clone(),
+                            buffer_frames: audio.buffer_level() as u64,
+                            drift_us,
+                            corrections_net_frames: audio.content_position().unwrap_or(0) as i64
+                                - audio.frames_played().unwrap_or(0) as i64,
+                            packets_lost: lost,
+                            packets_recovered: recovered,
+                            bit_perfect: audio.bit_perfect_path(),
+                        }))
+                        .await;
+                }
                 if started && let (Some(t), Some(frames)) = (tracker.as_ref(), audio.content_position()) {
                     let now = if tracker_is_controller_domain {
                         clock.local_to_controller(now_ns())
@@ -706,6 +735,7 @@ async fn run_endpoint(
                             );
                         }
                         stream_sample_rate = fp.sample_rate;
+                        current_stream_id = fp.stream_id.clone();
                         // configure() tears down the stream: reset scheduling state.
                         armed = false;
                         started = false;

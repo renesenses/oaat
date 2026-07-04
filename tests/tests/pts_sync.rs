@@ -245,6 +245,70 @@ async fn fec_recovers_lost_packet_through_endpoint_transport() {
 }
 
 #[tokio::test]
+async fn stream_stats_flow_from_endpoint_app_to_controller() {
+    use oaat_controller::EndpointResponse;
+    use oaat_core::message::StreamStats;
+
+    init_tracing();
+
+    let (control, audio, clock) = reserve_endpoint_ports().await;
+    let ep_config = endpoint_config(control, audio, clock);
+
+    let (event_tx, mut event_rx) = mpsc::channel(64);
+    let (ctrl_tx, ctrl_rx) = mpsc::channel(32);
+    let _ep = tokio::spawn(async move {
+        EndpointTransport::run(ep_config, event_tx, ctrl_rx)
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let ctrl_config = ControllerConfig {
+        controller_id: "ctrl-stats".into(),
+        controller_name: "Stats Controller".into(),
+        features: vec![],
+        clock_port: 0,
+        tls: false,
+    };
+    let mut endpoint = ConnectedEndpoint::connect(&ctrl_config, control).await.unwrap();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    // The endpoint application publishes a health report through the
+    // control channel; the transport forwards it to the controller.
+    ctrl_tx
+        .send(oaat_core::Message::StreamStats(StreamStats {
+            stream_id: "stats-stream".into(),
+            buffer_frames: 4800,
+            drift_us: -250,
+            corrections_net_frames: 12,
+            packets_lost: 1,
+            packets_recovered: 3,
+            bit_perfect: true,
+        }))
+        .await
+        .unwrap();
+
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(2), endpoint.response_rx.recv())
+        .await
+        .expect("timed out waiting for stream stats")
+        .unwrap();
+    match resp {
+        EndpointResponse::StreamStats(ss) => {
+            assert_eq!(ss.stream_id, "stats-stream");
+            assert_eq!(ss.buffer_frames, 4800);
+            assert_eq!(ss.drift_us, -250);
+            assert_eq!(ss.packets_lost, 1);
+            assert_eq!(ss.packets_recovered, 3);
+            assert!(ss.bit_perfect);
+        }
+        other => panic!("expected StreamStats, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn endpoint_clock_bootstraps_against_controller_responder() {
     init_tracing();
 
