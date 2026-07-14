@@ -62,6 +62,13 @@ jobs:
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
           ARCHIVE="${BINARY_NAME}-${TAG}-${{ matrix.target }}.${{ matrix.archive }}"
+          # Version-less alias so `releases/latest/download/<STABLE>` always
+          # resolves to the newest release's asset. The versioned name (above)
+          # is baked into `latest/download/` URLs, so the moment a new tag ships
+          # the old versioned URL 404s (GitHub returns a 9-byte "Not Found" body
+          # that `curl -o` happily saves). Publishing this stable-named copy lets
+          # docs/install scripts pin a URL once and never break on a bump.
+          ARCHIVE_STABLE="${BINARY_NAME}-${{ matrix.target }}.${{ matrix.archive }}"
           BIN="target/${{ matrix.target }}/release/${BINARY_NAME}"
           if [ ! -f "$BIN" ]; then
             echo "Binary not found at $BIN"
@@ -72,14 +79,18 @@ jobs:
           if [ "${{ matrix.archive }}" = "tar.gz" ]; then
             tar czf "$ARCHIVE" -C "target/${{ matrix.target }}/release" "$BINARY_NAME"
           fi
+          cp "$ARCHIVE" "$ARCHIVE_STABLE"
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
-          ls -lh "$ARCHIVE"
+          echo "ARCHIVE_STABLE=$ARCHIVE_STABLE" >> "$GITHUB_ENV"
+          ls -lh "$ARCHIVE" "$ARCHIVE_STABLE"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: ${{ env.ARCHIVE }}
+          path: |
+            ${{ env.ARCHIVE }}
+            ${{ env.ARCHIVE_STABLE }}
 
   release:
     needs: build
