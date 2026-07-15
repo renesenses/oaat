@@ -323,11 +323,16 @@ impl Default for AlsaDirectOutput {
     }
 }
 
+/// Expand packed 24-bit little-endian samples (3 bytes) into S32_LE (4 bytes),
+/// left-justified so the 24 significant bits occupy the high bytes of the 32-bit
+/// word (equivalent to `value << 8`). This produces full-scale S32_LE, which
+/// every ALSA hardware device accepts — unlike raw S24_LE, which DACs such as
+/// the I-Sabre ES9038Q2M reject. Bit-perfect: the low byte is zero-filled and
+/// the sign bit is carried naturally by the original MSB (chunk[2]).
 fn pad_s24_to_s32(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() / 3 * 4);
     for chunk in data.chunks_exact(3) {
-        let sign = if chunk[2] & 0x80 != 0 { 0xFF } else { 0x00 };
-        out.extend_from_slice(&[chunk[0], chunk[1], chunk[2], sign]);
+        out.extend_from_slice(&[0x00, chunk[0], chunk[1], chunk[2]]);
     }
     out
 }
@@ -335,7 +340,11 @@ fn pad_s24_to_s32(data: &[u8]) -> Vec<u8> {
 fn format_to_alsa(format: AudioFormat) -> Option<&'static str> {
     match format {
         AudioFormat::PcmS16le => Some("S16_LE"),
-        AudioFormat::PcmS24le => Some("S24_LE"),
+        // Packed S24 is expanded to full-scale S32_LE before writing (see
+        // `pad_s24_to_s32` / write_audio). S32_LE is accepted by virtually every
+        // ALSA hw device, whereas raw S24_LE is rejected by many DACs — notably
+        // the I-Sabre ES9038Q2M over I2S (advertises only S16_LE / S32_LE).
+        AudioFormat::PcmS24le => Some("S32_LE"),
         AudioFormat::PcmS24le4 => Some("S24_LE"),
         AudioFormat::PcmS32le => Some("S32_LE"),
         AudioFormat::PcmF32le => Some("FLOAT_LE"),
@@ -387,5 +396,50 @@ fn apply_volume(format: AudioFormat, data: &[u8], vol: f32) -> Vec<u8> {
             out
         }
         _ => data.to_vec(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn s24_maps_to_s32le_for_hardware_compat() {
+        // Packed S24 is expanded to S32_LE before writing, so aplay must be
+        // opened as S32_LE (accepted by S24_LE-incapable DACs like the ES9038Q2M).
+        assert_eq!(format_to_alsa(AudioFormat::PcmS24le), Some("S32_LE"));
+        assert_eq!(format_to_alsa(AudioFormat::PcmS32le), Some("S32_LE"));
+        assert_eq!(format_to_alsa(AudioFormat::PcmS16le), Some("S16_LE"));
+    }
+
+    #[test]
+    fn pad_s24_is_left_justified_full_scale() {
+        // Positive sample 0x7F1234 (LE bytes 34 12 7F) -> S32 0x7F123400.
+        let out = pad_s24_to_s32(&[0x34, 0x12, 0x7F]);
+        assert_eq!(out, vec![0x00, 0x34, 0x12, 0x7F]);
+        assert_eq!(i32::from_le_bytes([out[0], out[1], out[2], out[3]]), 0x7F123400);
+
+        // Most-negative sample 0x800000 -> i32::MIN (sign preserved, full scale).
+        let out = pad_s24_to_s32(&[0x00, 0x00, 0x80]);
+        assert_eq!(i32::from_le_bytes([out[0], out[1], out[2], out[3]]), i32::MIN);
+
+        // Zero stays zero; length grows 3 -> 4 bytes per sample.
+        let out = pad_s24_to_s32(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(out, vec![0u8; 8]);
+    }
+
+    #[test]
+    fn s24_value_is_source_shifted_left_8() {
+        // The S32 output equals the sign-extended 24-bit source value << 8:
+        // guarantees bit-perfect magnitude at full scale.
+        for &(b, expect_v24) in &[
+            ([0x01u8, 0x00, 0x00], 1i32),
+            ([0xFF, 0xFF, 0xFF], -1i32),
+            ([0x00, 0x00, 0x40], 0x400000i32),
+        ] {
+            let out = pad_s24_to_s32(&b);
+            let got = i32::from_le_bytes([out[0], out[1], out[2], out[3]]);
+            assert_eq!(got, expect_v24 << 8, "src {b:?}");
+        }
     }
 }
