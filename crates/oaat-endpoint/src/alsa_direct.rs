@@ -106,11 +106,17 @@ impl AlsaDirectOutput {
         self.channels = channels;
         self.device_name = device_name.map(|s| s.to_string());
 
-        let device = match device_name {
+        let mut device = match device_name {
             Some(d) if d.starts_with("hw:") || d.starts_with("plughw:")
-                || d.starts_with("default") || d.starts_with("sysdefault:") => d,
-            _ => "default",
+                || d.starts_with("default") || d.starts_with("sysdefault:") => d.to_string(),
+            _ => "default".to_string(),
         };
+
+        // Native DSD requires a raw hw: device — plug/sysdefault cannot open
+        // SPECIAL DSD_U32_BE. Map sysdefault:CARD=X → hw:CARD=X,DEV=0.
+        if format.is_dsd() {
+            device = dsd_hw_device(&device);
+        }
 
         if format == AudioFormat::Flac {
             // Stream FLAC through ffmpeg → raw PCM → aplay.
@@ -138,14 +144,14 @@ impl AlsaDirectOutput {
 
             self.process = Some(child);
         } else {
-            let alsa_fmt = format_to_alsa(format)
+            let (alsa_fmt, alsa_rate) = alsa_format_and_rate(format, sample_rate)
                 .ok_or_else(|| format!("unsupported format for ALSA direct: {format}"))?;
 
             let child = Command::new("aplay")
                 .args([
-                    "-D", device,
+                    "-D", &device,
                     "-f", alsa_fmt,
-                    "-r", &sample_rate.to_string(),
+                    "-r", &alsa_rate.to_string(),
                     "-c", &channels.to_string(),
                     "-t", "raw",
                     "-q",
@@ -157,9 +163,10 @@ impl AlsaDirectOutput {
                 .spawn()?;
 
             info!(
-                device,
+                device = %device,
                 format = alsa_fmt,
-                sample_rate,
+                sample_rate = alsa_rate,
+                wire_sample_rate = sample_rate,
                 channels,
                 "ALSA direct output started (aplay pipe)"
             );
@@ -260,7 +267,14 @@ impl AlsaDirectOutput {
 
         let scaled;
         let write_data;
-        let to_write = if self.format == AudioFormat::PcmS24le {
+        let to_write = if self.format == AudioFormat::DsdU8 {
+            // DSD is bit-perfect: ignore software volume (DAC volume only).
+            write_data = pack_dsd_u8_to_u32_be(data, self.channels);
+            &write_data
+        } else if self.format == AudioFormat::DsdU32le {
+            write_data = dsd_u32le_to_be(data);
+            &write_data
+        } else if self.format == AudioFormat::PcmS24le {
             if (vol - 1.0).abs() < 0.001 {
                 write_data = pad_s24_to_s32(data);
             } else {
@@ -337,19 +351,72 @@ fn pad_s24_to_s32(data: &[u8]) -> Vec<u8> {
     out
 }
 
-fn format_to_alsa(format: AudioFormat) -> Option<&'static str> {
+/// Map a soft device name to a raw hw: device suitable for native DSD.
+/// `sysdefault:CARD=AUDIO` → `hw:CARD=AUDIO,DEV=0`. Already-`hw:` names pass through.
+fn dsd_hw_device(device: &str) -> String {
+    if device.starts_with("hw:") {
+        return device.to_string();
+    }
+    if let Some(rest) = device.strip_prefix("sysdefault:CARD=") {
+        let card = rest.split(',').next().unwrap_or(rest).trim();
+        return format!("hw:CARD={card},DEV=0");
+    }
+    if let Some(rest) = device.strip_prefix("plughw:") {
+        return format!("hw:{rest}");
+    }
+    // Last resort: keep as-is (may fail; caller logs the aplay error).
+    device.to_string()
+}
+
+/// ALSA format string + rate for aplay.
+/// DsdU8 arrives with the DSD *bit* rate (e.g. 2_822_400); ALSA DSD_U32 uses rate/32.
+fn alsa_format_and_rate(format: AudioFormat, sample_rate: u32) -> Option<(&'static str, u32)> {
     match format {
-        AudioFormat::PcmS16le => Some("S16_LE"),
-        // Packed S24 is expanded to full-scale S32_LE before writing (see
-        // `pad_s24_to_s32` / write_audio). S32_LE is accepted by virtually every
-        // ALSA hw device, whereas raw S24_LE is rejected by many DACs — notably
-        // the I-Sabre ES9038Q2M over I2S (advertises only S16_LE / S32_LE).
-        AudioFormat::PcmS24le => Some("S32_LE"),
-        AudioFormat::PcmS24le4 => Some("S24_LE"),
-        AudioFormat::PcmS32le => Some("S32_LE"),
-        AudioFormat::PcmF32le => Some("FLOAT_LE"),
+        AudioFormat::PcmS16le => Some(("S16_LE", sample_rate)),
+        AudioFormat::PcmS24le => Some(("S32_LE", sample_rate)),
+        AudioFormat::PcmS24le4 => Some(("S24_LE", sample_rate)),
+        AudioFormat::PcmS32le => Some(("S32_LE", sample_rate)),
+        AudioFormat::PcmF32le => Some(("FLOAT_LE", sample_rate)),
+        // Native DSD: USB DACs (XMOS etc.) expose SPECIAL DSD_U32_BE.
+        AudioFormat::DsdU8 => Some(("DSD_U32_BE", sample_rate / 32)),
+        AudioFormat::DsdU16le => Some(("DSD_U32_BE", sample_rate / 16)),
+        AudioFormat::DsdU32le => Some(("DSD_U32_BE", sample_rate)),
         _ => None,
     }
+}
+
+fn format_to_alsa(format: AudioFormat) -> Option<&'static str> {
+    alsa_format_and_rate(format, 44100).map(|(f, _)| f)
+}
+
+/// Pack byte-interleaved DSD_U8 (LSB-first, DSF order) into ALSA DSD_U32_BE.
+///
+/// Input layout: `L0 R0 L1 R1 L2 R2 L3 R3 ...` (one byte = 8 DSD bits).
+/// Output layout: 4-byte big-endian words per channel, bits MSB-first in time
+/// (each input byte is bit-reversed; XMOS `bitrev=0` expects app-side order).
+fn pack_dsd_u8_to_u32_be(data: &[u8], channels: u8) -> Vec<u8> {
+    let ch = channels.max(1) as usize;
+    let frame = 4 * ch; // 4 bytes/channel → one DSD_U32 frame
+    let mut out = Vec::with_capacity(data.len());
+    for chunk in data.chunks_exact(frame) {
+        for c in 0..ch {
+            let b0 = chunk[c].reverse_bits();
+            let b1 = chunk[c + ch].reverse_bits();
+            let b2 = chunk[c + 2 * ch].reverse_bits();
+            let b3 = chunk[c + 3 * ch].reverse_bits();
+            out.extend_from_slice(&[b0, b1, b2, b3]);
+        }
+    }
+    out
+}
+
+/// Byte-swap DSD_U32LE words into DSD_U32_BE for aplay.
+fn dsd_u32le_to_be(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    for chunk in data.chunks_exact(4) {
+        out.extend_from_slice(&[chunk[3], chunk[2], chunk[1], chunk[0]]);
+    }
+    out
 }
 
 fn bytes_per_frame(format: AudioFormat, channels: u8) -> usize {
@@ -357,6 +424,9 @@ fn bytes_per_frame(format: AudioFormat, channels: u8) -> usize {
         AudioFormat::PcmS16le => 2,
         AudioFormat::PcmS24le => 3,
         AudioFormat::PcmS24le4 | AudioFormat::PcmS32le | AudioFormat::PcmF32le => 4,
+        AudioFormat::DsdU8 => 1,
+        AudioFormat::DsdU16le => 2,
+        AudioFormat::DsdU32le => 4,
         _ => 2,
     };
     bps * channels.max(1) as usize
@@ -441,5 +511,45 @@ mod tests {
             let got = i32::from_le_bytes([out[0], out[1], out[2], out[3]]);
             assert_eq!(got, expect_v24 << 8, "src {b:?}");
         }
+    }
+
+    #[test]
+    fn dsd_u8_maps_to_u32_be_at_rate_div_32() {
+        assert_eq!(
+            alsa_format_and_rate(AudioFormat::DsdU8, 2_822_400),
+            Some(("DSD_U32_BE", 88_200))
+        );
+        assert_eq!(
+            alsa_format_and_rate(AudioFormat::DsdU8, 5_644_800),
+            Some(("DSD_U32_BE", 176_400))
+        );
+    }
+
+    #[test]
+    fn sysdefault_maps_to_hw_for_dsd() {
+        assert_eq!(
+            dsd_hw_device("sysdefault:CARD=AUDIO"),
+            "hw:CARD=AUDIO,DEV=0"
+        );
+        assert_eq!(dsd_hw_device("hw:3,0"), "hw:3,0");
+    }
+
+    #[test]
+    fn pack_dsd_u8_stereo_bitrevs_and_groups() {
+        // 4 interleaved L/R byte pairs → one DSD_U32 frame per channel.
+        // Input: L0 R0 L1 R1 L2 R2 L3 R3
+        let input = [0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        let out = pack_dsd_u8_to_u32_be(&input, 2);
+        assert_eq!(out.len(), 8);
+        // Left word: rev(L0) rev(L1) rev(L2) rev(L3)
+        assert_eq!(out[0], 0x01u8.reverse_bits());
+        assert_eq!(out[1], 0x03u8.reverse_bits());
+        assert_eq!(out[2], 0x05u8.reverse_bits());
+        assert_eq!(out[3], 0x07u8.reverse_bits());
+        // Right word
+        assert_eq!(out[4], 0x02u8.reverse_bits());
+        assert_eq!(out[5], 0x04u8.reverse_bits());
+        assert_eq!(out[6], 0x06u8.reverse_bits());
+        assert_eq!(out[7], 0x08u8.reverse_bits());
     }
 }
