@@ -392,12 +392,13 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
         // application messages to forward (device-ready confirmations,
         // stream_stats reports…), and the deferred-accept fail-open timer.
         loop {
-            let accept_deadline = pending_accept
-                .as_ref()
-                .map(|(_, _, d)| *d)
-                .unwrap_or_else(|| {
-                    tokio::time::Instant::now() + std::time::Duration::from_secs(3600)
-                });
+            let accept_deadline =
+                pending_accept
+                    .as_ref()
+                    .map(|(_, _, d)| *d)
+                    .unwrap_or_else(|| {
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(3600)
+                    });
 
             tokio::select! {
                 _ = tokio::time::sleep_until(accept_deadline), if pending_accept.is_some() => {
@@ -769,7 +770,6 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
         }
     }
 }
-
 
 /// Decide whether to accept, counter-propose, or reject a format proposal.
 fn negotiate_format(caps: &EndpointCapabilities, fp: &FormatPropose) -> Message {

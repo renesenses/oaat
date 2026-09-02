@@ -31,7 +31,12 @@ impl AlsaMixer {
             "apodizing fast" => 6,
             other => {
                 if let Ok(n) = other.parse::<u32>() {
-                    if n <= 6 { n } else { warn!(filter = other, "invalid FIR filter index"); return false; }
+                    if n <= 6 {
+                        n
+                    } else {
+                        warn!(filter = other, "invalid FIR filter index");
+                        return false;
+                    }
                 } else {
                     warn!(filter = other, "unknown FIR filter name");
                     return false;

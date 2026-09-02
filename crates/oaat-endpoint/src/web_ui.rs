@@ -112,7 +112,10 @@ pub async fn start_web_ui(
     let addr: SocketAddr = ([0, 0, 0, 0], port).into();
     let listener = match TcpListener::bind(addr).await {
         Ok(l) => {
-            info!(port = l.local_addr().map(|a| a.port()).unwrap_or(port), "web UI listening");
+            info!(
+                port = l.local_addr().map(|a| a.port()).unwrap_or(port),
+                "web UI listening"
+            );
             l
         }
         Err(e) => {
@@ -181,7 +184,11 @@ async fn handle_request(
         (&Method::POST, "/api/device") => {
             // Read body to get device name
             use http_body_util::BodyExt;
-            let body = req.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let body = req
+                .collect()
+                .await
+                .map(|c| c.to_bytes())
+                .unwrap_or_default();
             let body_str = String::from_utf8_lossy(&body);
 
             // Parse simple JSON: {"device": "name"}
@@ -203,9 +210,10 @@ async fn handle_request(
                     Ok(Response::builder()
                         .status(200)
                         .header("Content-Type", "application/json")
-                        .body(Full::new(Bytes::from(
-                            format!(r#"{{"ok":true,"device":"{}"}}"#, name),
-                        )))
+                        .body(Full::new(Bytes::from(format!(
+                            r#"{{"ok":true,"device":"{}"}}"#,
+                            name
+                        ))))
                         .unwrap())
                 }
                 _ => Ok(Response::builder()
@@ -269,7 +277,10 @@ fn render_html(status: &BridgeStatus) -> String {
             let bits = status.stream_bits.unwrap_or(0);
             let rate_khz = rate as f64 / 1000.0;
             if rate_khz.fract() == 0.0 {
-                format!(r#"<span class="badge">{fmt} {bits}/{}</span>"#, rate_khz as u32)
+                format!(
+                    r#"<span class="badge">{fmt} {bits}/{}</span>"#,
+                    rate_khz as u32
+                )
             } else {
                 format!(r#"<span class="badge">{fmt} {bits}/{rate_khz:.1}</span>"#)
             }
@@ -300,7 +311,11 @@ fn render_html(status: &BridgeStatus) -> String {
             .into()
     };
 
-    let conn_dot = if status.connected { "connected" } else { "disconnected" };
+    let conn_dot = if status.connected {
+        "connected"
+    } else {
+        "disconnected"
+    };
     let conn_text = if status.connected {
         status.controller_name.as_deref().unwrap_or("Connected")
     } else {

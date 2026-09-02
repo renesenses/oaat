@@ -259,11 +259,18 @@ impl CpalOutput {
             });
             match found {
                 Some(d) => {
-                    info!(requested = name, found = d.name().unwrap_or_default(), "audio device matched by name");
+                    info!(
+                        requested = name,
+                        found = d.name().unwrap_or_default(),
+                        "audio device matched by name"
+                    );
                     d
                 }
                 None => {
-                    warn!(requested = name, "audio device not found, falling back to default");
+                    warn!(
+                        requested = name,
+                        "audio device not found, falling back to default"
+                    );
                     host.default_output_device()
                         .ok_or("no audio output device found")?
                 }
@@ -286,11 +293,7 @@ impl CpalOutput {
             }
         }
 
-        self.cached_device = Some((
-            device_name.map(|s| s.to_string()),
-            device.clone(),
-            support,
-        ));
+        self.cached_device = Some((device_name.map(|s| s.to_string()), device.clone(), support));
         Ok((device, support))
     }
 
@@ -345,7 +348,11 @@ impl CpalOutput {
 
         let actual_device_name = device.name().unwrap_or_default();
         self.device_name = Some(actual_device_name.clone());
-        let usb_hint = if is_usb_dac(&actual_device_name) { " (USB)" } else { "" };
+        let usb_hint = if is_usb_dac(&actual_device_name) {
+            " (USB)"
+        } else {
+            ""
+        };
         info!(
             device = %actual_device_name,
             sample_rate, channels, format = %format,
@@ -457,7 +464,11 @@ impl CpalOutput {
             }),
             OutKind::F32 => build_stream!(f32, move |b: &[u8], vol: u32| -> f32 {
                 let s = ring_format.to_f32(b);
-                if vol == 1000 { s } else { s * (vol as f32 / 1000.0) }
+                if vol == 1000 {
+                    s
+                } else {
+                    s * (vol as f32 / 1000.0)
+                }
             }),
         };
 
@@ -587,7 +598,9 @@ impl CpalOutput {
             }
             bytes = &bytes[drop_frames as usize * frame_bytes..];
         } else if pending > 0 && frames_in > 1 {
-            let drop_frames = pending.min(MAX_CORRECTION_FRAMES_PER_WRITE).min(frames_in - 1);
+            let drop_frames = pending
+                .min(MAX_CORRECTION_FRAMES_PER_WRITE)
+                .min(frames_in - 1);
             if drop_frames > 0 {
                 bytes = &bytes[drop_frames as usize * frame_bytes..];
                 self.correction.fetch_sub(drop_frames, Ordering::Relaxed);
@@ -600,8 +613,10 @@ impl CpalOutput {
                 duplicated.extend_from_slice(&bytes[..frame_bytes]);
             }
             duplicated.extend_from_slice(bytes);
-            self.correction.fetch_add(dup_frames as i64, Ordering::Relaxed);
-            self.net_adjust.fetch_sub(dup_frames as i64, Ordering::Relaxed);
+            self.correction
+                .fetch_add(dup_frames as i64, Ordering::Relaxed);
+            self.net_adjust
+                .fetch_sub(dup_frames as i64, Ordering::Relaxed);
             bytes = &duplicated;
         }
 
