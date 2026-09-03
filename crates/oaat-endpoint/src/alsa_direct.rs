@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use oaat_core::format::AudioFormat;
 use tracing::{error, info, warn};
@@ -72,7 +72,8 @@ impl AlsaDirectOutput {
             }
         }
         // Fallback: use sysdefault:CARD=X if only one card exists (likely USB DAC)
-        let cards: Vec<_> = devices.iter()
+        let cards: Vec<_> = devices
+            .iter()
             .filter(|d| d.starts_with("sysdefault:CARD="))
             .collect();
         if cards.len() == 1 {
@@ -139,8 +140,14 @@ impl AlsaDirectOutput {
         self.device_name = device_name.map(|s| s.to_string());
 
         let mut device = match device_name {
-            Some(d) if d.starts_with("hw:") || d.starts_with("plughw:")
-                || d.starts_with("default") || d.starts_with("sysdefault:") => d.to_string(),
+            Some(d)
+                if d.starts_with("hw:")
+                    || d.starts_with("plughw:")
+                    || d.starts_with("default")
+                    || d.starts_with("sysdefault:") =>
+            {
+                d.to_string()
+            }
             _ => "default".to_string(),
         };
 
@@ -185,14 +192,21 @@ impl AlsaDirectOutput {
 
             let mut child = Command::new("aplay")
                 .args([
-                    "-D", &device,
-                    "-f", alsa_fmt,
-                    "-r", &alsa_rate.to_string(),
-                    "-c", &channels.to_string(),
-                    "-t", "raw",
+                    "-D",
+                    &device,
+                    "-f",
+                    alsa_fmt,
+                    "-r",
+                    &alsa_rate.to_string(),
+                    "-c",
+                    &channels.to_string(),
+                    "-t",
+                    "raw",
                     "-v",
-                    "--buffer-time", APLAY_BUFFER_TIME_US,
-                    "--period-time", APLAY_PERIOD_TIME_US,
+                    "--buffer-time",
+                    APLAY_BUFFER_TIME_US,
+                    "--period-time",
+                    APLAY_PERIOD_TIME_US,
                 ])
                 .env("LC_ALL", "C")
                 .stdin(Stdio::piped())
@@ -379,7 +393,13 @@ impl Default for AlsaDirectOutput {
 #[cfg(target_os = "linux")]
 fn enlarge_pipe(stdin: &ChildStdin) {
     use std::os::fd::AsRawFd;
-    let granted = unsafe { libc::fcntl(stdin.as_raw_fd(), libc::F_SETPIPE_SZ, APLAY_STDIN_PIPE_BYTES) };
+    let granted = unsafe {
+        libc::fcntl(
+            stdin.as_raw_fd(),
+            libc::F_SETPIPE_SZ,
+            APLAY_STDIN_PIPE_BYTES,
+        )
+    };
     if granted < 0 {
         warn!(
             error = %std::io::Error::last_os_error(),
@@ -431,7 +451,7 @@ fn is_xrun_line(line: &str) -> bool {
 /// the sign bit is carried naturally by the original MSB (chunk[2]).
 fn pad_s24_to_s32(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() / 3 * 4);
-    for chunk in data.chunks_exact(3) {
+    for chunk in data.as_chunks::<3>().0 {
         out.extend_from_slice(&[0x00, chunk[0], chunk[1], chunk[2]]);
     }
     out
@@ -500,7 +520,7 @@ fn pack_dsd_u8_to_u32_be(data: &[u8], channels: u8) -> Vec<u8> {
 /// Byte-swap DSD_U32LE words into DSD_U32_BE for aplay.
 fn dsd_u32le_to_be(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len());
-    for chunk in data.chunks_exact(4) {
+    for chunk in data.as_chunks::<4>().0 {
         out.extend_from_slice(&[chunk[3], chunk[2], chunk[1], chunk[0]]);
     }
     out
@@ -523,7 +543,7 @@ fn apply_volume(format: AudioFormat, data: &[u8], vol: f32) -> Vec<u8> {
     match format {
         AudioFormat::PcmS16le => {
             let mut out = data.to_vec();
-            for chunk in out.chunks_exact_mut(2) {
+            for chunk in out.as_chunks_mut::<2>().0 {
                 let s = i16::from_le_bytes([chunk[0], chunk[1]]);
                 let scaled = ((s as f32) * vol) as i16;
                 chunk.copy_from_slice(&scaled.to_le_bytes());
@@ -532,7 +552,7 @@ fn apply_volume(format: AudioFormat, data: &[u8], vol: f32) -> Vec<u8> {
         }
         AudioFormat::PcmS32le | AudioFormat::PcmS24le4 | AudioFormat::PcmF32le => {
             let mut out = data.to_vec();
-            for chunk in out.chunks_exact_mut(4) {
+            for chunk in out.as_chunks_mut::<4>().0 {
                 let s = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                 let scaled = ((s as f64) * vol as f64) as i32;
                 chunk.copy_from_slice(&scaled.to_le_bytes());
@@ -541,7 +561,7 @@ fn apply_volume(format: AudioFormat, data: &[u8], vol: f32) -> Vec<u8> {
         }
         AudioFormat::PcmS24le => {
             let mut out = data.to_vec();
-            for chunk in out.chunks_exact_mut(3) {
+            for chunk in out.as_chunks_mut::<3>().0 {
                 let sign = if chunk[2] & 0x80 != 0 { 0xFFu8 } else { 0 };
                 let val = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], sign]);
                 let scaled = ((val as f64) * vol as f64) as i32;
@@ -560,6 +580,74 @@ fn apply_volume(format: AudioFormat, data: &[u8], vol: f32) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    // ------------------------------------------------------------------
+    // Le chemin audio touche par le passage de `chunks_exact` a `as_chunks`
+    // (lint `chunks_exact_to_as_chunks`, clippy 1.98). Les deux constructions
+    // ecartent le reste de division de la meme facon — mais ni `apply_volume`
+    // ni `dsd_u32le_to_be` n'avaient le moindre test, et un octet decale sur
+    // ce chemin s'entend. Ces tests fixent le comportement AVANT/APRES.
+    // ------------------------------------------------------------------
+
+    /// Le volume s'applique echantillon par echantillon, en 16 bits.
+    #[test]
+    fn le_volume_divise_un_echantillon_s16() {
+        // 1000 (0x03E8) en petit-boutiste, a moitie volume -> 500 (0x01F4).
+        let out = apply_volume(AudioFormat::PcmS16le, &[0xE8, 0x03], 0.5);
+        assert_eq!(out, vec![0xF4, 0x01]);
+    }
+
+    /// Idem en 32 bits.
+    #[test]
+    fn le_volume_divise_un_echantillon_s32() {
+        let out = apply_volume(AudioFormat::PcmS32le, &[0xE8, 0x03, 0x00, 0x00], 0.5);
+        assert_eq!(out, vec![0xF4, 0x01, 0x00, 0x00]);
+    }
+
+    /// Le S24 empaquete tient sur TROIS octets : le signe est reconstitue a la
+    /// main avant la multiplication, sinon un echantillon negatif devient un
+    /// enorme positif — et ca ne s'entend pas qu'un peu.
+    #[test]
+    fn le_volume_conserve_le_signe_en_s24_empaquete() {
+        // +1000 -> +500
+        let positif = apply_volume(AudioFormat::PcmS24le, &[0xE8, 0x03, 0x00], 0.5);
+        assert_eq!(positif, vec![0xF4, 0x01, 0x00]);
+        // -1000 (0xFFFFFC18) -> -500 (0xFFFFFE0C)
+        let negatif = apply_volume(AudioFormat::PcmS24le, &[0x18, 0xFC, 0xFF], 0.5);
+        assert_eq!(negatif, vec![0x0C, 0xFE, 0xFF]);
+    }
+
+    /// LA propriete que le changement de construction aurait pu casser : un
+    /// reste de division n'est PAS traite, et il est rendu tel quel.
+    #[test]
+    fn le_volume_laisse_un_reste_partiel_intact() {
+        // Trois octets en S16 : un echantillon complet, puis un octet orphelin.
+        let out = apply_volume(AudioFormat::PcmS16le, &[0xE8, 0x03, 0x77], 0.5);
+        assert_eq!(
+            out,
+            vec![0xF4, 0x01, 0x77],
+            "l'octet orphelin passe tel quel"
+        );
+    }
+
+    /// Le boutisme des mots DSD_U32 est inverse, mot par mot.
+    #[test]
+    fn les_mots_dsd_u32_sont_inverses_un_a_un() {
+        let out = dsd_u32le_to_be(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(out, vec![4, 3, 2, 1, 8, 7, 6, 5]);
+    }
+
+    /// Meme propriete de reste, cote DSD : un mot incomplet est ECARTE, pas
+    /// rendu a moitie inverse.
+    #[test]
+    fn un_mot_dsd_incomplet_est_ecarte() {
+        let out = dsd_u32le_to_be(&[1, 2, 3, 4, 5, 6]);
+        assert_eq!(
+            out,
+            vec![4, 3, 2, 1],
+            "les deux octets en trop disparaissent"
+        );
+    }
+
     #[test]
     fn s24_maps_to_s32le_for_hardware_compat() {
         // Packed S24 is expanded to S32_LE before writing, so aplay must be
@@ -574,11 +662,17 @@ mod tests {
         // Positive sample 0x7F1234 (LE bytes 34 12 7F) -> S32 0x7F123400.
         let out = pad_s24_to_s32(&[0x34, 0x12, 0x7F]);
         assert_eq!(out, vec![0x00, 0x34, 0x12, 0x7F]);
-        assert_eq!(i32::from_le_bytes([out[0], out[1], out[2], out[3]]), 0x7F123400);
+        assert_eq!(
+            i32::from_le_bytes([out[0], out[1], out[2], out[3]]),
+            0x7F123400
+        );
 
         // Most-negative sample 0x800000 -> i32::MIN (sign preserved, full scale).
         let out = pad_s24_to_s32(&[0x00, 0x00, 0x80]);
-        assert_eq!(i32::from_le_bytes([out[0], out[1], out[2], out[3]]), i32::MIN);
+        assert_eq!(
+            i32::from_le_bytes([out[0], out[1], out[2], out[3]]),
+            i32::MIN
+        );
 
         // Zero stays zero; length grows 3 -> 4 bytes per sample.
         let out = pad_s24_to_s32(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
@@ -617,7 +711,9 @@ mod tests {
         assert!(is_xrun_line("underrun!!! (at least 34.202 ms long)"));
         assert!(is_xrun_line("overrun!!!"));
         assert!(is_xrun_line("Suspicious buffer position: xrun detected"));
-        assert!(!is_xrun_line("Playing raw data 'stdin' : Signed 32 bit Little Endian, Rate 44100 Hz, Stereo"));
+        assert!(!is_xrun_line(
+            "Playing raw data 'stdin' : Signed 32 bit Little Endian, Rate 44100 Hz, Stereo"
+        ));
         assert!(!is_xrun_line("buffer_size  : 44100"));
     }
 

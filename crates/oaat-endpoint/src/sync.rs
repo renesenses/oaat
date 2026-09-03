@@ -79,7 +79,9 @@ impl SharedClock {
 
     /// Convert a controller-domain timestamp to the local clock domain.
     pub fn controller_to_local(&self, controller_ns: u64) -> u64 {
-        (controller_ns as i64).saturating_sub(self.offset_ns()).max(0) as u64
+        (controller_ns as i64)
+            .saturating_sub(self.offset_ns())
+            .max(0) as u64
     }
 
     /// Convert a local timestamp to the controller clock domain.
@@ -155,7 +157,10 @@ mod tests {
         }
         assert!(clock.is_bootstrapped());
         let offset = clock.offset_ns();
-        assert!((offset - 100).abs() < 2, "offset should be ~100, got {offset}");
+        assert!(
+            (offset - 100).abs() < 2,
+            "offset should be ~100, got {offset}"
+        );
     }
 
     #[test]
@@ -181,7 +186,10 @@ mod tests {
         let local = 5_000_000u64;
         let roundtrip = clock.local_to_controller(clock.controller_to_local(local));
         // controller_to_local adds |offset|, local_to_controller removes it.
-        assert_eq!(clock.controller_to_local(local) as i64, local as i64 - clock.offset_ns());
+        assert_eq!(
+            clock.controller_to_local(local) as i64,
+            local as i64 - clock.offset_ns()
+        );
         assert_eq!(roundtrip, local);
     }
 
@@ -218,6 +226,9 @@ mod tests {
         let played_in_60s = (48_000.0f64 * 60.0 * (1.0 - 100e-6)) as u64;
         let drift = tracker.drift_frames(60_000_000_000, played_in_60s);
         // 100 ppm over 60 s = 288 frames = 6 ms. The servo must see this.
-        assert!((drift - 288).abs() <= 1, "expected ~288 frames, got {drift}");
+        assert!(
+            (drift - 288).abs() <= 1,
+            "expected ~288 frames, got {drift}"
+        );
     }
 }
