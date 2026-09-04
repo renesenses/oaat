@@ -4,7 +4,7 @@
 **Date**: 2026-07-04
 **Author**: Bertrand Clech / MozAIk Labs
 **Status**: Draft
-**License**: Specification — CC BY-ND 4.0, with a royalty-free implementation and patent grant (see [LICENSE-SPEC](LICENSE-SPEC.md)). Reference implementation (`crates/`) — Business Source License 1.1, unchanged.
+**License**: Specification — CC BY 4.0, with a royalty-free implementation and patent grant (see [LICENSE-SPEC](LICENSE-SPEC.md)). Reference implementation (`crates/`) — Business Source License 1.1, unchanged.
 
 > Changes in 0.3.0: FEC is fully specified on the wire (group size, index,
 > length-XOR recovery); FormatAccept now signals device readiness; clock sync
@@ -46,7 +46,7 @@ OAAT is designed to be an open alternative to Roon's proprietary RAAT protocol, 
 - **Bit-perfect audio transport**: PCM data arrives at the DAC identical to the source, with no resampling, dithering, or modification unless explicitly requested by the user.
 - **Multi-room synchronization**: Multiple endpoints play the same audio stream in sync, with perceptible alignment (target: < 1 ms drift between any two endpoints on the same LAN).
 - **Format negotiation**: Server and endpoint agree on the best common format (sample rate, bit depth, channel layout, encoding) without user intervention.
-- **Open standard**: Fully documented, published under CC BY-ND 4.0 with a royalty-free patent and implementation grant ([LICENSE-SPEC](LICENSE-SPEC.md)). No licensing fees, no certification costs, no separate agreement. Any project or manufacturer can implement OAAT.
+- **Open standard**: Fully documented, published under CC BY 4.0 with a royalty-free patent and implementation grant — freely quotable and translatable ([LICENSE-SPEC](LICENSE-SPEC.md)). No licensing fees, no certification costs, no separate agreement. Any project or manufacturer can implement OAAT.
 - **Rust-first design**: Zero-copy semantics, async I/O, no garbage collector dependency. A conforming basic endpoint is implementable in under 2000 lines of Rust.
 - **Embeddable**: Protocol is lightweight enough for resource-constrained devices (Raspberry Pi, ESP32 with external DAC, FPGA-based streamers).
 - **Coexistence**: OAAT endpoints can coexist on the same network as DLNA, AirPlay, Chromecast, and OpenHome devices. An OAAT server MAY also serve those protocols simultaneously.
@@ -830,7 +830,7 @@ trait OaatHal {
 
 | Feature | OAAT | RAAT | DLNA | AirPlay 2 | Chromecast | OpenHome |
 |---------|------|------|------|-----------|------------|----------|
-| Spec license | CC BY-ND 4.0* | Proprietary | UPnP Forum | Apple | Google | BSD |
+| Spec license | CC BY 4.0* | Proprietary | UPnP Forum | Apple | Google | BSD |
 | Implementation license | BSL 1.1** | Proprietary | Varies | Apple | Google | BSD |
 | Cert cost | Free | Paid | Fee | MFi | Cast SDK | Free |
 | Bit-perfect | Yes | Yes | Depends | No | No | Yes |
@@ -843,7 +843,7 @@ trait OaatHal {
 | Endpoint LOC | ~1500 | N/A | ~5000+ | N/A | N/A | ~3000+ |
 | Open source | Yes | No | Yes | Reverse-eng | No | Yes |
 
-\* The specification is free to implement: CC BY-ND 4.0 plus a royalty-free patent and implementation grant. No fee, no certification cost, no separate agreement — see [LICENSE-SPEC](LICENSE-SPEC.md).
+\* The specification is free to implement, quote and translate: CC BY 4.0 plus a royalty-free patent and implementation grant. No fee, no certification cost, no separate agreement — see [LICENSE-SPEC](LICENSE-SPEC.md).
 
 \*\* The reference implementation is source-available, not open source: free for non-commercial and internal production use, converts to Apache 2.0 four years after each version. Embedding it in a commercial product requires a licence: contact@mozaiklabs.fr. Writing your own implementation from the specification requires nothing.
 
