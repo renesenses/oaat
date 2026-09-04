@@ -13,12 +13,13 @@ Guide complet pour configurer un Raspberry Pi 3B+ ou 4 comme endpoint audio bit-
 7. [Utilisation avec Tune](#utilisation-avec-tune)
 8. [Troubleshooting](#troubleshooting)
 9. [Aller plus loin](#aller-plus-loin)
+10. [Licence](#licence)
 
 ---
 
 ## Pourquoi OAAT sur Raspberry Pi ?
 
-OAAT (Open Advanced Audio Transport) est un protocole de transport audio réseau open-source, conçu comme alternative ouverte au RAAT propriétaire de Roon. Il offre :
+OAAT (Open Advanced Audio Transport) est un protocole de transport audio réseau dont la spécification est un standard ouvert, libre de redevances, conçu comme alternative au RAAT propriétaire de Roon. L'implémentation de référence, elle, est sous licence BSL 1.1 : son code est public, mais ce n'est pas un logiciel libre — les deux ne se confondent pas, voir la section [Licence](#licence). Il offre :
 
 - **Audio bit-perfect** : PCM jusqu'à 768 kHz / 32 bits, DSD natif jusqu'à DSD512
 - **Synchronisation multi-room** : < 1 ms entre endpoints, via horloge PTP
@@ -28,11 +29,12 @@ OAAT (Open Advanced Audio Transport) est un protocole de transport audio réseau
 
 | | OAAT | RAAT (Roon) | DLNA/UPnP | AirPlay 2 |
 |---|---|---|---|---|
-| Licence | Apache 2.0 | Propriétaire | UPnP Forum | Apple |
+| Licence de la spécification | CC BY-ND 4.0 + concession de brevet\* | Propriétaire | UPnP Forum | Apple |
+| Licence de l'implémentation | BSL 1.1\*\* | Propriétaire | Variable | Apple |
 | Bit-perfect | Oui | Oui | Variable | Non |
 | DSD natif | Oui | Oui | DoP seulement | Non |
 | Multi-room sync | < 1 ms | < 1 ms | Aucun | ~Apple only |
-| Open source | Oui | Non | Oui | Non |
+| Sources disponibles | Oui | Non | Oui | Non |
 
 Le Raspberry Pi est le compagnon idéal :
 
@@ -611,9 +613,35 @@ Le setup décrit ici est déjà 100% headless. Une fois flashé et démarré, le
 
 ---
 
+## Licence
+
+**Deux choses distinctes, deux licences distinctes.**
+
+\* **La spécification du protocole** (`docs/rfc.md`) est un standard ouvert :
+[CC BY-ND 4.0](LICENSE-SPEC.md), assortie d'une **concession de brevet et
+d'implémentation libre de redevances**. N'importe qui — y compris un fabricant
+qui commercialise un appareil — peut implémenter OAAT. Sans redevance, sans
+coût de certification, sans accord distinct à négocier.
+
+\*\* **L'implémentation de référence** (`crates/`) est sous
+[BSL 1.1](../LICENSE) : libre pour un usage non commercial et pour une mise en
+production interne, et elle bascule sous Apache 2.0 quatre ans après la
+publication de chaque version. Bâtir un produit commercial *sur ce code*
+demande un accord avec MozAIk Labs — implémenter *le protocole* n'en demande
+aucun.
+
+Ce guide décrit un usage personnel : rien de ce qui suit ne demande la moindre
+autorisation.
+
+> ⚠️ La licence de la spécification porte encore la mention **« DRAFT —
+> pending legal review »**. Elle ne doit pas servir de fondement à une décision
+> commerciale tant que cette mention n'a pas été retirée.
+
+---
+
 ## Liens
 
-- [Code source OAAT](https://github.com/renesenses/oaat) (Apache 2.0)
+- [Code source OAAT](https://github.com/renesenses/oaat) (implémentation sous BSL 1.1)
 - [Spécification RFC](https://mozaiklabs.fr/docs/oaat)
 - [Tune — serveur de musique](https://mozaiklabs.fr)
 - [Forum MozAIk Labs](https://mozaiklabs.fr/forum)
