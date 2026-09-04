@@ -1,169 +1,171 @@
-# Transformer un Raspberry Pi en endpoint audio OAAT
+# Turning a Raspberry Pi into an OAAT audio endpoint
 
-Guide complet pour configurer un Raspberry Pi 3B+ ou 4 comme endpoint audio bit-perfect avec le protocole OAAT.
+*Ce guide existe aussi en [français](howto-rpi-endpoint.fr.md).*
 
-## Sommaire
+A complete guide to setting up a Raspberry Pi 3B+ or 4 as a bit-perfect audio endpoint using the OAAT protocol.
 
-1. [Pourquoi OAAT sur Raspberry Pi ?](#pourquoi-oaat-sur-raspberry-pi-)
-2. [Matériel nécessaire](#matériel-nécessaire)
-3. [Flasher la carte SD](#flasher-la-carte-sd)
+## Contents
+
+1. [Why OAAT on a Raspberry Pi?](#why-oaat-on-a-raspberry-pi)
+2. [What you need](#what-you-need)
+3. [Flashing the SD card](#flashing-the-sd-card)
 4. [Installation](#installation)
 5. [Configuration](#configuration)
-6. [Vérification et premier son](#vérification-et-premier-son)
-7. [Utilisation avec Tune](#utilisation-avec-tune)
+6. [Checks and first sound](#checks-and-first-sound)
+7. [Using it with Tune](#using-it-with-tune)
 8. [Troubleshooting](#troubleshooting)
-9. [Aller plus loin](#aller-plus-loin)
+9. [Going further](#going-further)
 10. [Licence](#licence)
 
 ---
 
-## Pourquoi OAAT sur Raspberry Pi ?
+## Why OAAT on a Raspberry Pi?
 
-OAAT (Open Advanced Audio Transport) est un protocole de transport audio réseau dont la spécification est un standard ouvert, libre de redevances, conçu comme alternative au RAAT propriétaire de Roon. L'implémentation de référence, elle, est sous licence BSL 1.1 : son code est public, mais ce n'est pas un logiciel libre — les deux ne se confondent pas, voir la section [Licence](#licence). Il offre :
+OAAT (Open Advanced Audio Transport) is a network audio transport protocol whose specification is an open, royalty-free standard, designed as an alternative to Roon's proprietary RAAT. The reference implementation is a separate matter: it is under BSL 1.1, meaning the code is public but it is not free software. The two do not overlap — see the [Licence](#licence) section. It offers:
 
-- **Audio bit-perfect** : PCM jusqu'à 768 kHz / 32 bits, DSD natif jusqu'à DSD512
-- **Synchronisation multi-room** : < 1 ms entre endpoints, via horloge PTP
-- **Négociation de format** : le contrôleur s'adapte automatiquement aux capacités du DAC
-- **Gapless** : transitions sans coupure, même lors d'un changement de format
-- **Zéro configuration** : découverte automatique via mDNS/DNS-SD
+- **Bit-perfect audio**: PCM up to 768 kHz / 32 bits, native DSD up to DSD512
+- **Multi-room synchronisation**: < 1 ms between endpoints, over a PTP clock
+- **Format negotiation**: the controller adapts automatically to the DAC's capabilities
+- **Gapless**: seamless transitions, even across a format change
+- **Zero configuration**: automatic discovery over mDNS/DNS-SD
 
 | | OAAT | RAAT (Roon) | DLNA/UPnP | AirPlay 2 |
 |---|---|---|---|---|
-| Licence de la spécification | CC BY 4.0 + concession de brevet\* | Propriétaire | UPnP Forum | Apple |
-| Licence de l'implémentation | BSL 1.1\*\* | Propriétaire | Variable | Apple |
-| Bit-perfect | Oui | Oui | Variable | Non |
-| DSD natif | Oui | Oui | DoP seulement | Non |
-| Multi-room sync | < 1 ms | < 1 ms | Aucun | ~Apple only |
-| Sources disponibles | Oui | Non | Oui | Non |
+| Specification licence | CC BY 4.0 + patent grant\* | Proprietary | UPnP Forum | Apple |
+| Implementation licence | BSL 1.1\*\* | Proprietary | Varies | Apple |
+| Bit-perfect | Yes | Yes | Depends | No |
+| Native DSD | Yes | Yes | DoP only | No |
+| Multi-room sync | < 1 ms | < 1 ms | None | Apple only |
+| Source available | Yes | No | Yes | No |
 
-Le Raspberry Pi est le compagnon idéal :
+The Raspberry Pi is the ideal companion:
 
-- **Prix** : 35-75 EUR selon le modèle, un endpoint audio haut de gamme pour le prix d'un repas
-- **Silence** : pas de ventilateur, zéro bruit mécanique
-- **I2S natif** : connexion directe au DAC via le bus I2S du GPIO, sans passer par USB — le chemin le plus court et le plus pur vers le DAC
-- **Compact** : se glisse derrière un ampli ou dans un boîtier Audiophonics
-
----
-
-## Matériel nécessaire
-
-### Le Raspberry Pi
-
-| Modèle | PCM max | RAM | Prix indicatif | Recommandation |
-|--------|---------|-----|----------------|----------------|
-| **RPi 4B** (2 ou 4 Go) | 384 kHz / 32 bits | 2-8 Go | ~55-75 EUR | Recommandé |
-| **RPi 3B+** | 192 kHz / 32 bits | 1 Go | ~35-45 EUR | Budget / occasion |
-| RPi 5 | 384 kHz / 32 bits | 4-8 Go | ~70-90 EUR | Fonctionne aussi |
-
-> **Note** : Le RPi 3B+ est limité à 192 kHz par son bus I2S. Pour le hi-res au-delà (352.8 / 384 kHz), préférez le RPi 4.
-
-### Le DAC I2S (HAT)
-
-OAAT supporte tous les DAC I2S compatibles Raspberry Pi. Voici les plus courants :
-
-| DAC | Chipset | PCM max | Prix | Overlay Linux |
-|-----|---------|---------|------|---------------|
-| **Audiophonics ESS 9038Q2M** | ESS ES9038Q2M | 384 kHz / 32 bits | ~120 EUR | `i-sabre-q2m` ([driver](https://github.com/audiophonics/I-Sabre_9038Q2M)) |
-| **HifiBerry DAC2 HD** | PCM1796 | 192 kHz / 24 bits | ~65 EUR | `hifiberry-dacplushd` |
-| **HifiBerry DAC+ Pro** | PCM5122 | 192 kHz / 32 bits | ~45 EUR | `hifiberry-dacplus` |
-| **Allo Boss** | PCM5122 | 384 kHz / 32 bits | ~50 EUR | `allo-boss-dac-pcm512x-audio` |
-| **IQaudio DAC+** | PCM5122 | 192 kHz / 32 bits | ~30 EUR | `iqaudio-dacplus` |
-| **JustBoom DAC HAT** | PCM5122 | 384 kHz / 32 bits | ~35 EUR | `justboom-dac` |
-
-> **Important** : L'overlay Linux doit correspondre exactement à votre DAC. Un mauvais overlay = pas de son (erreur ALSA `-121` ou `-22`).
-
-### Accessoires
-
-- **Carte microSD** : 8 Go minimum (16 Go recommandé)
-- **Alimentation** : officielle RPi ou 5V/3A USB-C (RPi 4) / micro-USB (RPi 3)
-- **Câble Ethernet** : recommandé pour la stabilité audio (le WiFi fonctionne mais ajoute ~50 ms de jitter sur la clock sync)
-- **Boîtier** (optionnel) : Audiophonics propose des boîtiers intégrés Pi + DAC
+- **Price**: EUR 35-75 depending on the model — a high-end audio endpoint for the price of a meal
+- **Silence**: no fan, zero mechanical noise
+- **Native I2S**: a direct connection to the DAC over the GPIO's I2S bus, bypassing USB — the shortest and cleanest path to the DAC
+- **Compact**: it slips behind an amplifier, or into an Audiophonics case
 
 ---
 
-## Flasher la carte SD
+## What you need
 
-### Étape 1 : Télécharger Raspberry Pi Imager
+### The Raspberry Pi
 
-- **macOS** : `brew install --cask raspberry-pi-imager` ou [télécharger](https://www.raspberrypi.com/software/)
-- **Windows** : [télécharger l'installeur](https://www.raspberrypi.com/software/)
-- **Linux** : `sudo apt install rpi-imager`
+| Model | Max PCM | RAM | Typical price | Recommendation |
+|-------|---------|-----|---------------|----------------|
+| **RPi 4B** (2 or 4 GB) | 384 kHz / 32 bits | 2-8 GB | ~EUR 55-75 | Recommended |
+| **RPi 3B+** | 192 kHz / 32 bits | 1 GB | ~EUR 35-45 | Budget / second-hand |
+| RPi 5 | 384 kHz / 32 bits | 4-8 GB | ~EUR 70-90 | Works too |
 
-### Étape 2 : Configurer et flasher
+> **Note**: the RPi 3B+ is limited to 192 kHz by its I2S bus. For hi-res beyond that (352.8 / 384 kHz), prefer the RPi 4.
 
-1. Ouvrir **Raspberry Pi Imager**
-2. **Choisir l'appareil** : Raspberry Pi 3 ou 4 selon votre modèle
-3. **Choisir l'OS** : `Raspberry Pi OS (other)` → **Raspberry Pi OS Lite (64-bit)**
-   - Pas besoin du Desktop, on veut un système minimal
-4. **Choisir le stockage** : votre carte microSD
-5. **Avant de flasher**, cliquer sur l'engrenage (⚙️) pour configurer :
+### The I2S DAC (HAT)
 
-| Paramètre | Valeur recommandée |
-|-----------|-------------------|
+OAAT supports every Raspberry Pi-compatible I2S DAC. Here are the most common ones:
+
+| DAC | Chipset | Max PCM | Price | Linux overlay |
+|-----|---------|---------|-------|---------------|
+| **Audiophonics ESS 9038Q2M** | ESS ES9038Q2M | 384 kHz / 32 bits | ~EUR 120 | `i-sabre-q2m` ([driver](https://github.com/audiophonics/I-Sabre_9038Q2M)) |
+| **HifiBerry DAC2 HD** | PCM1796 | 192 kHz / 24 bits | ~EUR 65 | `hifiberry-dacplushd` |
+| **HifiBerry DAC+ Pro** | PCM5122 | 192 kHz / 32 bits | ~EUR 45 | `hifiberry-dacplus` |
+| **Allo Boss** | PCM5122 | 384 kHz / 32 bits | ~EUR 50 | `allo-boss-dac-pcm512x-audio` |
+| **IQaudio DAC+** | PCM5122 | 192 kHz / 32 bits | ~EUR 30 | `iqaudio-dacplus` |
+| **JustBoom DAC HAT** | PCM5122 | 384 kHz / 32 bits | ~EUR 35 | `justboom-dac` |
+
+> **Important**: the Linux overlay must match your DAC exactly. The wrong overlay means no sound (ALSA error `-121` or `-22`).
+
+### Accessories
+
+- **microSD card**: 8 GB minimum, 16 GB recommended
+- **Power supply**: the official RPi one, or 5V/3A USB-C (RPi 4) / micro-USB (RPi 3)
+- **Ethernet cable**: recommended for audio stability (Wi-Fi works, but adds ~50 ms of jitter to the clock sync)
+- **Case** (optional): Audiophonics sell integrated Pi + DAC enclosures
+
+---
+
+## Flashing the SD card
+
+### Step 1 — Download Raspberry Pi Imager
+
+- **macOS**: `brew install --cask raspberry-pi-imager`, or [download it](https://www.raspberrypi.com/software/)
+- **Windows**: [download the installer](https://www.raspberrypi.com/software/)
+- **Linux**: `sudo apt install rpi-imager`
+
+### Step 2 — Configure and flash
+
+1. Open **Raspberry Pi Imager**
+2. **Choose device**: Raspberry Pi 3 or 4, depending on your model
+3. **Choose OS**: `Raspberry Pi OS (other)` → **Raspberry Pi OS Lite (64-bit)**
+   - The Desktop is not needed; a minimal system is what you want
+4. **Choose storage**: your microSD card
+5. **Before flashing**, click the gear icon (⚙️) to configure:
+
+| Setting | Recommended value |
+|---------|-------------------|
 | Hostname | `oaat-endpoint` |
-| Activer SSH | Oui, avec mot de passe |
-| Nom d'utilisateur | `pi` (ou votre choix) |
-| Mot de passe | un mot de passe solide |
-| WiFi | configurer si pas d'Ethernet |
-| Fuseau horaire | `Europe/Paris` |
+| Enable SSH | Yes, with a password |
+| Username | `pi` (or your choice) |
+| Password | a strong one |
+| Wi-Fi | configure it if you have no Ethernet |
+| Time zone | your own |
 
-6. **Flasher** — compter 2-3 minutes
+6. **Flash** — allow 2-3 minutes
 
-### Étape 3 : Premier démarrage
+### Step 3 — First boot
 
-1. Insérer la carte SD dans le Pi
-2. Brancher le DAC HAT sur le GPIO (si pas déjà monté)
-3. Brancher Ethernet + alimentation
-4. Attendre 1-2 minutes (premier boot un peu plus long)
-5. Se connecter en SSH :
+1. Insert the SD card into the Pi
+2. Fit the DAC HAT onto the GPIO header, if it isn't already
+3. Connect Ethernet and power
+4. Wait 1-2 minutes — the first boot takes a little longer
+5. Connect over SSH:
 
 ```bash
 ssh pi@oaat-endpoint.local
-# ou avec l'adresse IP si .local ne fonctionne pas
+# or by IP address, if .local does not resolve
 ssh pi@192.168.1.XX
 ```
 
-> **Astuce** : Pour trouver l'IP du Pi, consultez l'interface de votre box/routeur, ou utilisez `arp -a | grep raspberry` depuis votre ordinateur.
+> **Tip**: to find the Pi's IP address, check your router's interface, or run `arp -a | grep raspberry` from your computer.
 
 ---
 
 ## Installation
 
-### Installation automatique (recommandée)
+### Automatic installation (recommended)
 
-Une seule commande installe tout :
+A single command installs everything:
 
 ```bash
 curl -sL https://raw.githubusercontent.com/renesenses/oaat/main/dist/rpi/setup.sh | sudo bash
 ```
 
-Le script vous demande de choisir votre DAC, puis :
+The script asks you to pick your DAC, then:
 
-1. Installe les dépendances système (ALSA, outils de build)
-2. Configure l'overlay du DAC dans `/boot/config.txt`
-3. Configure ALSA (`/etc/asound.conf`)
-4. Installe Rust et compile OAAT depuis les sources
-5. Installe le service systemd
+1. Installs the system dependencies (ALSA, build tools)
+2. Configures the DAC overlay in `/boot/config.txt`
+3. Configures ALSA (`/etc/asound.conf`)
+4. Installs Rust and builds OAAT from source
+5. Installs the systemd service
 
-**Temps de compilation** :
-- RPi 4 : **~8 minutes** en `--release`
-- RPi 3B+ : **~20 minutes** en `--release`
+**Build time**:
+- RPi 4: **~8 minutes** in `--release`
+- RPi 3B+: **~20 minutes** in `--release`
 
-> **Note** : La compilation Rust est gourmande en RAM. Sur RPi 3B+ (1 Go), le build peut nécessiter un fichier swap. Le script le gère automatiquement.
+> **Note**: building Rust is memory-hungry. On an RPi 3B+ (1 GB), the build may need a swap file. The script handles that for you.
 
-Après l'installation :
+Once installed:
 
 ```bash
 sudo reboot
 ```
 
-Le reboot est nécessaire pour activer l'overlay du DAC. Après redémarrage, le service OAAT démarre automatiquement.
+The reboot is required to activate the DAC overlay. After restarting, the OAAT service starts automatically.
 
-### Installation manuelle (étape par étape)
+### Manual installation, step by step
 
-Si vous préférez contrôler chaque étape :
+If you would rather control each step:
 
-#### 1. Dépendances système
+#### 1. System dependencies
 
 ```bash
 sudo apt-get update
@@ -171,21 +173,21 @@ sudo apt-get install -y libasound2 libasound2-dev alsa-utils \
     curl git build-essential pkg-config
 ```
 
-#### 2. Configurer le DAC
+#### 2. Configure the DAC
 
-Éditer `/boot/firmware/config.txt` (ou `/boot/config.txt` selon la version de l'OS) :
+Edit `/boot/firmware/config.txt` (or `/boot/config.txt`, depending on your OS version):
 
 ```bash
 sudo nano /boot/firmware/config.txt
 ```
 
-Commenter la sortie audio embarquée et ajouter l'overlay de votre DAC :
+Comment out the on-board audio output and add your DAC's overlay:
 
 ```ini
-# Désactiver l'audio embarqué
+# Disable on-board audio
 #dtparam=audio=on
 
-# Votre DAC — décommentez UNE SEULE ligne :
+# Your DAC — uncomment ONE line only:
 dtoverlay=i-sabre-q2m              # Audiophonics ESS 9038Q2M
 #dtoverlay=hifiberry-dacplus        # HifiBerry DAC+ / DAC+ Pro
 #dtoverlay=hifiberry-dacplushd      # HifiBerry DAC2 HD
@@ -194,7 +196,7 @@ dtoverlay=i-sabre-q2m              # Audiophonics ESS 9038Q2M
 #dtoverlay=justboom-dac             # JustBoom DAC HAT
 ```
 
-#### 3. Configurer ALSA
+#### 3. Configure ALSA
 
 ```bash
 sudo tee /etc/asound.conf << 'EOF'
@@ -212,14 +214,14 @@ ctl.!default {
 EOF
 ```
 
-#### 4. Installer Rust
+#### 4. Install Rust
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source ~/.cargo/env
 ```
 
-#### 5. Compiler OAAT
+#### 5. Build OAAT
 
 ```bash
 sudo mkdir -p /opt/oaat
@@ -230,16 +232,16 @@ cargo build --release --bin oaat
 cp target/release/oaat /opt/oaat/oaat
 ```
 
-#### 6. Configurer l'endpoint
+#### 6. Configure the endpoint
 
 ```bash
 cp dist/rpi/endpoint.toml /opt/oaat/endpoint.toml
 nano /opt/oaat/endpoint.toml
 ```
 
-Adapter le nom et les capacités à votre DAC (voir section [Configuration](#configuration)).
+Adjust the name and the capabilities to match your DAC — see the [Configuration](#configuration) section.
 
-#### 7. Installer le service systemd
+#### 7. Install the systemd service
 
 ```bash
 sudo cp dist/oaat-endpoint.service /etc/systemd/system/
@@ -247,7 +249,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable oaat-endpoint
 ```
 
-#### 8. Rebooter
+#### 8. Reboot
 
 ```bash
 sudo reboot
@@ -257,56 +259,56 @@ sudo reboot
 
 ## Configuration
 
-Le fichier de configuration se trouve dans `/opt/oaat/endpoint.toml`.
+The configuration file lives at `/opt/oaat/endpoint.toml`.
 
-### Référence complète
+### Full reference
 
 ```toml
 [endpoint]
-# Nom affiché dans Tune et lors de la découverte mDNS
-name = "Salon DAC"
+# Name shown in Tune and during mDNS discovery
+name = "Living room DAC"
 
-# Port TCP pour le contrôle (défaut : 9740)
+# TCP control port (default: 9740)
 port = 9740
 
-# Périphérique audio ALSA (défaut : "default", utilise /etc/asound.conf)
+# ALSA audio device (default: "default", which uses /etc/asound.conf)
 # audio_device = "hw:1,0"
 
-# TLS (désactivé par défaut, pas nécessaire en LAN)
+# TLS (off by default; not needed on a LAN)
 # tls = false
 
 [capabilities]
-# Fréquence d'échantillonnage maximale en Hz
+# Maximum sample rate, in Hz
 pcm_max_rate = 384000
 
-# Résolution maximale en bits
+# Maximum bit depth
 pcm_max_bits = 32
 
-# Nombre de canaux max
+# Maximum channel count
 channels_max = 2
 
-# Support DSD natif (la plupart des DAC I2S via RPi ne supportent pas le DSD natif)
+# Native DSD support (most I2S DACs on a RPi do not support native DSD)
 dsd = false
 
-# Compression FLAC pour le transport (réduit la bande passante de ~50%)
+# FLAC compression for transport (cuts bandwidth by roughly half)
 flac = true
 
 [logging]
-# Niveau de log : error, warn, info, debug, trace
+# Log level: error, warn, info, debug, trace
 level = "info"
 ```
 
-### Exemples par DAC
+### Examples, DAC by DAC
 
 #### Audiophonics ESS 9038Q2M
 
-Le ES9038Q2M supporte nativement S16_LE et S32_LE, des taux d'échantillonnage jusqu'à 384 kHz (voire 1.536 MHz en mode DSD), et dispose de contrôles ALSA avancés :
+The ES9038Q2M natively supports S16_LE and S32_LE, sample rates up to 384 kHz (and up to 1.536 MHz in DSD mode), and exposes advanced ALSA controls:
 
-- **Volume numérique** : 0-100 (-100 dB à 0 dB)
-- **Filtre FIR** : 7 types (brick wall, minimum phase, linear phase)
-- **Sélection entrée** : I2S / SPDIF
+- **Digital volume**: 0-100 (-100 dB to 0 dB)
+- **FIR filter**: 7 types (brick wall, minimum phase, linear phase)
+- **Input selection**: I2S / SPDIF
 
-Le [driver Linux](https://github.com/audiophonics/I-Sabre_9038Q2M) utilise l'adresse I2C `0x48`. Sur Raspberry Pi OS Bookworm récent, l'overlay `i-sabre-q2m` est généralement inclus dans le noyau. Pour un noyau plus ancien, il faut compiler le module depuis le dépôt Audiophonics.
+The [Linux driver](https://github.com/audiophonics/I-Sabre_9038Q2M) uses I2C address `0x48`. On a recent Raspberry Pi OS Bookworm, the `i-sabre-q2m` overlay is generally shipped with the kernel. On an older kernel you will need to build the module from the Audiophonics repository.
 
 ```toml
 [endpoint]
@@ -358,56 +360,56 @@ channels_max = 2
 flac = true
 ```
 
-### Conseils
+### Advice
 
-- **`pcm_max_rate`** : ne déclarez pas plus que ce que votre DAC supporte réellement. OAAT négocie automatiquement vers le bas si la source dépasse.
-- **`flac = true`** : recommandé. Réduit la bande passante réseau de ~50-60% sans aucune perte de qualité (FLAC est lossless). Particulièrement utile en WiFi.
-- **`name`** : choisissez un nom parlant, c'est ce qui apparaît dans l'interface de Tune comme zone de lecture.
+- **`pcm_max_rate`**: do not declare more than your DAC genuinely supports. OAAT negotiates downwards automatically when the source exceeds it.
+- **`flac = true`**: recommended. It cuts network bandwidth by 50-60% with no loss of quality whatsoever — FLAC is lossless. Particularly useful over Wi-Fi.
+- **`name`**: pick something meaningful. This is what appears in Tune as a playback zone.
 
 ---
 
-## Vérification et premier son
+## Checks and first sound
 
-### 1. Vérifier que le DAC est détecté
+### 1. Check the DAC is detected
 
 ```bash
 aplay -l
 ```
 
-Vous devez voir votre DAC comme carte 0 :
+Your DAC should appear as card 0:
 
 ```
-**** Liste des Périphériques Matériels PLAYBACK ****
-carte 0: sndrpies9038q2m [snd_rpi_es9038q2m], périphérique 0: ES9038Q2M HiFi es9038q2m-hifi-0 []
-  Sous-périphériques: 1/1
+**** List of PLAYBACK Hardware Devices ****
+card 0: sndrpies9038q2m [snd_rpi_es9038q2m], device 0: ES9038Q2M HiFi es9038q2m-hifi-0 []
+  Subdevices: 1/1
 ```
 
-Si le DAC n'apparaît pas, vérifiez l'overlay dans `/boot/firmware/config.txt` et redémarrez.
+If the DAC does not show up, check the overlay in `/boot/firmware/config.txt` and reboot.
 
-### 2. Tester le son directement (sans OAAT)
+### 2. Test sound directly, without OAAT
 
 ```bash
 speaker-test -D hw:0,0 -c 2 -t sine -f 440
 ```
 
-Vous devez entendre un la 440 Hz. `Ctrl+C` pour arrêter.
+You should hear a 440 Hz tone. `Ctrl+C` to stop.
 
-### 3. Vérifier le service OAAT
+### 3. Check the OAAT service
 
 ```bash
 sudo systemctl status oaat-endpoint
 ```
 
-Sortie attendue :
+Expected output:
 
 ```
 ● oaat-endpoint.service - OAAT Audio Endpoint (...)
      Active: active (running) since ...
 ```
 
-### 4. Vérifier la découverte mDNS
+### 4. Check mDNS discovery
 
-Depuis un autre appareil sur le réseau :
+From another device on the network:
 
 ```bash
 # macOS
@@ -417,26 +419,26 @@ dns-sd -B _oaat._tcp
 avahi-browse -r _oaat._tcp
 ```
 
-Vous devez voir votre endpoint avec son nom et ses capacités.
+You should see your endpoint, with its name and its capabilities.
 
-### 5. Premier son via OAAT
+### 5. First sound over OAAT
 
-Depuis votre ordinateur (avec le CLI oaat installé) :
-
-```bash
-# Sinusoïde 440 Hz pendant 5 secondes
-oaat controller --target <ip-du-pi>:9740 --freq 440 --duration 5
-```
-
-Si vous entendez le la 440 Hz, votre endpoint OAAT est fonctionnel et bit-perfect.
-
-### 6. Test de conformité complet
+From your computer, with the `oaat` CLI installed:
 
 ```bash
-oaat-test <ip-du-pi>:9740
+# A 440 Hz sine wave for 5 seconds
+oaat controller --target <pi-ip>:9740 --freq 440 --duration 5
 ```
 
-Résultat attendu :
+If you hear the 440 Hz tone, your OAAT endpoint is working and bit-perfect.
+
+### 6. Full conformance test
+
+```bash
+oaat-test <pi-ip>:9740
+```
+
+Expected result:
 
 ```
 OAAT Conformance Test — 192.168.1.42:9740
@@ -453,72 +455,72 @@ OAAT Conformance Test — 192.168.1.42:9740
 
 ---
 
-## Utilisation avec Tune
+## Using it with Tune
 
-[Tune](https://mozaiklabs.fr) est un serveur de musique auto-hébergé qui intègre nativement OAAT.
+[Tune](https://mozaiklabs.fr) is a self-hosted music server with native OAAT support.
 
-### Découverte automatique
+### Automatic discovery
 
-Si Tune tourne sur le même réseau local que votre RPi, l'endpoint OAAT apparaît automatiquement comme zone de lecture dans l'interface web. Aucune configuration supplémentaire n'est nécessaire.
+If Tune runs on the same local network as your RPi, the OAAT endpoint appears as a playback zone in the web interface on its own. No further configuration is needed.
 
-L'endpoint OAAT est prioritaire sur DLNA et AirPlay dans Tune, car il offre le chemin audio le plus direct et le plus fidèle.
+Tune prefers the OAAT endpoint over DLNA and AirPlay, because it offers the most direct and most faithful audio path.
 
-### Lecture
+### Playback
 
-1. Ouvrir l'interface web de Tune
-2. Sélectionner la zone correspondant au nom de votre endpoint (ex: "Salon DAC")
-3. Lancer la lecture d'un album ou d'une playlist
-4. Tune négocie automatiquement le meilleur format supporté par votre DAC
+1. Open Tune's web interface
+2. Select the zone matching your endpoint's name — "Living room DAC", say
+3. Start playing an album or a playlist
+4. Tune negotiates the best format your DAC supports, automatically
 
-### Formats supportés
+### Supported formats
 
-La négociation est automatique :
+Negotiation is automatic:
 
-- Si votre source est en 24/96 et le DAC supporte 384/32 → lecture en 24/96 (pas d'upsampling inutile)
-- Si votre source est en 24/192 et le DAC supporte max 96 → Tune downsample à 24/96 (même famille 48 kHz)
-- Si votre source est en DSD et le DAC ne supporte pas le DSD → conversion PCM transparente
+- Source at 24/96 and a DAC that handles 384/32 → playback at 24/96, with no pointless upsampling
+- Source at 24/192 and a DAC capped at 96 → Tune downsamples to 24/96, staying in the same 48 kHz family
+- Source in DSD and a DAC without DSD support → transparent PCM conversion
 
 ---
 
 ## Troubleshooting
 
-### Pas de son
+### No sound
 
-| Symptôme | Cause probable | Solution |
-|----------|---------------|----------|
-| `aplay -l` ne liste aucune carte | Overlay DAC manquant ou incorrect | Vérifier `/boot/firmware/config.txt`, corriger l'overlay, rebooter |
-| `speaker-test` donne une erreur `-121` | Mauvais overlay pour ce DAC | Essayer un autre overlay (voir tableau DACs) |
-| `speaker-test` fonctionne mais pas OAAT | Service pas démarré ou mauvaise config | `systemctl status oaat-endpoint` + `journalctl -u oaat-endpoint` |
-| Son qui grésille ou saute | WiFi instable ou buffer trop petit | Passer en Ethernet, ou augmenter le buffer dans les logs |
+| Symptom | Likely cause | Fix |
+|---------|--------------|-----|
+| `aplay -l` lists no card | DAC overlay missing or wrong | Check `/boot/firmware/config.txt`, correct the overlay, reboot |
+| `speaker-test` returns error `-121` | Wrong overlay for this DAC | Try another overlay — see the DAC table |
+| `speaker-test` works but OAAT does not | Service not started, or misconfigured | `systemctl status oaat-endpoint` and `journalctl -u oaat-endpoint` |
+| Crackling or skipping | Unstable Wi-Fi, or too small a buffer | Switch to Ethernet, or raise the buffer |
 
-### Le service ne démarre pas
+### The service will not start
 
 ```bash
-# Voir les logs détaillés
+# Read the detailed logs
 journalctl -u oaat-endpoint -f
 
-# Erreurs courantes :
-# "No such device" → DAC pas détecté, vérifier overlay + reboot
-# "Address already in use" → un autre processus utilise le port 9740
-# "Permission denied" → vérifier le User dans le fichier service
+# Common errors:
+# "No such device"        → DAC not detected; check the overlay and reboot
+# "Address already in use" → another process holds port 9740
+# "Permission denied"      → check the User directive in the service file
 ```
 
-### L'endpoint n'est pas découvert par Tune
+### Tune does not discover the endpoint
 
-- Vérifier que Tune et le RPi sont sur le **même sous-réseau**
-- Si vous utilisez un VPN (NordVPN, etc.) : activer `lan-discovery` (`nordvpn set lan-discovery on`)
-- Vérifier le pare-feu : les ports 9740 (TCP), 9741 (UDP), 9742 (UDP) et 5353 (mDNS) doivent être ouverts
-- Tester la découverte mDNS manuellement (voir section Vérification)
+- Check that Tune and the RPi sit on the **same subnet**
+- If you use a VPN such as NordVPN, enable LAN discovery: `nordvpn set lan-discovery on`
+- Check the firewall: ports 9740 (TCP), 9741 (UDP), 9742 (UDP) and 5353 (mDNS) must be open
+- Test mDNS discovery by hand — see the checks section above
 
-### Audiophonics ESS 9038Q2M : overlay introuvable
+### Audiophonics ESS 9038Q2M: overlay not found
 
-Sur certaines versions de Raspberry Pi OS, l'overlay `i-sabre-q2m` n'est pas inclus dans le noyau. Symptôme :
+On some Raspberry Pi OS versions the `i-sabre-q2m` overlay is not shipped with the kernel. The symptom:
 
 ```
 dtoverlay: failed to apply overlay 'i-sabre-q2m'
 ```
 
-Solution : compiler le driver depuis les sources Audiophonics :
+The fix is to build the driver from the Audiophonics sources:
 
 ```bash
 sudo apt-get install -y raspberrypi-kernel-headers
@@ -529,30 +531,30 @@ sudo make install
 sudo reboot
 ```
 
-Après reboot, vérifier :
+After rebooting, check:
 
 ```bash
 aplay -l
-# Doit afficher : card X: DAC [I-Sabre Q2M DAC], device 0: ...
+# should show: card X: DAC [I-Sabre Q2M DAC], device 0: ...
 ```
 
-### RPi 3 vs RPi 4
+### RPi 3 versus RPi 4
 
 | Aspect | RPi 3B+ | RPi 4B |
 |--------|---------|--------|
-| PCM max via I2S | 192 kHz | 384 kHz |
-| Temps de compilation | ~20 min | ~8 min |
-| RAM | 1 Go (swap recommandé) | 2-8 Go |
-| Ethernet | 100 Mbps (via USB) | Gigabit natif |
-| WiFi | 2.4/5 GHz | 2.4/5 GHz, meilleur |
+| Max PCM over I2S | 192 kHz | 384 kHz |
+| Build time | ~20 min | ~8 min |
+| RAM | 1 GB (swap recommended) | 2-8 GB |
+| Ethernet | 100 Mbps, over USB | Native gigabit |
+| Wi-Fi | 2.4/5 GHz | 2.4/5 GHz, better |
 
-Le RPi 3B+ fonctionne parfaitement pour du 16/44.1 (CD) jusqu'au 24/192 (hi-res). Si vous écoutez principalement du FLAC CD ou du Qobuz 24/96, un RPi 3 d'occasion à 25 EUR fait parfaitement l'affaire.
+The RPi 3B+ is perfectly good from 16/44.1 (CD) up to 24/192 (hi-res). If you mostly listen to CD-quality FLAC or Qobuz at 24/96, a second-hand RPi 3 at EUR 25 does the job well.
 
 ---
 
-## Aller plus loin
+## Going further
 
-### Mise à jour de l'endpoint
+### Updating the endpoint
 
 ```bash
 cd /opt/oaat/src
@@ -562,91 +564,90 @@ cp target/release/oaat /opt/oaat/oaat
 sudo systemctl restart oaat-endpoint
 ```
 
-### Multi-room synchronisé
+### Synchronised multi-room
 
-Deux (ou plus) Raspberry Pi sur le même réseau peuvent être synchronisés à < 1 ms :
+Two or more Raspberry Pis on the same network can be synchronised to under a millisecond:
 
 ```
                     ┌─────────────────┐
                     │   Tune Server   │
-                    │   (contrôleur)  │
+                    │   (controller)  │
                     └────────┬────────┘
                              │
                     ┌────────┴────────┐
                     │                 │
               ┌─────┴─────┐    ┌─────┴─────┐
               │  RPi #1   │    │  RPi #2   │
-              │  Salon    │    │  Cuisine  │
+              │  Living   │    │  Kitchen  │
               │  ESS 9038 │    │  HifiBerry│
               └───────────┘    └───────────┘
                     ▲                ▲
-                    │  même PTS      │
+                    │  same PTS      │
                     │  < 1 ms sync   │
                     └────────────────┘
 ```
 
-Chaque endpoint reçoit les mêmes paquets audio avec le même timestamp de présentation (PTS). La synchronisation PTP corrige automatiquement les différences d'horloge entre les Pi.
+Every endpoint receives the same audio packets carrying the same presentation timestamp (PTS). PTP synchronisation corrects the clock differences between the Pis automatically.
 
-Dans Tune, il suffit de créer une zone groupant plusieurs endpoints pour activer le multi-room.
+In Tune, creating a zone that groups several endpoints is all it takes to turn multi-room on.
 
-### Headless complet (sans écran ni clavier)
+### Fully headless
 
-Le setup décrit ici est déjà 100% headless. Une fois flashé et démarré, le Pi est autonome :
+The setup described here is already 100% headless. Once flashed and booted, the Pi runs on its own:
 
-- Le service OAAT démarre au boot
-- Redémarrage automatique en cas de crash (systemd `Restart=always`)
-- Reconnexion automatique si le contrôleur se déconnecte
-- Mise à jour possible en SSH
+- The OAAT service starts at boot
+- It restarts automatically after a crash (systemd `Restart=always`)
+- It reconnects automatically if the controller drops
+- It can be updated over SSH
 
-### Performances réseau
+### Network performance
 
-| Transport | Bande passante | Latence |
-|-----------|---------------|---------|
-| PCM 16/44.1 stéréo | 1.41 Mbps | - |
-| PCM 24/192 stéréo | 9.22 Mbps | - |
-| PCM 32/384 stéréo | 24.58 Mbps | - |
-| FLAC 24/192 stéréo | ~4 Mbps | +5 ms décompression |
-| Ethernet 100 Mbps (RPi 3) | OK pour tout | < 1 ms |
-| WiFi 5 GHz | OK pour tout | ~50 ms clock offset |
+| Transport | Bandwidth | Latency |
+|-----------|-----------|---------|
+| PCM 16/44.1 stereo | 1.41 Mbps | - |
+| PCM 24/192 stereo | 9.22 Mbps | - |
+| PCM 32/384 stereo | 24.58 Mbps | - |
+| FLAC 24/192 stereo | ~4 Mbps | +5 ms decoding |
+| Ethernet 100 Mbps (RPi 3) | Fine for everything | < 1 ms |
+| Wi-Fi 5 GHz | Fine for everything | ~50 ms clock offset |
 
-> **Recommandation** : Ethernet pour le multi-room synchronisé. WiFi pour un endpoint solo, c'est très bien.
+> **Recommendation**: Ethernet for synchronised multi-room. Wi-Fi is perfectly fine for a single endpoint.
 
 ---
 
 ## Licence
 
-**Deux choses distinctes, deux licences distinctes.**
+**Two different things, two different licences.**
 
-\* **La spécification du protocole** (`docs/rfc.md`) est un standard ouvert :
-[CC BY 4.0](LICENSE-SPEC.md), assortie d'une **concession de brevet et
-d'implémentation libre de redevances**. N'importe qui — y compris un fabricant
-qui commercialise un appareil — peut implémenter OAAT. Sans redevance, sans
-coût de certification, sans accord distinct à négocier.
+\* **The protocol specification** (`docs/rfc.md`) is an open standard:
+[CC BY 4.0](LICENSE-SPEC.md), with a **royalty-free patent and implementation
+grant**. Anyone — including a manufacturer shipping a commercial device — may
+implement OAAT. No fee, no certification cost, no separate agreement to
+negotiate.
 
-\*\* **L'implémentation de référence** (`crates/`) est sous
-[BSL 1.1](../LICENSE) : libre pour un usage non commercial et pour une mise en
-production interne, et elle bascule sous Apache 2.0 quatre ans après la
-publication de chaque version. Bâtir un produit commercial *sur ce code*
-demande un accord avec MozAIk Labs — implémenter *le protocole* n'en demande
-aucun.
+\*\* **The reference implementation** (`crates/`) is under
+[BSL 1.1](../LICENSE): free for non-commercial use and for internal production
+use, and it converts to Apache 2.0 four years after each version is published.
+Building a commercial product *on this code* requires an agreement with MozAIk
+Labs — implementing *the protocol* requires none.
 
-Ce guide décrit un usage personnel : rien de ce qui suit ne demande la moindre
-autorisation.
+This guide describes personal use: nothing in it requires permission from
+anyone.
 
-> ⚠️ La licence de la spécification porte encore la mention **« DRAFT —
-> pending legal review »**. Elle ne doit pas servir de fondement à une décision
-> commerciale tant que cette mention n'a pas été retirée.
-
----
-
-## Liens
-
-- [Code source OAAT](https://github.com/renesenses/oaat) (implémentation sous BSL 1.1)
-- [Spécification RFC](https://mozaiklabs.fr/docs/oaat)
-- [Tune — serveur de musique](https://mozaiklabs.fr)
-- [Forum MozAIk Labs](https://mozaiklabs.fr/forum)
-- [Audiophonics](https://www.audiophonics.fr) — DAC I2S et boîtiers RPi
+> ⚠️ The specification licence still carries a **DRAFT — pending legal review**
+> notice. It should not be relied upon for a commercial decision until that
+> notice has been removed.
 
 ---
 
-*Guide rédigé par MozAIk Labs — dernière mise à jour : mai 2026*
+## Links
+
+- [OAAT source code](https://github.com/renesenses/oaat) (implementation under BSL 1.1)
+- [RFC specification](https://mozaiklabs.fr/docs/oaat)
+- [Tune — music server](https://mozaiklabs.fr)
+- [MozAIk Labs forum](https://mozaiklabs.fr/forum)
+- [Audiophonics](https://www.audiophonics.fr) — I2S DACs and RPi cases
+
+---
+
+*Written by MozAIk Labs — last updated: September 2026*

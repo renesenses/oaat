@@ -65,4 +65,4 @@ oaat controller --target <ip-du-pi>:9740 --freq 440 --duration 5
 
 ## Guide complet
 
-Voir [docs/howto-rpi-endpoint.md](../../docs/howto-rpi-endpoint.md) pour le guide détaillé avec configuration, troubleshooting et multi-room.
+Voir [docs/howto-rpi-endpoint.fr.md](../../docs/howto-rpi-endpoint.fr.md) pour le guide détaillé avec configuration, troubleshooting et multi-room.
