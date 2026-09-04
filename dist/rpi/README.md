@@ -30,7 +30,7 @@ sudo bash setup.sh --dac ess9038
 
 ## Full guide (FR)
 
-See [docs/howto-rpi-endpoint.md](../../docs/howto-rpi-endpoint.md) for the complete step-by-step guide in French, including manual installation, configuration reference, troubleshooting, and multi-room setup.
+See [docs/howto-rpi-endpoint.md](../../docs/howto-rpi-endpoint.md) for the complete step-by-step guide, including manual installation, configuration reference, troubleshooting, and multi-room setup. A French version is available at [howto-rpi-endpoint.fr.md](../../docs/howto-rpi-endpoint.fr.md).
 
 ## Files
 
