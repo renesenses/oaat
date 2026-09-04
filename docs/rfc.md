@@ -4,7 +4,7 @@
 **Date**: 2026-07-04
 **Author**: Bertrand Clech / MozAIk Labs
 **Status**: Draft
-**License**: Specification — CC BY 4.0, with a royalty-free implementation and patent grant (see [LICENSE-SPEC](LICENSE-SPEC.md)). Reference implementation (`crates/`) — Business Source License 1.1, unchanged.
+**License**: Specification — CC BY 4.0, with a royalty-free implementation and patent grant (see [LICENSE-SPEC](LICENSE-SPEC.md)). Reference implementation (`crates/`) — Apache License 2.0.
 
 > Changes in 0.3.0: FEC is fully specified on the wire (group size, index,
 > length-XOR recovery); FormatAccept now signals device readiness; clock sync
@@ -831,7 +831,7 @@ trait OaatHal {
 | Feature | OAAT | RAAT | DLNA | AirPlay 2 | Chromecast | OpenHome |
 |---------|------|------|------|-----------|------------|----------|
 | Spec license | CC BY 4.0* | Proprietary | UPnP Forum | Apple | Google | BSD |
-| Implementation license | BSL 1.1** | Proprietary | Varies | Apple | Google | BSD |
+| Implementation license | Apache 2.0** | Proprietary | Varies | Apple | Google | BSD |
 | Cert cost | Free | Paid | Fee | MFi | Cast SDK | Free |
 | Bit-perfect | Yes | Yes | Depends | No | No | Yes |
 | Max PCM | 768/32 | 768/32 | Varies | 48/24 | 48/24 | Varies |
@@ -845,7 +845,7 @@ trait OaatHal {
 
 \* The specification is free to implement, quote and translate: CC BY 4.0 plus a royalty-free patent and implementation grant. No fee, no certification cost, no separate agreement — see [LICENSE-SPEC](LICENSE-SPEC.md).
 
-\*\* The reference implementation is source-available, not open source: free for non-commercial and internal production use, converts to Apache 2.0 four years after each version. Embedding it in a commercial product requires a licence: contact@mozaiklabs.fr. Writing your own implementation from the specification requires nothing.
+\*\* The reference implementation is open source under the Apache License 2.0. Embed it, ship it, sell a product built on it — no licence to negotiate, no fee, no notification. Writing your own implementation from the specification instead requires nothing either.
 
 ---
 

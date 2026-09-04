@@ -2,10 +2,10 @@
 
 [![CI](https://github.com/renesenses/oaat/actions/workflows/ci.yml/badge.svg)](https://github.com/renesenses/oaat/actions)
 [![Spec: CC BY 4.0](https://img.shields.io/badge/Spec-CC_BY_4.0-brightgreen.svg)](docs/LICENSE-SPEC.md)
-[![Implementation: BSL 1.1](https://img.shields.io/badge/Implementation-BSL_1.1-orange.svg)](LICENSE)
+[![Implementation: Apache 2.0](https://img.shields.io/badge/Implementation-Apache_2.0-brightgreen.svg)](LICENSE)
 
 A bit-perfect, multi-room audio streaming protocol: an **open specification**,
-free to implement, with a **source-available** reference implementation.
+free to implement, with an **open-source** reference implementation.
 
 OAAT is a network audio transport protocol designed as an alternative to
 Roon's proprietary RAAT. It provides:
@@ -105,13 +105,13 @@ oaat-test 192.168.1.50:9740
 | Feature | OAAT | RAAT | DLNA | AirPlay 2 | OpenHome |
 |---------|------|------|------|-----------|----------|
 | Spec license | CC BY 4.0* | Proprietary | UPnP Forum | Apple | BSD |
-| Implementation license | BSL 1.1** | Proprietary | Varies | Apple | BSD |
+| Implementation license | Apache 2.0** | Proprietary | Varies | Apple | BSD |
 | Bit-perfect | Yes | Yes | Depends | No | Yes |
 | DSD native | Yes | Yes | DoP only | No | DoP |
 | Multi-room sync | < 1 ms (measured) | < 1 ms | None | Apple | Limited |
 | Gapless | Yes | Yes | Unreliable | Yes | Yes |
 | Format negotiation | Auto | Auto | Manual | Fixed | Limited |
-| Source available | Yes | No | Yes | Reverse-eng | Yes |
+| Open source | Yes | No | Yes | Reverse-eng | Yes |
 | Endpoint LOC | ~1500 | N/A | ~5000+ | N/A | ~3000+ |
 | Conformance tool | Yes | No | No | No | No |
 
@@ -125,13 +125,16 @@ implementation grant**. Anyone — including a manufacturer shipping a commercia
 device — may implement OAAT. No fee, no certification cost, no separate
 agreement, nobody to ask.
 
-\*\* **The reference implementation** (`crates/`) is source-available, not open
-source: Business Source License 1.1 — see [LICENSE](LICENSE). Free for
-non-commercial use and for your own internal production use; each version
-converts to Apache 2.0 four years after its publication. Embedding *this code*
-in a commercial product requires a licence from MozAIk Labs:
-contact@mozaiklabs.fr. Writing your own implementation from the specification
-requires nothing.
+\*\* **The reference implementation** (`crates/`) is open source under the
+[Apache License 2.0](LICENSE). Embed it, modify it, ship it inside a product you
+sell — there is nothing to negotiate, no fee, and nobody to notify. Writing your
+own implementation from the specification instead requires nothing either.
+
+It was under the Business Source License until September 2026. That licence
+restricted commercial use of *this code*, which no patent grant on the
+specification could offset: a manufacturer weighing two protocols compares the
+cost of integrating them, and rewriting the endpoint rather than importing it is
+a cost. The restriction protected nothing that existed, so it went.
 
 "OAAT" and the OAAT logo are trademarks of MozAIk Labs. Implementing the
 protocol does not grant the right to claim certification or endorsement; the
