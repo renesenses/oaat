@@ -2,7 +2,7 @@
 
 **Applies to**: `docs/rfc.md` — the OAAT protocol specification, and only that
 document. The reference implementation in `crates/` is licensed separately,
-under the Business Source License 1.1 (see [`LICENSE`](../LICENSE)).
+under the Apache License 2.0 (see [`LICENSE`](../LICENSE)).
 
 > ⚠️ **DRAFT — pending legal review.**
 > Section 2 is modelled on the patent clause of the Apache License 2.0 (§ 3)
@@ -58,12 +58,6 @@ document to that entity terminate as of the date such litigation is filed.
 implement OAAT.**
 
 ## 3. What this grant does not cover
-
-- **The reference implementation.** The code in `crates/` remains under the
-  Business Source License 1.1. Implementing the specification from the document
-  is free; embedding MozAIk Labs' own code in a commercial product is not.
-  These are two distinct decisions, and only the first one is needed to build
-  an OAAT device.
 
 - **The name and the logo.** "OAAT", "Open Advanced Audio Transport" and the
   OAAT logo are trademarks of MozAIk Labs. Implementing the specification does
