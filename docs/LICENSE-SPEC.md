@@ -13,18 +13,29 @@ under the Business Source License 1.1 (see [`LICENSE`](../LICENSE)).
 
 ## 1. The document
 
-The OAAT specification is licensed under the **Creative Commons
-Attribution-NoDerivatives 4.0 International licence (CC BY-ND 4.0)** —
-https://creativecommons.org/licenses/by-nd/4.0/
+The OAAT specification is licensed under the **Creative Commons Attribution 4.0
+International licence (CC BY 4.0)** —
+https://creativecommons.org/licenses/by/4.0/
 
-You may copy, redistribute and quote the specification, in any medium or
-format, for any purpose, including commercially, provided you give appropriate
-credit. You may not distribute a modified version of the document.
+You may copy, redistribute, quote, excerpt, adapt and **translate** the
+specification, in any medium or format, for any purpose, including
+commercially, provided you give appropriate credit.
 
-**Implementing the specification is not creating a derivative of the
-document.** The no-derivatives condition exists to protect the canonical text
-from divergent competing versions published under the same name. It places no
-restriction whatsoever on implementations.
+**Translations are explicitly welcome.** The first version of this document
+used CC BY-ND, on the reasoning that a no-derivatives clause protected the
+canonical text from divergent competing versions published under the same name.
+That reasoning was wrong on a point that matters: a translation is a derivative
+work, so ND blocked precisely what a specification written by a French author
+needs most in order to be adopted internationally. It was corrected after
+Hedda raised it in issue #13.
+
+Divergence is a naming problem, not a copyright problem. It is handled by the
+trademark in section 3, which was always the right instrument: publish your own
+adaptation freely, but do not present it as the canonical OAAT specification.
+
+Implementations were never restricted by this document, and are not restricted
+now. Implementing a specification does not create a derivative of the text in
+the first place.
 
 ## 2. Implementation and patent grant
 
@@ -59,3 +70,8 @@ implement OAAT.**
   not grant the right to describe a product as certified, compliant with, or
   endorsed by OAAT. Conformance claims are governed separately; the conformance
   tool is `oaat-test`.
+
+  This is also what keeps the canonical text canonical. You may publish a
+  modified or translated version of the specification under CC BY 4.0; you may
+  not present it as *the* OAAT specification. Copyright is not doing that job —
+  the trademark is.

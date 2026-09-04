@@ -1,7 +1,7 @@
 # OAAT — Open Advanced Audio Transport
 
 [![CI](https://github.com/renesenses/oaat/actions/workflows/ci.yml/badge.svg)](https://github.com/renesenses/oaat/actions)
-[![Spec: CC BY-ND 4.0](https://img.shields.io/badge/Spec-CC_BY--ND_4.0-brightgreen.svg)](docs/LICENSE-SPEC.md)
+[![Spec: CC BY 4.0](https://img.shields.io/badge/Spec-CC_BY_4.0-brightgreen.svg)](docs/LICENSE-SPEC.md)
 [![Implementation: BSL 1.1](https://img.shields.io/badge/Implementation-BSL_1.1-orange.svg)](LICENSE)
 
 A bit-perfect, multi-room audio streaming protocol: an **open specification**,
@@ -104,7 +104,7 @@ oaat-test 192.168.1.50:9740
 
 | Feature | OAAT | RAAT | DLNA | AirPlay 2 | OpenHome |
 |---------|------|------|------|-----------|----------|
-| Spec license | CC BY-ND 4.0* | Proprietary | UPnP Forum | Apple | BSD |
+| Spec license | CC BY 4.0* | Proprietary | UPnP Forum | Apple | BSD |
 | Implementation license | BSL 1.1** | Proprietary | Varies | Apple | BSD |
 | Bit-perfect | Yes | Yes | Depends | No | Yes |
 | DSD native | Yes | Yes | DoP only | No | DoP |
@@ -120,7 +120,7 @@ oaat-test 192.168.1.50:9740
 **Two different things, two different licences.**
 
 \* **The protocol specification** (`docs/rfc.md`) is an open standard:
-[CC BY-ND 4.0](docs/LICENSE-SPEC.md) with a **royalty-free patent and
+[CC BY 4.0](docs/LICENSE-SPEC.md) with a **royalty-free patent and
 implementation grant**. Anyone — including a manufacturer shipping a commercial
 device — may implement OAAT. No fee, no certification cost, no separate
 agreement, nobody to ask.
