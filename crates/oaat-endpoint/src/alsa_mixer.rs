@@ -11,7 +11,8 @@ use tracing::{info, warn};
 pub struct AlsaMixer {
     card: u32,
     volume_numid: Option<u32>,
-    volume_max: u32,
+    volume_min: i32,
+    volume_max: i32,
     mute_numid: Option<u32>,
 }
 
@@ -20,6 +21,7 @@ impl AlsaMixer {
         let mut mixer = Self {
             card,
             volume_numid: None,
+            volume_min: 0,
             volume_max: 100,
             mute_numid: None,
         };
@@ -31,6 +33,7 @@ impl AlsaMixer {
         let Some(contents) = self.amixer_contents() else {
             // Legacy ESS fallback when discovery fails.
             self.volume_numid = Some(1);
+            self.volume_min = 0;
             self.volume_max = 100;
             self.mute_numid = Some(2);
             warn!(card = self.card, "amixer contents unavailable; using numid 1/2 fallback");
@@ -38,18 +41,21 @@ impl AlsaMixer {
         };
 
         // Prefer a real Playback Volume control (SMSL USB, many USB DACs).
-        if let Some((numid, max)) = find_playback_volume(&contents) {
+        if let Some((numid, min, max)) = find_playback_volume(&contents) {
             self.volume_numid = Some(numid);
-            self.volume_max = max.max(1);
+            self.volume_min = min;
+            self.volume_max = if max > min { max } else { min + 1 };
             info!(
                 card = self.card,
                 numid,
+                min = self.volume_min,
                 max = self.volume_max,
                 "ALSA playback volume control detected"
             );
         } else {
             // ESS Sabre HAT convention in older tune-bridge setups.
             self.volume_numid = Some(1);
+            self.volume_min = 0;
             self.volume_max = 100;
             warn!(
                 card = self.card,
@@ -57,19 +63,16 @@ impl AlsaMixer {
             );
         }
 
-        if let Some(numid) = find_playback_switch(&contents) {
-            self.mute_numid = Some(numid);
-        } else {
-            self.mute_numid = Some(2);
-        }
+        // Only bind mute when a named Playback Switch exists. Blind numid=2
+        // after a successful discovery can poke an unrelated control on USB DACs.
+        self.mute_numid = find_playback_switch(&contents);
     }
 
     pub fn set_volume(&self, level: u8) -> bool {
-        let level = level.min(100) as u32;
         let Some(numid) = self.volume_numid else {
             return false;
         };
-        let raw = (level * self.volume_max + 50) / 100; // round
+        let raw = scale_level_to_raw(level, self.volume_min, self.volume_max);
         self.amixer_cset(&format!("numid={numid}"), &raw.to_string())
     }
 
@@ -112,8 +115,7 @@ impl AlsaMixer {
         let numid = self.volume_numid?;
         let output = self.amixer_cget(&format!("numid={numid}"))?;
         let raw = parse_int_value(&output)?;
-        let pct = (raw * 100 + self.volume_max / 2) / self.volume_max;
-        Some(pct.min(100) as u8)
+        Some(scale_raw_to_level(raw, self.volume_min, self.volume_max))
     }
 
     pub fn get_mute(&self) -> Option<bool> {
@@ -184,8 +186,25 @@ impl AlsaMixer {
     }
 }
 
-fn find_playback_volume(contents: &str) -> Option<(u32, u32)> {
-    let mut best: Option<(u32, u32)> = None;
+/// Map protocol level 0–100 onto the control's `[min, max]` range (rounded).
+fn scale_level_to_raw(level: u8, min: i32, max: i32) -> i32 {
+    let level = i32::from(level.min(100));
+    let span = max - min;
+    min + (level * span + 50) / 100
+}
+
+/// Inverse of [`scale_level_to_raw`].
+fn scale_raw_to_level(raw: i32, min: i32, max: i32) -> u8 {
+    let span = max - min;
+    if span == 0 {
+        return 0;
+    }
+    let pct = ((raw - min) * 100 + span / 2) / span;
+    pct.clamp(0, 100) as u8
+}
+
+fn find_playback_volume(contents: &str) -> Option<(u32, i32, i32)> {
+    let mut best: Option<(u32, i32, i32)> = None;
     for block in contents.split("numid=") {
         let Some(first_line) = block.lines().next() else {
             continue;
@@ -204,11 +223,13 @@ fn find_playback_volume(contents: &str) -> Option<(u32, u32)> {
         if !lower.contains("iface=mixer") {
             continue;
         }
-        let max = parse_max_value(block).unwrap_or(100);
-        // Prefer the first stereo/main control (lowest numid wins if several).
+        let min = parse_range_value(block, "min=").unwrap_or(0);
+        let max = parse_range_value(block, "max=").unwrap_or(100);
+        // Lowest numid wins when several * Playback Volume controls exist
+        // (Master / PCM / Headphone…); good enough until a real card needs more.
         match best {
-            Some((n, _)) if numid >= n => {}
-            _ => best = Some((numid, max)),
+            Some((n, _, _)) if numid >= n => {}
+            _ => best = Some((numid, min, max)),
         }
     }
     best
@@ -230,6 +251,7 @@ fn find_playback_switch(contents: &str) -> Option<u32> {
         if !lower.contains("playback switch") || !lower.contains("iface=mixer") {
             continue;
         }
+        // Same lowest-numid heuristic as volume when several switches exist.
         match best {
             Some(n) if numid >= n => {}
             _ => best = Some(numid),
@@ -238,14 +260,20 @@ fn find_playback_switch(contents: &str) -> Option<u32> {
     best
 }
 
-fn parse_max_value(block: &str) -> Option<u32> {
+fn parse_range_value(block: &str, key: &str) -> Option<i32> {
     for line in block.lines() {
         let trimmed = line.trim();
         // "; type=INTEGER,access=rw---R--,values=2,min=0,max=127,step=0"
-        if let Some(idx) = trimmed.find("max=") {
-            let rest = &trimmed[idx + 4..];
-            let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-            if let Ok(v) = num.parse::<u32>() {
+        // Also handles negative mins: "min=-127,max=0"
+        if let Some(idx) = trimmed.find(key) {
+            let rest = &trimmed[idx + key.len()..];
+            let num: String = rest
+                .chars()
+                .enumerate()
+                .take_while(|(i, c)| c.is_ascii_digit() || (*i == 0 && *c == '-'))
+                .map(|(_, c)| c)
+                .collect();
+            if let Ok(v) = num.parse::<i32>() {
                 return Some(v);
             }
         }
@@ -253,7 +281,7 @@ fn parse_max_value(block: &str) -> Option<u32> {
     None
 }
 
-fn parse_int_value(output: &str) -> Option<u32> {
+fn parse_int_value(output: &str) -> Option<i32> {
     for line in output.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with(": values=") {
@@ -283,7 +311,60 @@ numid=4,iface=MIXER,name='SMSL USB AUDIO  Playback Volume'
   ; type=INTEGER,access=rw---R--,values=2,min=0,max=127,step=0
   : values=127,127
 "#;
-        assert_eq!(find_playback_volume(contents), Some((4, 127)));
+        assert_eq!(find_playback_volume(contents), Some((4, 0, 127)));
         assert_eq!(find_playback_switch(contents), Some(2));
+    }
+
+    #[test]
+    fn detects_volume_with_nonzero_min() {
+        let contents = r#"
+numid=3,iface=MIXER,name='PCM Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=2,min=64,max=255,step=1
+  : values=255,255
+"#;
+        assert_eq!(find_playback_volume(contents), Some((3, 64, 255)));
+        assert_eq!(find_playback_switch(contents), None);
+    }
+
+    #[test]
+    fn detects_volume_with_negative_min() {
+        let contents = r#"
+numid=5,iface=MIXER,name='Master Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=2,min=-127,max=0,step=1
+  : values=0,0
+"#;
+        assert_eq!(find_playback_volume(contents), Some((5, -127, 0)));
+    }
+
+    #[test]
+    fn scale_respects_min_max() {
+        assert_eq!(scale_level_to_raw(0, 0, 127), 0);
+        assert_eq!(scale_level_to_raw(100, 0, 127), 127);
+        assert_eq!(scale_level_to_raw(50, 0, 127), 64);
+
+        assert_eq!(scale_level_to_raw(0, 64, 255), 64);
+        assert_eq!(scale_level_to_raw(100, 64, 255), 255);
+        assert_eq!(scale_level_to_raw(0, -127, 0), -127);
+        assert_eq!(scale_level_to_raw(100, -127, 0), 0);
+
+        assert_eq!(scale_raw_to_level(0, 0, 127), 0);
+        assert_eq!(scale_raw_to_level(127, 0, 127), 100);
+        assert_eq!(scale_raw_to_level(64, 64, 255), 0);
+        assert_eq!(scale_raw_to_level(255, 64, 255), 100);
+        assert_eq!(scale_raw_to_level(-127, -127, 0), 0);
+        assert_eq!(scale_raw_to_level(0, -127, 0), 100);
+    }
+
+    #[test]
+    fn lowest_numid_wins_among_several_volumes() {
+        let contents = r#"
+numid=8,iface=MIXER,name='Headphone Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=2,min=0,max=100,step=1
+  : values=100,100
+numid=4,iface=MIXER,name='PCM Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=2,min=0,max=100,step=1
+  : values=100,100
+"#;
+        assert_eq!(find_playback_volume(contents), Some((4, 0, 100)));
     }
 }
