@@ -26,7 +26,9 @@ use tracing::{error, info, warn};
 
 use oaat_core::format::AudioFormat;
 
-const RING_BUFFER_FRAMES: usize = 48000;
+fn ring_buffer_frames(sample_rate: u32) -> usize {
+    sample_rate.max(48000) as usize
+}
 
 /// Names that indicate a built-in / onboard audio device (not a USB DAC).
 const BUILTIN_DEVICE_KEYWORDS: &[&str] = &[
@@ -361,7 +363,7 @@ impl CpalOutput {
 
         let ring_format = self.ring_format;
         let bps = ring_format.bytes_per_sample();
-        let ring_size = RING_BUFFER_FRAMES * channels as usize * bps;
+        let ring_size = ring_buffer_frames(sample_rate) * channels as usize * bps;
         let config = StreamConfig {
             channels: channels as u16,
             sample_rate: SampleRate(sample_rate),
@@ -765,5 +767,14 @@ mod tests {
             let b = f.to_le_bytes();
             assert_eq!(RingFormat::F32.to_i32(&b) >> 8, v);
         }
+    }
+
+    #[test]
+    fn ring_buffer_frames_scales_by_sample_rate() {
+        assert_eq!(ring_buffer_frames(44100), 48000);
+        assert_eq!(ring_buffer_frames(48000), 48000);
+        assert_eq!(ring_buffer_frames(96000), 96000);
+        assert_eq!(ring_buffer_frames(192000), 192000);
+        assert_eq!(ring_buffer_frames(384000), 384000);
     }
 }
