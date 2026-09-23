@@ -167,6 +167,8 @@ pub struct CpalOutput {
     /// stream type, volume 100%, unmuted). Diagnostic, refreshed on
     /// configure.
     bit_perfect: Arc<AtomicU8>,
+    /// Mid-playback underruns: ring buffer ran dry while `playing` was true.
+    underruns: Arc<AtomicU64>,
     /// Resolved cpal device + sample type support, keyed by the requested
     /// name. Device and config enumeration cost ~1-2 s on macOS: paying
     /// them on every configure() eats the PTS scheduling lead time.
@@ -231,6 +233,7 @@ impl CpalOutput {
             correction: Arc::new(AtomicI64::new(0)),
             net_adjust: Arc::new(AtomicI64::new(0)),
             bit_perfect: Arc::new(AtomicU8::new(0)),
+            underruns: Arc::new(AtomicU64::new(0)),
             cached_device: None,
             #[cfg(feature = "flac")]
             flac_stream: None,
@@ -374,7 +377,9 @@ impl CpalOutput {
         self.samples_played.store(0, Ordering::Relaxed);
         self.correction.store(0, Ordering::Relaxed);
         self.net_adjust.store(0, Ordering::Relaxed);
+        self.underruns.store(0, Ordering::Relaxed);
         let samples_played = self.samples_played.clone();
+        let underruns = self.underruns.clone();
 
         let rb = HeapRb::<u8>::new(ring_size);
         let (producer, mut consumer) = rb.split();
@@ -429,6 +434,9 @@ impl CpalOutput {
                         }
                         let got = consumer.pop_slice(&mut scratch[..want_bytes]);
                         let samples = got / bps;
+                        if samples < output.len() {
+                            underruns.fetch_add(1, Ordering::Relaxed);
+                        }
                         samples_played.fetch_add(samples as u64, Ordering::Relaxed);
                         for (i, out) in output.iter_mut().enumerate() {
                             *out = if i < samples {
@@ -657,6 +665,10 @@ impl CpalOutput {
         Some(adjusted.max(0) as u64)
     }
 
+    pub fn underrun_count(&self) -> u64 {
+        self.underruns.load(Ordering::Relaxed)
+    }
+
     /// Queue a drift correction. Positive `frames`: playback is behind, frames
     /// will be skipped. Negative: playback is ahead, frames will be duplicated.
     /// Replaces (not accumulates) the pending correction so a stale command
@@ -765,5 +777,20 @@ mod tests {
             let b = f.to_le_bytes();
             assert_eq!(RingFormat::F32.to_i32(&b) >> 8, v);
         }
+    }
+
+    #[test]
+    fn underrun_counter_reset_on_new() {
+        let out = CpalOutput::new();
+        assert_eq!(out.underrun_count(), 0);
+    }
+
+    #[test]
+    fn underrun_counter_increments_and_resets() {
+        let out = CpalOutput::new();
+        out.underruns.fetch_add(3, Ordering::Relaxed);
+        assert_eq!(out.underrun_count(), 3);
+        out.underruns.store(0, Ordering::Relaxed);
+        assert_eq!(out.underrun_count(), 0);
     }
 }
