@@ -38,6 +38,10 @@ impl ClockState {
         // debug and poison the EMA with a wrapped huge value in release.
         let rtt = ((t4 as i128 - t1 as i128) - (t3 as i128 - t2 as i128)).max(0) as f64;
 
+        if self.samples >= self.bootstrap_count && rtt > self.rtt_ns * 3.0 {
+            return;
+        }
+
         if self.samples == 0 {
             self.offset_ns = offset;
             self.rtt_ns = rtt;
@@ -204,5 +208,31 @@ mod tests {
         let mut clock = ClockState::new();
         clock.update(1000, 1060, 1065, 1025);
         assert_eq!(clock.suggested_interval_ms(), 100);
+    }
+
+    #[test]
+    fn rtt_outlier_rejected_after_bootstrap() {
+        let mut clock = ClockState::new();
+        // Bootstrap with 2ms RTT, 50ns offset
+        for _ in 0..20 {
+            clock.update(1_000_000, 1_001_050, 1_001_055, 1_003_000);
+        }
+        assert!(clock.is_bootstrapped());
+        let offset_before = clock.offset_ns();
+        let rtt_before = clock.rtt_ns();
+
+        // Inject one 500ms RTT outlier (>3× the 2ms baseline)
+        clock.update(1_000_000, 1_001_050, 1_001_055, 501_000_000);
+        assert_eq!(clock.offset_ns(), offset_before, "offset must not shift on RTT outlier");
+        assert_eq!(clock.rtt_ns(), rtt_before, "rtt must not shift on RTT outlier");
+    }
+
+    #[test]
+    fn rtt_outlier_accepted_during_bootstrap() {
+        let mut clock = ClockState::new();
+        clock.update(1_000_000, 1_001_050, 1_001_055, 1_003_000);
+        // High-RTT sample during bootstrap must be accepted (no baseline yet)
+        clock.update(1_000_000, 1_001_050, 1_001_055, 501_000_000);
+        assert_eq!(clock.samples(), 2);
     }
 }
