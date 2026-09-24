@@ -75,6 +75,7 @@ pub struct Zone {
     endpoints: HashMap<String, EndpointEntry>,
     config: ControllerConfig,
     sequence: u16,
+    clock_sequence: u16,
     volume: VolumeMap,
     active_stream: Option<ActiveStream>,
     fec_encoder: Option<oaat_core::fec::FecEncoder>,
@@ -89,6 +90,7 @@ impl Zone {
             endpoints: HashMap::new(),
             config,
             sequence: 0,
+            clock_sequence: 0,
             volume: VolumeMap::new(),
             active_stream: None,
             fec_encoder: None,
@@ -597,8 +599,8 @@ impl Zone {
 
     pub async fn clock_sync_all(&mut self) {
         for (id, entry) in &mut self.endpoints {
-            let seq = self.sequence;
-            self.sequence = self.sequence.wrapping_add(1);
+            let seq = self.clock_sequence;
+            self.clock_sequence = self.clock_sequence.wrapping_add(1);
             if let Err(e) = entry.endpoint.clock_sync_once(seq).await {
                 warn!(endpoint = %id, error = %e, "clock sync failed");
             }
