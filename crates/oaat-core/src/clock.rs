@@ -106,12 +106,12 @@ impl ClockState {
 
     /// Convert a local timestamp to controller clock domain.
     pub fn local_to_controller(&self, local_ns: u64) -> u64 {
-        (local_ns as i64 + self.offset_ns()) as u64
+        (local_ns as i64).saturating_add(self.offset_ns()).max(0) as u64
     }
 
     /// Convert a controller timestamp to local clock domain.
     pub fn controller_to_local(&self, controller_ns: u64) -> u64 {
-        (controller_ns as i64 - self.offset_ns()) as u64
+        (controller_ns as i64).saturating_sub(self.offset_ns()).max(0) as u64
     }
 }
 
@@ -204,5 +204,16 @@ mod tests {
         let mut clock = ClockState::new();
         clock.update(1000, 1060, 1065, 1025);
         assert_eq!(clock.suggested_interval_ms(), 100);
+    }
+
+    #[test]
+    fn timestamp_conversion_saturates_on_overflow() {
+        let mut cs = ClockState::default();
+        cs.update(0, 1_000_000, 1_000_000, 2_000_000);
+        assert_eq!(cs.local_to_controller(0), 0);
+        assert_eq!(cs.controller_to_local(0), 0);
+        let big = u64::MAX / 2;
+        let result = cs.local_to_controller(big);
+        assert!(result > 0);
     }
 }
