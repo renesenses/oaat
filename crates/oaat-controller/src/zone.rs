@@ -714,8 +714,6 @@ fn spawn_endpoint_clock_sync(ep: &ConnectedEndpoint) -> tokio::task::JoinHandle<
 }
 
 fn now_ns() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
 }
