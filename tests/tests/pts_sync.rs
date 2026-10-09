@@ -369,3 +369,81 @@ async fn endpoint_clock_bootstraps_against_controller_responder() {
     let there_and_back = shared_clock.controller_to_local(shared_clock.local_to_controller(local));
     assert_eq!(there_and_back, local);
 }
+
+#[tokio::test]
+async fn truncated_udp_packet_is_dropped() {
+    use oaat_core::wire::{AUDIO_HEADER_SIZE, AudioPacketHeader};
+
+    init_tracing();
+
+    let (control, audio, clock) = reserve_endpoint_ports().await;
+    let ep_config = endpoint_config(control, audio, clock);
+
+    let (event_tx, mut event_rx) = mpsc::channel(64);
+    let (_ctrl_tx, ctrl_rx) = mpsc::channel(32);
+    let _ep = tokio::spawn(async move {
+        EndpointTransport::run(ep_config, event_tx, ctrl_rx)
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let ctrl_config = ControllerConfig {
+        controller_id: "ctrl-trunc".into(),
+        controller_name: "Truncation Test Controller".into(),
+        features: vec![],
+        clock_port: 0,
+        tls: false,
+    };
+    let _endpoint = ConnectedEndpoint::connect(&ctrl_config, control).await.unwrap();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    let make_packet = |seq: u16, payload: &[u8], claimed_len: u16| -> Vec<u8> {
+        let header = AudioPacketHeader {
+            version: 1,
+            flags: PacketFlags::empty(),
+            format: AudioFormat::PcmS16le,
+            sequence: seq,
+            stream_id: 1,
+            pts_ns: 1_000_000 * seq as u64,
+            sample_offset: 480 * seq as u64,
+            payload_len: claimed_len,
+            fec_group_size: 0,
+            fec_index: 0,
+            fec_len_xor: 0,
+        };
+        let mut buf = vec![0u8; AUDIO_HEADER_SIZE + payload.len()];
+        let mut hdr = [0u8; AUDIO_HEADER_SIZE];
+        header.encode(&mut hdr);
+        buf[..AUDIO_HEADER_SIZE].copy_from_slice(&hdr);
+        buf[AUDIO_HEADER_SIZE..].copy_from_slice(payload);
+        buf
+    };
+
+    let truncated = make_packet(0, &[0xAAu8; 50], 100);
+    sock.send_to(&truncated, audio).await.unwrap();
+
+    let good_payload = vec![0xBBu8; 80];
+    let good = make_packet(1, &good_payload, 80);
+    sock.send_to(&good, audio).await.unwrap();
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+        .await
+        .expect("timed out — no packet arrived")
+        .unwrap();
+
+    if let EndpointEvent::AudioPacket { header, payload } = event {
+        assert_eq!(header.sequence, 1, "truncated packet (seq 0) must be dropped");
+        assert_eq!(payload, good_payload);
+    } else {
+        panic!("expected AudioPacket event");
+    }
+
+    let extra = tokio::time::timeout(std::time::Duration::from_millis(200), event_rx.recv()).await;
+    assert!(extra.is_err(), "truncated packet must not produce an event");
+}

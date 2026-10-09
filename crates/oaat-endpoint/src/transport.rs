@@ -742,6 +742,16 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
                 Ok(h) => h,
                 Err(_) => continue,
             };
+            let actual_payload_len = n - AUDIO_HEADER_SIZE;
+            if actual_payload_len != header.payload_len as usize {
+                warn!(
+                    seq = header.sequence,
+                    expected = header.payload_len,
+                    actual = actual_payload_len,
+                    "truncated UDP packet, dropping",
+                );
+                continue;
+            }
             let payload = buf[AUDIO_HEADER_SIZE..n].to_vec();
 
             // Flush the group on stream end so trailing packets are not
