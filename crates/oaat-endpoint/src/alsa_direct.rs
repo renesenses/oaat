@@ -550,7 +550,15 @@ fn apply_volume(format: AudioFormat, data: &[u8], vol: f32) -> Vec<u8> {
             }
             out
         }
-        AudioFormat::PcmS32le | AudioFormat::PcmS24le4 | AudioFormat::PcmF32le => {
+        AudioFormat::PcmF32le => {
+            let mut out = data.to_vec();
+            for chunk in out.as_chunks_mut::<4>().0 {
+                let s = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                chunk.copy_from_slice(&(s * vol).to_le_bytes());
+            }
+            out
+        }
+        AudioFormat::PcmS32le | AudioFormat::PcmS24le4 => {
             let mut out = data.to_vec();
             for chunk in out.as_chunks_mut::<4>().0 {
                 let s = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
@@ -724,6 +732,35 @@ mod tests {
             "hw:CARD=AUDIO,DEV=0"
         );
         assert_eq!(dsd_hw_device("hw:3,0"), "hw:3,0");
+    }
+
+    #[test]
+    fn le_volume_f32_multiplie_en_float() {
+        let sample: f32 = 0.8;
+        let input = sample.to_le_bytes();
+        let out = apply_volume(AudioFormat::PcmF32le, &input, 0.5);
+        let got = f32::from_le_bytes([out[0], out[1], out[2], out[3]]);
+        assert!(
+            (got - 0.4).abs() < 1e-6,
+            "F32 volume: expected ~0.4, got {got}"
+        );
+    }
+
+    #[test]
+    fn le_volume_f32_negatif() {
+        let sample: f32 = -0.6;
+        let input = sample.to_le_bytes();
+        let out = apply_volume(AudioFormat::PcmF32le, &input, 0.5);
+        let got = f32::from_le_bytes([out[0], out[1], out[2], out[3]]);
+        assert!(
+            (got - (-0.3)).abs() < 1e-6,
+            "F32 negative volume: expected ~-0.3, got {got}"
+        );
+    }
+
+    #[test]
+    fn f32_maps_to_float_le() {
+        assert_eq!(format_to_alsa(AudioFormat::PcmF32le), Some("FLOAT_LE"));
     }
 
     #[test]
