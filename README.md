@@ -163,6 +163,18 @@ MozAIk Labs. Neither licence grants trademark rights: see
 [TRADEMARKS.md](TRADEMARKS.md) for what you may do without asking and what
 needs permission. The conformance tool is `oaat-test`.
 
+## Contributing
+
+Contributions are welcome by pull request. They follow the
+[Community Specification Contribution Policy](Contributing.md) and are made
+under the [Contributor License Agreement](CONTRIBUTOR-LICENSE-AGREEMENT.md),
+accepted by the act of contributing; there is no CLA bot. In addition, as a
+contribution policy of this repository, every commit must carry a
+[Developer Certificate of Origin](https://developercertificate.org/) sign-off
+(`Signed-off-by: Your Name <you@example.com>`, added by `git commit -s`), for
+the specification and the code alike. Code of Conduct: see
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md); contact in [Notices.md](Notices.md).
+
 ## Author
 
 Bertrand Clech / MozAIk Labs

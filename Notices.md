@@ -2,7 +2,7 @@
 
 ## Code of Conduct
 
-Contact for Code of Conduct issues or inquires:  Bertrand Clech, bertrand@mozaiklabs.fr (GitHub: @renesenses)
+Contact for Code of Conduct issues or inquires:  bertrand@mozaiklabs.fr
 
 
 ## License Acceptance
