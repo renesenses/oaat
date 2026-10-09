@@ -4,11 +4,26 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Le 02/09/2026, la CI est repartie ROUGE sans qu'une seule ligne n'ait
+  # change : clippy 1.98 a promu `chunks_exact_to_as_chunks` en erreur, et
+  # `-D warnings` sur une toolchain flottante a fait le reste. Le dernier run
+  # vert datait du 12/08 — trois semaines sans exécution faute de commit. Le
+  # rouge a donc ete decouvert par hasard, en ouvrant une PR de documentation,
+  # juste apres avoir annonce publiquement que la specification etait ouverte.
+  #
+  # Ce rendez-vous hebdomadaire n'empeche rien : il change QUI decouvre la
+  # derive, et QUAND.
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Build et tests sur stable FLOTTANT : c'est ce qu'on veut. Une vraie
+  # regression de compilation ou de comportement doit se voir des la version
+  # qui l'introduit.
   check:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
@@ -26,8 +41,6 @@ jobs:
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
 
       - name: Cache cargo registry & target
         uses: actions/cache@v4
@@ -45,6 +58,46 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+  # Clippy sur une version EPINGLEE, et sur Linux seulement.
+  #
+  # Pourquoi epinglee : `-D warnings` transforme chaque nouveau lint en erreur
+  # de compilation, y compris purement stylistique. Sur une toolchain
+  # flottante, un depot dont le code n'a pas bouge d'une ligne devient rouge
+  # parce que la definition de « warning » a bouge. Ce n'est pas une
+  # regression, et ca ne doit pas bloquer une PR de documentation.
+  #
+  # Pourquoi Linux seulement : tout le code specifique a une plateforme est
+  # derriere `cfg(target_os = "linux")` (`alsa_direct`). Aucun `cfg` macOS ni
+  # Windows dans le depot — lanter sur macOS ne voit rien de plus.
+  #
+  # Cette version se monte a la main, delibérément : bumper le pin est un
+  # geste separe, avec sa PR et ses corrections de lints, jamais un effet de
+  # bord d'un mardi matin.
+  clippy:
+    name: clippy (pinned)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ALSA dev
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - name: Install Rust 1.98.0
+        uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: clippy
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: clippy-1.98.0-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            clippy-1.98.0-cargo-
 
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
