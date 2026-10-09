@@ -11,6 +11,8 @@ use oaat_core::message::*;
 use oaat_core::wire::{AUDIO_HEADER_SIZE, AudioPacketHeader, ClockSyncPacket, ClockSyncType};
 use oaat_core::{Message, OaatError, PROTOCOL_VERSION};
 
+use crate::clock::{ClockMeasurement, SharedTimeSource, SystemTimeSource};
+
 #[derive(Clone)]
 pub struct ControllerConfig {
     pub controller_id: String,
@@ -40,6 +42,7 @@ pub struct ConnectedEndpoint {
     pub(crate) clock_socket: Arc<UdpSocket>,
     pub(crate) clock_target: SocketAddr,
     pub(crate) clock_state: Arc<Mutex<ClockState>>,
+    pub(crate) time_source: SharedTimeSource,
     sequence: u16,
     pub response_rx: mpsc::Receiver<EndpointResponse>,
     reader_task: tokio::task::JoinHandle<()>,
@@ -55,6 +58,20 @@ impl ConnectedEndpoint {
     pub async fn connect(
         config: &ControllerConfig,
         endpoint_addr: SocketAddr,
+    ) -> Result<Self, OaatError> {
+        Self::connect_with_time_source(config, endpoint_addr, Arc::new(SystemTimeSource)).await
+    }
+
+    /// Connect using an explicit controller clock.
+    ///
+    /// The regular [`Self::connect`] remains the production entry point. This
+    /// seam is deliberately narrow so deterministic conformance tests can
+    /// drive bootstrap and steady-state synchronization through the real
+    /// transport.
+    pub async fn connect_with_time_source(
+        config: &ControllerConfig,
+        endpoint_addr: SocketAddr,
+        time_source: SharedTimeSource,
     ) -> Result<Self, OaatError> {
         let stream = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -94,16 +111,17 @@ impl ConnectedEndpoint {
                 info!(fingerprint = %fp, "TLS connected (TOFU)");
             }
 
-            return Self::handshake_and_spawn(config, endpoint_addr, tls_stream).await;
+            return Self::handshake_and_spawn(config, endpoint_addr, tls_stream, time_source).await;
         }
 
-        Self::handshake_and_spawn(config, endpoint_addr, stream).await
+        Self::handshake_and_spawn(config, endpoint_addr, stream, time_source).await
     }
 
     async fn handshake_and_spawn<S>(
         config: &ControllerConfig,
         endpoint_addr: SocketAddr,
         stream: S,
+        time_source: SharedTimeSource,
     ) -> Result<Self, OaatError>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -253,6 +271,7 @@ impl ConnectedEndpoint {
             clock_socket,
             clock_target,
             clock_state: Arc::new(Mutex::new(ClockState::new())),
+            time_source,
             sequence: 0,
             response_rx,
             reader_task,
@@ -374,7 +393,7 @@ impl ConnectedEndpoint {
 
     /// Run clock sync exchange. Returns (offset_ns, rtt_ns) after this sample.
     pub async fn clock_sync_once(&mut self, seq: u16) -> Result<(i64, u64), OaatError> {
-        let t1 = now_ns();
+        let t1 = self.time_source.now_ns();
         let request = ClockSyncPacket {
             version: 1,
             kind: ClockSyncType::Request,
@@ -389,7 +408,7 @@ impl ConnectedEndpoint {
 
         let mut resp_buf = [0u8; ClockSyncPacket::SIZE];
         let _ = self.clock_socket.recv(&mut resp_buf).await?;
-        let t4 = now_ns();
+        let t4 = self.time_source.now_ns();
 
         let response = ClockSyncPacket::decode(&resp_buf)?;
 
@@ -413,16 +432,22 @@ impl ConnectedEndpoint {
         self.clock_state.lock().await.offset_ns()
     }
 
+    /// Latest immutable clock estimate, or `None` until one valid exchange
+    /// has completed.
+    pub async fn clock_measurement(&self) -> Option<ClockMeasurement> {
+        let state = self.clock_state.lock().await;
+        (state.samples() > 0).then(|| ClockMeasurement {
+            samples: state.samples(),
+            bootstrapped: state.is_bootstrapped(),
+            offset_ns: state.offset_ns(),
+            rtt_ns: state.rtt_ns(),
+            jitter_ns: state.jitter_ns().round().max(0.0) as u64,
+        })
+    }
+
     /// Check whether the TCP reader task is still running.
     /// Returns `false` once the endpoint has disconnected or the reader errored out.
     pub fn is_reader_alive(&self) -> bool {
         !self.reader_task.is_finished()
     }
-}
-
-fn now_ns() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64
 }

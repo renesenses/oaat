@@ -13,6 +13,7 @@ use oaat_core::{
 
 use crate::manager::{EndpointSnapshot, EndpointState};
 use crate::transport::{ConnectedEndpoint, ControllerConfig};
+use crate::{EndpointClockSnapshot, SharedTimeSource, SystemTimeSource};
 
 /// Per-endpoint volume offset model.
 /// Effective volume = clamp(master + offset, 0, 100).
@@ -79,10 +80,22 @@ pub struct Zone {
     active_stream: Option<ActiveStream>,
     fec_encoder: Option<oaat_core::fec::FecEncoder>,
     play_delay_override_ms: Option<u64>,
+    time_source: SharedTimeSource,
 }
 
 impl Zone {
     pub fn new(zone_id: String, name: String, config: ControllerConfig) -> Self {
+        Self::new_with_time_source(zone_id, name, config, std::sync::Arc::new(SystemTimeSource))
+    }
+
+    /// Build a zone with an explicit controller clock while preserving the
+    /// existing production constructor.
+    pub fn new_with_time_source(
+        zone_id: String,
+        name: String,
+        config: ControllerConfig,
+        time_source: SharedTimeSource,
+    ) -> Self {
         Self {
             zone_id,
             name,
@@ -93,6 +106,7 @@ impl Zone {
             active_stream: None,
             fec_encoder: None,
             play_delay_override_ms: None,
+            time_source,
         }
     }
 
@@ -161,10 +175,29 @@ impl Zone {
             .collect()
     }
 
+    /// Immutable clock evidence for every endpoint, including explicit
+    /// `None` measurements when synchronization has not produced a sample.
+    pub async fn endpoint_clock_snapshots(&self) -> Vec<EndpointClockSnapshot> {
+        let mut snapshots = Vec::with_capacity(self.endpoints.len());
+        for (endpoint_id, entry) in &self.endpoints {
+            snapshots.push(EndpointClockSnapshot {
+                endpoint_id: endpoint_id.clone(),
+                measurement: entry.endpoint.clock_measurement().await,
+            });
+        }
+        snapshots.sort_by(|a, b| a.endpoint_id.cmp(&b.endpoint_id));
+        snapshots
+    }
+
     // -- Endpoint lifecycle --
 
     pub async fn add_endpoint(&mut self, addr: SocketAddr) -> Result<String, OaatError> {
-        let mut ep = ConnectedEndpoint::connect(&self.config, addr).await?;
+        let mut ep = ConnectedEndpoint::connect_with_time_source(
+            &self.config,
+            addr,
+            self.time_source.clone(),
+        )
+        .await?;
 
         if let Err(e) = ep.clock_sync_bootstrap().await {
             warn!(error = %e, "clock sync failed for endpoint, continuing");
@@ -665,6 +698,7 @@ fn spawn_endpoint_clock_sync(ep: &ConnectedEndpoint) -> tokio::task::JoinHandle<
     let clock_socket = ep.clock_socket.clone();
     let clock_target = ep.clock_target;
     let clock_state = ep.clock_state.clone();
+    let time_source = ep.time_source.clone();
     let ep_id = ep.info.endpoint_id.clone();
 
     tokio::spawn(async move {
@@ -672,7 +706,7 @@ fn spawn_endpoint_clock_sync(ep: &ConnectedEndpoint) -> tokio::task::JoinHandle<
         let mut current_interval_ms: u64 = 2000;
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(current_interval_ms)).await;
-            let t1 = now_ns();
+            let t1 = time_source.now_ns();
             let request = oaat_core::wire::ClockSyncPacket {
                 version: 1,
                 kind: oaat_core::wire::ClockSyncType::Request,
@@ -696,7 +730,7 @@ fn spawn_endpoint_clock_sync(ep: &ConnectedEndpoint) -> tokio::task::JoinHandle<
             .await
             {
                 Ok(Ok(_)) => {
-                    let t4 = now_ns();
+                    let t4 = time_source.now_ns();
                     if let Ok(response) = oaat_core::wire::ClockSyncPacket::decode(&resp_buf) {
                         let mut state = clock_state.lock().await;
                         state.update(t1, response.t2, response.t3, t4);
@@ -711,11 +745,4 @@ fn spawn_endpoint_clock_sync(ep: &ConnectedEndpoint) -> tokio::task::JoinHandle<
             seq = seq.wrapping_add(1);
         }
     })
-}
-
-fn now_ns() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64
 }
