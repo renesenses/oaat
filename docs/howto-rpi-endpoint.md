@@ -31,7 +31,7 @@ OAAT (Open Advanced Audio Transport) is a network audio transport protocol whose
 
 | | OAAT | RAAT (Roon) | DLNA/UPnP | AirPlay 2 |
 |---|---|---|---|---|
-| Specification licence | CC BY 4.0 + patent grant\* | Proprietary | UPnP Forum | Apple |
+| Specification licence | Community Spec 1.0\* | Proprietary | UPnP Forum | Apple |
 | Implementation licence | Apache 2.0\*\* | Proprietary | Varies | Apple |
 | Bit-perfect | Yes | Yes | Depends | No |
 | Native DSD | Yes | Yes | DoP only | No |
@@ -620,8 +620,9 @@ The setup described here is already 100% headless. Once flashed and booted, the 
 **Two different things, two different licences.**
 
 \* **The protocol specification** (`docs/rfc.md`) is an open standard:
-[CC BY 4.0](LICENSE-SPEC.md), with a **royalty-free patent and implementation
-grant**. Anyone — including a manufacturer shipping a commercial device — may
+the [Community Specification License 1.0](LICENSE-SPEC.md), with
+**royalty-free patent licences** from every contributor and between
+implementers. Anyone — including a manufacturer shipping a commercial device — may
 implement OAAT. No fee, no certification cost, no separate agreement to
 negotiate.
 
@@ -630,10 +631,6 @@ negotiate.
 sell — there is nothing to negotiate and nobody to notify.
 
 Nothing in this guide requires permission from anyone.
-
-> ⚠️ The specification licence still carries a **DRAFT — pending legal review**
-> notice. It should not be relied upon for a commercial decision until that
-> notice has been removed.
 
 ---
 

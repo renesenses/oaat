@@ -1,7 +1,7 @@
 # OAAT — Open Advanced Audio Transport
 
 [![CI](https://github.com/renesenses/oaat/actions/workflows/ci.yml/badge.svg)](https://github.com/renesenses/oaat/actions)
-[![Spec: CC BY 4.0](https://img.shields.io/badge/Spec-CC_BY_4.0-brightgreen.svg)](docs/LICENSE-SPEC.md)
+[![Spec: Community Specification License 1.0](https://img.shields.io/badge/Spec-Community_Spec_1.0-brightgreen.svg)](LICENSE.md)
 [![Implementation: Apache 2.0](https://img.shields.io/badge/Implementation-Apache_2.0-brightgreen.svg)](LICENSE)
 
 A bit-perfect, multi-room audio streaming protocol: an **open specification**,
@@ -104,7 +104,7 @@ oaat-test 192.168.1.50:9740
 
 | Feature | OAAT | RAAT | DLNA | AirPlay 2 | OpenHome |
 |---------|------|------|------|-----------|----------|
-| Spec license | CC BY 4.0* | Proprietary | UPnP Forum | Apple | BSD |
+| Spec license | Community Spec 1.0* | Proprietary | UPnP Forum | Apple | BSD |
 | Implementation license | Apache 2.0** | Proprietary | Varies | Apple | BSD |
 | Bit-perfect | Yes | Yes | Depends | No | Yes |
 | DSD native | Yes | Yes | DoP only | No | DoP |
@@ -119,11 +119,33 @@ oaat-test 192.168.1.50:9740
 
 **Two different things, two different licences.**
 
-\* **The protocol specification** (`docs/rfc.md`) is an open standard:
-[CC BY 4.0](docs/LICENSE-SPEC.md) with a **royalty-free patent and
-implementation grant**. Anyone — including a manufacturer shipping a commercial
-device — may implement OAAT. No fee, no certification cost, no separate
-agreement, nobody to ask.
+\* **The protocol specification** (`docs/rfc.md`) is an open standard under
+the [Community Specification License 1.0](LICENSE.md)
+([full text](Community_Specification_License-v1.md)), the licence also used by
+Sendspin, developed through the Joint Development Foundation. It grants, free of
+charge and royalty-free:
+
+- the right to copy, adapt and **translate** the text, with attribution;
+- a **patent licence from every contributor** for implementations of the
+  specification, within the [Scope](Scope.md);
+- a **reciprocal patent licence between implementers**, so that no implementer
+  can use its own patents against another.
+
+Anyone — including a manufacturer shipping a commercial device — may implement
+OAAT. No fee, no certification cost, nobody to ask. To benefit from the patent
+licences, include the [licence](Community_Specification_License-v1.md) with
+your implementation (in the root of a source distribution, or in the
+documentation or legal notices of a product), or add your name to
+[Notices.md](Notices.md) by pull request (Section 2.1.3).
+
+MozAIk Labs — Bertrand Clech contributes the specification as written to date
+under this licence. Maintainer and Editor, in the sense of the
+[Governance](Governance.md): Bertrand Clech (@renesenses). Contributions to the
+specification are made under the
+[Contributor License Agreement](CONTRIBUTOR-LICENSE-AGREEMENT.md); see
+[Contributing.md](Contributing.md). Earlier versions (up to RFC 0.3.0) were
+published under CC BY 4.0 with a royalty-free patent grant, which remains in
+effect for them — see [docs/LICENSE-SPEC.md](docs/LICENSE-SPEC.md).
 
 \*\* **The reference implementation** (`crates/`) is open source under the
 [Apache License 2.0](LICENSE). Embed it, modify it, ship it inside a product you
@@ -136,9 +158,22 @@ specification could offset: a manufacturer weighing two protocols compares the
 cost of integrating them, and rewriting the endpoint rather than importing it is
 a cost. The restriction protected nothing that existed, so it went.
 
-"OAAT" and the OAAT logo are trademarks of MozAIk Labs. Implementing the
-protocol does not grant the right to claim certification or endorsement; the
-conformance tool is `oaat-test`.
+"OAAT", "Open Advanced Audio Transport" and the OAAT logo are trademarks of
+MozAIk Labs. Neither licence grants trademark rights: see
+[TRADEMARKS.md](TRADEMARKS.md) for what you may do without asking and what
+needs permission. The conformance tool is `oaat-test`.
+
+## Contributing
+
+Contributions are welcome by pull request. They follow the
+[Community Specification Contribution Policy](Contributing.md) and are made
+under the [Contributor License Agreement](CONTRIBUTOR-LICENSE-AGREEMENT.md),
+accepted by the act of contributing; there is no CLA bot. In addition, as a
+contribution policy of this repository, every commit must carry a
+[Developer Certificate of Origin](https://developercertificate.org/) sign-off
+(`Signed-off-by: Your Name <you@example.com>`, added by `git commit -s`), for
+the specification and the code alike. Code of Conduct: see
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md); contact in [Notices.md](Notices.md).
 
 ## Author
 
