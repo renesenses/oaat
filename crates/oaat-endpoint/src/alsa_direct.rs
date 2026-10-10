@@ -335,7 +335,8 @@ impl AlsaDirectOutput {
             }
             Err(e) => {
                 warn!(error = %e, "audio output respawn failed");
-                self.respawn_backoff = (backoff * 2).clamp(RESPAWN_BACKOFF_MIN, RESPAWN_BACKOFF_MAX);
+                self.respawn_backoff =
+                    (backoff * 2).clamp(RESPAWN_BACKOFF_MIN, RESPAWN_BACKOFF_MAX);
                 self.respawn_at = Some(Instant::now() + self.respawn_backoff);
                 false
             }

@@ -68,7 +68,11 @@ fn aplay_is_respawned_after_unexpected_exit_with_bounded_backoff() {
     let script = dir.join("aplay");
     fs::write(&script, FAKE_APLAY).unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-    let path = format!("{}:{}", dir.display(), std::env::var("PATH").unwrap_or_default());
+    let path = format!(
+        "{}:{}",
+        dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
     // SAFETY: single-threaded at this point; this test binary holds one test.
     unsafe {
         std::env::set_var("PATH", path);
@@ -100,7 +104,10 @@ fn aplay_is_respawned_after_unexpected_exit_with_bounded_backoff() {
     // only the number of spawns is meaningful here.
     pump(&mut out, Duration::from_secs(3));
     let n = calls(&dir);
-    assert!((3..=6).contains(&n), "bounded retries, got {n} spawns in ~3 s");
+    assert!(
+        (3..=6).contains(&n),
+        "bounded retries, got {n} spawns in ~3 s"
+    );
     out.stop();
 
     let _ = fs::remove_dir_all(&dir);
