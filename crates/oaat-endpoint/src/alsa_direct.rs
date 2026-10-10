@@ -2,6 +2,7 @@ use std::io::Write;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use oaat_core::format::AudioFormat;
 use tracing::{error, info, warn};
@@ -40,7 +41,23 @@ pub struct AlsaDirectOutput {
     bytes_written: u64,
     device_name: Option<String>,
     underruns: Arc<AtomicU64>,
+    /// When the current child was spawned (to tell a stable run from a
+    /// crash loop).
+    spawned_at: Option<Instant>,
+    /// Pending automatic respawn after an unexpected child exit (#33).
+    /// Cleared by an intentional `stop()`.
+    respawn_at: Option<Instant>,
+    /// Current respawn backoff; doubles on each quick failure, capped.
+    respawn_backoff: Duration,
 }
+
+/// First automatic respawn delay after an unexpected aplay exit (#33).
+const RESPAWN_BACKOFF_MIN: Duration = Duration::from_millis(250);
+/// Respawn delay cap while the device keeps failing (e.g. DAC unplugged).
+const RESPAWN_BACKOFF_MAX: Duration = Duration::from_secs(8);
+/// A child that ran at least this long was healthy: the next failure starts
+/// the backoff over instead of continuing to double it.
+const RESPAWN_STABLE_RUN: Duration = Duration::from_secs(5);
 
 impl AlsaDirectOutput {
     pub fn list_devices() -> Vec<String> {
@@ -107,6 +124,9 @@ impl AlsaDirectOutput {
             bytes_written: 0,
             device_name: None,
             underruns: Arc::new(AtomicU64::new(0)),
+            spawned_at: None,
+            respawn_at: None,
+            respawn_backoff: Duration::ZERO,
         }
     }
 
@@ -233,6 +253,7 @@ impl AlsaDirectOutput {
         }
 
         self.bytes_written = 0;
+        self.spawned_at = Some(Instant::now());
         self.playing.store(false, Ordering::Relaxed);
 
         Ok(())
@@ -254,6 +275,71 @@ impl AlsaDirectOutput {
             let _ = child.wait();
         }
         self.bytes_written = 0;
+        // An intentional stop cancels any pending automatic recovery.
+        self.respawn_at = None;
+        self.respawn_backoff = Duration::ZERO;
+    }
+
+    /// The child died on its own (DAC unplugged, ALSA error, killed): plan a
+    /// respawn with capped exponential backoff. Never sleeps — the attempt is
+    /// made by a later `write_audio()` once the delay has elapsed (#33).
+    fn schedule_respawn(&mut self) {
+        if self.format == AudioFormat::Flac {
+            // The ffmpeg | aplay pipeline needs the FLAC stream header, which
+            // is only sent once: a midstream respawn cannot decode. Recovery
+            // stays with reconfigure/flush (next stream or seek).
+            warn!("FLAC pipeline exited: no automatic respawn, waiting for the next reconfigure");
+            return;
+        }
+        let stable = self
+            .spawned_at
+            .is_some_and(|t| t.elapsed() >= RESPAWN_STABLE_RUN);
+        self.respawn_backoff = if stable || self.respawn_backoff.is_zero() {
+            RESPAWN_BACKOFF_MIN
+        } else {
+            (self.respawn_backoff * 2).min(RESPAWN_BACKOFF_MAX)
+        };
+        self.respawn_at = Some(Instant::now() + self.respawn_backoff);
+        info!(
+            retry_in_ms = self.respawn_backoff.as_millis() as u64,
+            "audio output process will be respawned"
+        );
+    }
+
+    /// Respawn the child with the same device, format, rate and channels once
+    /// the backoff has elapsed. Volume and mute live in shared atomics and are
+    /// untouched; playback resumes since we only get here while playing.
+    fn try_respawn(&mut self) -> bool {
+        let Some(at) = self.respawn_at else {
+            return false;
+        };
+        if Instant::now() < at {
+            return false;
+        }
+        let backoff = self.respawn_backoff;
+        let (fmt, sr, ch, dev) = (
+            self.format,
+            self.sample_rate,
+            self.channels,
+            self.device_name.clone(),
+        );
+        // configure_with_device() starts with stop(), which clears the
+        // recovery state: carry the backoff across.
+        let result = self.configure_with_device(fmt, sr, ch, dev.as_deref());
+        self.respawn_backoff = backoff;
+        match result {
+            Ok(()) => {
+                self.playing.store(true, Ordering::Relaxed);
+                info!("audio output process respawned after unexpected exit");
+                true
+            }
+            Err(e) => {
+                warn!(error = %e, "audio output respawn failed");
+                self.respawn_backoff = (backoff * 2).clamp(RESPAWN_BACKOFF_MIN, RESPAWN_BACKOFF_MAX);
+                self.respawn_at = Some(Instant::now() + self.respawn_backoff);
+                false
+            }
+        }
     }
 
     pub fn flush(&mut self) {
@@ -282,15 +368,19 @@ impl AlsaDirectOutput {
             return 0;
         }
 
+        if self.process.is_none() && !self.try_respawn() {
+            return 0;
+        }
         let Some(ref mut child) = self.process else {
             return 0;
         };
 
         if let Some(status) = child.try_wait().ok().flatten() {
             // stderr is streamed live by spawn_stderr_logger — the cause is
-            // already in the log as `aplay: …` lines.
+            // already in the log as `aplay: …` lines. try_wait() reaped it.
             warn!(exit_code = %status, "audio output process exited unexpectedly");
             self.process = None;
+            self.schedule_respawn();
             return 0;
         }
 
