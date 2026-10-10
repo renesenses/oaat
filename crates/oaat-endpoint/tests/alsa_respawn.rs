@@ -96,7 +96,9 @@ fn aplay_is_respawned_after_unexpected_exit_with_bounded_backoff() {
     reset(&dir, "always_fail");
     let mut out = new_output();
     sleep(Duration::from_millis(200));
-    assert_eq!(pump(&mut out, Duration::from_secs(3)), 0);
+    // A write can land in a freshly respawned child before it dies again:
+    // only the number of spawns is meaningful here.
+    pump(&mut out, Duration::from_secs(3));
     let n = calls(&dir);
     assert!((3..=6).contains(&n), "bounded retries, got {n} spawns in ~3 s");
     out.stop();
