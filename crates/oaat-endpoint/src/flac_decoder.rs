@@ -174,7 +174,9 @@ impl FlacStreamDecoder {
         let mut samples = Vec::new();
         let mut pos = 0;
         while pos < buf.len() {
-            let Some(start) = (pos..buf.len()).find(|&i| !matches!(frame_header(&buf[i..]), Header::Invalid)) else {
+            let Some(start) =
+                (pos..buf.len()).find(|&i| !matches!(frame_header(&buf[i..]), Header::Invalid))
+            else {
                 pos = buf.len();
                 break;
             };
@@ -343,7 +345,11 @@ fn crc8(data: &[u8]) -> u8 {
     for &b in data {
         crc ^= b;
         for _ in 0..8 {
-            crc = if crc & 0x80 != 0 { (crc << 1) ^ 0x07 } else { crc << 1 };
+            crc = if crc & 0x80 != 0 {
+                (crc << 1) ^ 0x07
+            } else {
+                crc << 1
+            };
         }
     }
     crc
@@ -353,7 +359,11 @@ fn crc8(data: &[u8]) -> u8 {
 fn crc16_update(crc: u16, byte: u8) -> u16 {
     let mut crc = crc ^ ((byte as u16) << 8);
     for _ in 0..8 {
-        crc = if crc & 0x8000 != 0 { (crc << 1) ^ 0x8005 } else { crc << 1 };
+        crc = if crc & 0x8000 != 0 {
+            (crc << 1) ^ 0x8005
+        } else {
+            crc << 1
+        };
     }
     crc
 }
@@ -388,7 +398,11 @@ mod tests {
             for &b in d {
                 c ^= b;
                 for _ in 0..8 {
-                    c = if c & 0x80 != 0 { (c << 1) ^ 0x07 } else { c << 1 };
+                    c = if c & 0x80 != 0 {
+                        (c << 1) ^ 0x07
+                    } else {
+                        c << 1
+                    };
                 }
             }
             c
@@ -398,7 +412,11 @@ mod tests {
             for &b in d {
                 c ^= (b as u16) << 8;
                 for _ in 0..8 {
-                    c = if c & 0x8000 != 0 { (c << 1) ^ 0x8005 } else { c << 1 };
+                    c = if c & 0x8000 != 0 {
+                        (c << 1) ^ 0x8005
+                    } else {
+                        c << 1
+                    };
                 }
             }
             c
