@@ -1,7 +1,7 @@
 use std::io::Cursor;
 
 use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::{CODEC_TYPE_FLAC, DecoderOptions};
+use symphonia::core::codecs::{CODEC_TYPE_FLAC, CodecParameters, DecoderOptions};
 use symphonia::core::formats::{FormatOptions, Packet};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
@@ -145,36 +145,20 @@ impl FlacStreamDecoder {
         self.track_id = 0;
     }
 
-    /// Build the codec from the stream header (`fLaC` + metadata blocks).
+    /// Build the codec from the STREAMINFO block of the stream header. The
+    /// symphonia demuxer is not used here: its init insists on reading up to
+    /// the first audio frame, and it owns its input, which is what made the
+    /// old decoder blind to anything fed after initialization (#32).
     fn try_init(&mut self, header_len: usize) -> Result<(), String> {
-        let cursor = Cursor::new(self.buf[..header_len].to_vec());
-        let mss = MediaSourceStream::new(Box::new(cursor), Default::default());
-
-        let mut hint = Hint::new();
-        hint.with_extension("flac");
-
-        let probed = symphonia::default::get_probe()
-            .format(
-                &hint,
-                mss,
-                &FormatOptions::default(),
-                &MetadataOptions::default(),
-            )
-            .map_err(|e| format!("FLAC init failed: {e}"))?;
-
-        let format = probed.format;
-        let track = format
-            .tracks()
-            .iter()
-            .find(|t| t.codec_params.codec == CODEC_TYPE_FLAC)
-            .ok_or("no FLAC track")?;
-
-        let track_id = track.id;
+        let info = stream_info(&self.buf[..header_len]).ok_or("no STREAMINFO block")?;
+        let mut params = CodecParameters::new();
+        params
+            .for_codec(CODEC_TYPE_FLAC)
+            .with_extra_data(info.to_vec().into_boxed_slice());
         let decoder = symphonia::default::get_codecs()
-            .make(&track.codec_params, &DecoderOptions::default())
+            .make(&params, &DecoderOptions::default())
             .map_err(|e| format!("FLAC decoder init: {e}"))?;
-
-        self.track_id = track_id;
+        self.track_id = 0;
         self.decoder = Some(decoder);
         Ok(())
     }
@@ -245,6 +229,24 @@ fn stream_header_len(buf: &[u8]) -> Option<usize> {
         }
         pos = end;
     }
+}
+
+/// Body of the STREAMINFO metadata block (type 0, 34 bytes) in a complete
+/// stream header.
+fn stream_info(header: &[u8]) -> Option<&[u8]> {
+    let mut pos = 4;
+    while let Some(block) = header.get(pos..pos + 4) {
+        let len = u32::from_be_bytes([0, block[1], block[2], block[3]]) as usize;
+        let body = header.get(pos + 4..pos + 4 + len)?;
+        if block[0] & 0x7F == 0 && len == 34 {
+            return Some(body);
+        }
+        if block[0] & 0x80 != 0 {
+            return None;
+        }
+        pos += 4 + len;
+    }
+    None
 }
 
 enum Header {
