@@ -427,7 +427,10 @@ fn spawn_stderr_logger(stderr: std::process::ChildStderr, underruns: Arc<AtomicU
                 continue;
             }
             if let Some(gap_ms) = idle_resume_ms(line) {
-                info!(gap_ms, "aplay: resume after idle period, not counted as underrun: {line}");
+                info!(
+                    gap_ms,
+                    "aplay: resume after idle period, not counted as underrun: {line}"
+                );
             } else if is_xrun_line(line) {
                 let total = underruns.fetch_add(1, Ordering::Relaxed) + 1;
                 warn!(total, "aplay: {line}");
@@ -756,7 +759,10 @@ mod tests {
         // Real dropouts, up to the threshold, still count.
         assert!(is_xrun_line("underrun!!! (at least 34.202 ms long)"));
         assert!(is_xrun_line("underrun!!! (at least 29999.999 ms long)"));
-        assert_eq!(idle_resume_ms("underrun!!! (at least 34.202 ms long)"), None);
+        assert_eq!(
+            idle_resume_ms("underrun!!! (at least 34.202 ms long)"),
+            None
+        );
         assert_eq!(idle_resume_ms("overrun!!!"), None);
     }
 
