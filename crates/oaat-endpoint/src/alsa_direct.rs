@@ -426,7 +426,12 @@ fn spawn_stderr_logger(stderr: std::process::ChildStderr, underruns: Arc<AtomicU
             if line.is_empty() {
                 continue;
             }
-            if is_xrun_line(line) {
+            if let Some(gap_ms) = idle_resume_ms(line) {
+                info!(
+                    gap_ms,
+                    "aplay: resume after idle period, not counted as underrun: {line}"
+                );
+            } else if is_xrun_line(line) {
                 let total = underruns.fetch_add(1, Ordering::Relaxed) + 1;
                 warn!(total, "aplay: {line}");
             } else {
@@ -438,9 +443,26 @@ fn spawn_stderr_logger(stderr: std::process::ChildStderr, underruns: Arc<AtomicU
 
 /// aplay (LC_ALL=C) reports buffer trouble as `underrun!!! (at least … ms
 /// long)` / `overrun!!!`; snd_pcm_recover-style messages say "xrun".
+/// Idle-period resumes (see `idle_resume_ms`) are excluded: they are not
+/// playback incidents.
 fn is_xrun_line(line: &str) -> bool {
     let l = line.to_ascii_lowercase();
-    l.contains("underrun") || l.contains("overrun") || l.contains("xrun")
+    (l.contains("underrun") || l.contains("overrun") || l.contains("xrun"))
+        && idle_resume_ms(line).is_none()
+}
+
+/// Above this, an aplay "underrun" is the idle time of a pipe left open
+/// between streams, reported on resume — not a dropout. A real feed gap that
+/// long is already handled by the stall watchdog (#12).
+const IDLE_UNDERRUN_MS: u64 = 30_000;
+
+/// Duration in whole ms of an `underrun!!! (at least X ms long)` line when it
+/// exceeds `IDLE_UNDERRUN_MS`; `None` for any other line.
+fn idle_resume_ms(line: &str) -> Option<u64> {
+    let rest = line.split_once("at least ")?.1;
+    let num = rest.split_whitespace().next()?;
+    let ms = num.split('.').next()?.parse::<u64>().ok()?;
+    (line.to_ascii_lowercase().contains("underrun") && ms > IDLE_UNDERRUN_MS).then_some(ms)
 }
 
 /// Expand packed 24-bit little-endian samples (3 bytes) into S32_LE (4 bytes),
@@ -723,6 +745,25 @@ mod tests {
             "Playing raw data 'stdin' : Signed 32 bit Little Endian, Rate 44100 Hz, Stereo"
         ));
         assert!(!is_xrun_line("buffer_size  : 44100"));
+    }
+
+    /// #12: an aplay left open while the stream is idle reports the whole
+    /// idle period as one "underrun" on resume (seen on .44: ~5.5 h). That is
+    /// not a playback incident and must not inflate `underrun_count()`.
+    #[test]
+    fn idle_resume_underruns_are_not_counted() {
+        let idle = "underrun!!! (at least 19785035.123 ms long)";
+        assert!(!is_xrun_line(idle));
+        assert_eq!(idle_resume_ms(idle), Some(19_785_035));
+        assert!(!is_xrun_line("underrun!!! (at least 21730527 ms long)"));
+        // Real dropouts, up to the threshold, still count.
+        assert!(is_xrun_line("underrun!!! (at least 34.202 ms long)"));
+        assert!(is_xrun_line("underrun!!! (at least 29999.999 ms long)"));
+        assert_eq!(
+            idle_resume_ms("underrun!!! (at least 34.202 ms long)"),
+            None
+        );
+        assert_eq!(idle_resume_ms("overrun!!!"), None);
     }
 
     #[test]
