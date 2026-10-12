@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
-/// Monotonic-enough clock domain used by controller-side OAAT timestamps.
+/// Clock domain used by controller-side OAAT timestamps.
 ///
-/// Production callers use [`SystemTimeSource`]. Tests may inject a scripted
+/// Production callers use [`MonotonicTimeSource`] (the process-wide
+/// `oaat_core::time::now_ns`). Tests may inject a scripted
 /// source through `ConnectedEndpoint::connect_with_time_source` or
 /// `Zone::new_with_time_source` without changing the public configuration
 /// struct used by existing applications.
@@ -12,17 +13,21 @@ pub trait TimeSource: Send + Sync {
 
 pub type SharedTimeSource = Arc<dyn TimeSource>;
 
+/// The process-wide monotonic OAAT clock (`oaat_core::time::now_ns`):
+/// epoch-shaped nanoseconds, never stepped by NTP (#34). Shared with the
+/// clock responder and the CLI, so one process has one clock domain.
 #[derive(Debug, Default)]
-pub struct SystemTimeSource;
+pub struct MonotonicTimeSource;
 
-impl TimeSource for SystemTimeSource {
+impl TimeSource for MonotonicTimeSource {
     fn now_ns(&self) -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64
+        oaat_core::time::now_ns()
     }
 }
+
+/// Former name of [`MonotonicTimeSource`], kept for existing callers. It no
+/// longer reads `SystemTime` on every call (#34).
+pub type SystemTimeSource = MonotonicTimeSource;
 
 /// Immutable view of one endpoint's latest controller-side clock estimate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,4 +48,20 @@ pub struct ClockMeasurement {
 pub struct EndpointClockSnapshot {
     pub endpoint_id: String,
     pub measurement: Option<ClockMeasurement>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #34 / review of #39: the controller's default time source and the
+    /// rest of the process (clock responder, CLI) share one clock domain.
+    #[test]
+    fn default_time_source_is_the_process_clock() {
+        let a = oaat_core::time::now_ns();
+        let b = MonotonicTimeSource.now_ns();
+        let c = oaat_core::time::now_ns();
+        assert!(a <= b && b <= c, "{a} {b} {c}");
+        assert!(c - a < 50_000_000, "same domain, a few µs apart: {}", c - a);
+    }
 }
