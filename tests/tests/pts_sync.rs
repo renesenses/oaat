@@ -287,6 +287,7 @@ async fn stream_stats_flow_from_endpoint_app_to_controller() {
             packets_lost: 1,
             packets_recovered: 3,
             bit_perfect: true,
+            underruns: 2,
         }))
         .await
         .unwrap();
@@ -303,6 +304,7 @@ async fn stream_stats_flow_from_endpoint_app_to_controller() {
             assert_eq!(ss.packets_lost, 1);
             assert_eq!(ss.packets_recovered, 3);
             assert!(ss.bit_perfect);
+            assert_eq!(ss.underruns, 2);
         }
         other => panic!("expected StreamStats, got {other:?}"),
     }

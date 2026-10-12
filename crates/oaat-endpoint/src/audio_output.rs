@@ -169,6 +169,9 @@ pub struct CpalOutput {
     /// stream type, volume 100%, unmuted). Diagnostic, refreshed on
     /// configure.
     bit_perfect: Arc<AtomicU8>,
+    /// Mid-playback underruns of the current stream (#28): starvation
+    /// events, not short callbacks. Reset on configure.
+    underruns: Arc<AtomicU64>,
     /// Resolved cpal device + sample type support, keyed by the requested
     /// name. Device and config enumeration cost ~1-2 s on macOS: paying
     /// them on every configure() eats the PTS scheduling lead time.
@@ -233,6 +236,7 @@ impl CpalOutput {
             correction: Arc::new(AtomicI64::new(0)),
             net_adjust: Arc::new(AtomicI64::new(0)),
             bit_perfect: Arc::new(AtomicU8::new(0)),
+            underruns: Arc::new(AtomicU64::new(0)),
             cached_device: None,
             #[cfg(feature = "flac")]
             flac_stream: None,
@@ -376,7 +380,10 @@ impl CpalOutput {
         self.samples_played.store(0, Ordering::Relaxed);
         self.correction.store(0, Ordering::Relaxed);
         self.net_adjust.store(0, Ordering::Relaxed);
+        self.underruns.store(0, Ordering::Relaxed);
         let samples_played = self.samples_played.clone();
+        let underruns = self.underruns.clone();
+        let mut underrun_detector = UnderrunDetector::default();
 
         let rb = HeapRb::<u8>::new(ring_size);
         let (producer, mut consumer) = rb.split();
@@ -432,6 +439,7 @@ impl CpalOutput {
                         let got = consumer.pop_slice(&mut scratch[..want_bytes]);
                         let samples = got / bps;
                         samples_played.fetch_add(samples as u64, Ordering::Relaxed);
+                        underrun_detector.observe(samples, output.len(), &underruns);
                         for (i, out) in output.iter_mut().enumerate() {
                             *out = if i < samples {
                                 convert(&scratch[i * bps..(i + 1) * bps], vol)
@@ -530,6 +538,13 @@ impl CpalOutput {
     /// output path; software volume at 100% and unmuted preserve this).
     pub fn bit_perfect_path(&self) -> bool {
         self.bit_perfect.load(Ordering::Relaxed) != 0
+    }
+
+    /// Mid-playback underruns since the last `configure()` (#28): times the
+    /// ring ran dry while playing and audio then came back. Starting before
+    /// the first data and the end-of-stream drain are not counted.
+    pub fn underrun_count(&self) -> u64 {
+        self.underruns.load(Ordering::Relaxed)
     }
 
     /// Write audio payload bytes (in the negotiated wire format) to the ring.
@@ -674,6 +689,39 @@ impl Default for CpalOutput {
     }
 }
 
+/// Counts ring starvation events in the audio callback (#28).
+///
+/// A short callback (fewer samples than the device asked for) opens a gap;
+/// the gap is counted once, when audio comes back. Hence:
+/// - a gap lasting many callbacks counts once (rising edge, not per callback);
+/// - the end-of-stream drain never counts: no audio follows it;
+/// - starting before any data has arrived never counts (`primed`).
+///
+/// Lock- and allocation-free: safe in the real-time callback.
+#[derive(Debug, Default)]
+struct UnderrunDetector {
+    /// Audio has flowed at least once since the stream was configured.
+    primed: bool,
+    /// The ring ran dry after having been primed; not yet counted.
+    starving: bool,
+}
+
+impl UnderrunDetector {
+    fn observe(&mut self, got: usize, wanted: usize, counter: &AtomicU64) {
+        if got > 0 && self.starving {
+            // Audio is back after a gap: that gap was a real underrun.
+            counter.fetch_add(1, Ordering::Relaxed);
+            self.starving = false;
+        }
+        if got >= wanted {
+            self.primed = true;
+        } else if self.primed {
+            // The ring ran dry in this callback: a gap opens.
+            self.starving = true;
+        }
+    }
+}
+
 /// Return the DSD rate multiplier for a DSD format (64, 128, or 256).
 /// DSD_U8 = DSD64 (1 byte = 8 bits = 8 DSD samples), DSD_U16LE/U32LE imply
 /// wider container but still DSD64 unless the sample_rate field says otherwise.
@@ -728,6 +776,60 @@ fn dsd_to_f32(data: &[u8], rate_multiplier: u32) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Drive the detector with a sequence of (got, wanted) callbacks.
+    fn underruns_for(callbacks: &[(usize, usize)]) -> u64 {
+        let mut d = UnderrunDetector::default();
+        let counter = AtomicU64::new(0);
+        for &(got, wanted) in callbacks {
+            d.observe(got, wanted, &counter);
+        }
+        counter.load(Ordering::Relaxed)
+    }
+
+    fn repeat(cb: (usize, usize), n: usize) -> Vec<(usize, usize)> {
+        vec![cb; n]
+    }
+
+    /// #28: the ring runs dry mid-playback for 100 callbacks (~1 s), then
+    /// audio comes back: exactly one underrun.
+    #[test]
+    fn one_mid_playback_gap_counts_once() {
+        let mut cbs = repeat((512, 512), 10);
+        cbs.push((100, 512)); // ring drained mid-callback
+        cbs.extend(repeat((0, 512), 100));
+        cbs.extend(repeat((512, 512), 10));
+        assert_eq!(underruns_for(&cbs), 1);
+    }
+
+    #[test]
+    fn two_gaps_count_twice() {
+        let mut cbs = repeat((512, 512), 5);
+        cbs.extend(repeat((0, 512), 3));
+        cbs.extend(repeat((512, 512), 5));
+        cbs.push((200, 512));
+        cbs.push((512, 512));
+        assert_eq!(underruns_for(&cbs), 2);
+    }
+
+    /// `play()` before any data: the leading silence is not an underrun.
+    #[test]
+    fn start_before_data_is_not_an_underrun() {
+        let mut cbs = repeat((0, 512), 50);
+        cbs.push((300, 512)); // first data, partial
+        cbs.extend(repeat((512, 512), 10));
+        assert_eq!(underruns_for(&cbs), 0);
+    }
+
+    /// End of stream: the ring drains while `playing` is still true, and no
+    /// audio follows.
+    #[test]
+    fn end_of_stream_drain_is_not_an_underrun() {
+        let mut cbs = repeat((512, 512), 10);
+        cbs.push((128, 512));
+        cbs.extend(repeat((0, 512), 200));
+        assert_eq!(underruns_for(&cbs), 0);
+    }
 
     #[test]
     fn ring_format_s16_roundtrip_exact() {

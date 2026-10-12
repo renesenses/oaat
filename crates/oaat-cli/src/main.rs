@@ -638,6 +638,7 @@ async fn run_endpoint(
                             packets_lost: lost,
                             packets_recovered: recovered,
                             bit_perfect: audio.bit_perfect_path(),
+                            underruns: audio.underrun_count(),
                         }))
                         .await;
                 }

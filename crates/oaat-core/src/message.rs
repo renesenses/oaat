@@ -200,6 +200,10 @@ pub struct StreamStats {
     pub packets_recovered: u64,
     /// Whether the active output path delivers samples bit-exact.
     pub bit_perfect: bool,
+    /// Output underruns: times the audio device ran out of samples during
+    /// playback (#28). Absent from older endpoints (defaults to 0).
+    #[serde(default)]
+    pub underruns: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -307,6 +311,17 @@ impl Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #28: `underruns` is optional on the wire, so stats from endpoints that
+    /// predate it still parse.
+    #[test]
+    fn stream_stats_without_underruns_defaults_to_zero() {
+        let json = r#"{"type":"stream_stats","stream_id":"s","buffer_frames":1,"drift_us":0,"corrections_net_frames":0,"packets_lost":0,"packets_recovered":0,"bit_perfect":true}"#;
+        match serde_json::from_str::<Message>(json).unwrap() {
+            Message::StreamStats(ss) => assert_eq!(ss.underruns, 0),
+            other => panic!("expected StreamStats, got {other:?}"),
+        }
+    }
 
     #[test]
     fn hello_roundtrip() {
