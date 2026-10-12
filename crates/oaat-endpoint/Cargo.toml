@@ -30,6 +30,8 @@ http-body-util = { version = "0.1", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+# Direct ALSA output (alsa_direct): the version cpal already pulls in.
+alsa = "0.9"
 
 [features]
 default = ["audio-output", "flac", "tls", "web-ui"]
