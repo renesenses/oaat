@@ -393,6 +393,12 @@ filter re-converges.
 - Steady state: adaptive on measured jitter — 5 s when jitter < 100 µs,
   2 s below 1 ms, 500 ms above.
 - Offset is filtered through an exponential moving average (alpha = 0.125).
+- After bootstrap, an exchange with an outlying RTT SHOULD be discarded: an
+  asymmetric delay spike biases the offset by up to RTT/2. The reference
+  implementation rejects an RTT above `median + max(5 × 1.4826 × MAD, 1 ms)`
+  of the last 16 exchanges. The window MUST also take the rejected
+  exchanges, otherwise a durable RTT change (another network path) is
+  rejected forever and the offset freezes.
 - Jitter MUST be estimated with a forgetting statistic (e.g. exponentially
   weighted variance), not a cumulative one: slow clock drift would otherwise
   inflate the jitter estimate forever and pin the cadence at its fastest.
