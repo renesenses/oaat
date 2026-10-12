@@ -375,7 +375,7 @@ impl Default for FlacStreamDecoder {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -392,7 +392,7 @@ mod tests {
 
     /// Minimal FLAC encoder for tests: 16-bit stereo, VERBATIM subframes,
     /// fixed block size. Returns (stream bytes, header length, frame lengths).
-    fn encode_flac(frames: usize, block: usize) -> (Vec<u8>, usize, Vec<usize>) {
+    pub(crate) fn encode_flac(frames: usize, block: usize) -> (Vec<u8>, usize, Vec<usize>) {
         fn crc8(d: &[u8]) -> u8 {
             let mut c = 0u8;
             for &b in d {
