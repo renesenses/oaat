@@ -477,9 +477,15 @@ buffer health, residual drift and link quality without polling:
   "corrections_net_frames": 27405,
   "packets_lost": 0,
   "packets_recovered": 3,
-  "bit_perfect": true
+  "bit_perfect": true,
+  "underruns": 0
 }
 ```
+
+`underruns` counts the times the output device ran out of samples during
+playback (a gap followed by more audio; starting before the first data and
+the end-of-stream drain are not underruns). It is OPTIONAL: a Controller
+MUST treat a missing field as 0.
 
 ### 6.7 Sync Accuracy Target
 
