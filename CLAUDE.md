@@ -61,7 +61,7 @@ cargo run --bin tune-bridge -- discover --timeout 5
 - `Message` — All JSON control messages (hello, format_propose/accept/counter/reject, play/pause/stop, metadata, zone_*, next_track_*)
 - `SessionState` — 8-state machine (Discovery → Handshake → Idle → Negotiation → Streaming → Paused → Stopped → Disconnected)
 - `Capabilities` — Parsed from mDNS TXT: `pcm:768/32,dsd:256,flac`
-- `ClockState` — EMA-filtered clock offset (alpha=0.125, bootstrap alpha=0.5)
+- `ClockState` — EMA-filtered clock offset (alpha=0.125, bootstrap alpha=0.5); after bootstrap, RTT outliers (median + max(5 scaled MAD, 1 ms) over 16 exchanges) are rejected
 - `FrameCodec` — Buffered TCP frame decoder (handles partial reads)
 - `Zone` — Multi-endpoint group with synchronized audio fan-out
 
