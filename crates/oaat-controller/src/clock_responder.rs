@@ -66,9 +66,7 @@ impl ClockResponder {
     }
 }
 
+/// The process-wide monotonic OAAT clock (#34): see `oaat_core::time`.
 fn now_ns() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64
+    oaat_core::time::now_ns()
 }

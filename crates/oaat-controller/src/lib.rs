@@ -6,7 +6,8 @@ pub mod transport;
 pub mod zone;
 
 pub use clock::{
-    ClockMeasurement, EndpointClockSnapshot, SharedTimeSource, SystemTimeSource, TimeSource,
+    ClockMeasurement, EndpointClockSnapshot, MonotonicTimeSource, SharedTimeSource,
+    SystemTimeSource, TimeSource,
 };
 pub use clock_responder::ClockResponder;
 pub use discovery::{ControllerDiscovery, DiscoveredEndpoint};

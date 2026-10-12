@@ -1778,11 +1778,9 @@ async fn run_multiroom(
     println!("\nDone. {sample_offset} samples sent to {n} endpoints in sync.");
 }
 
+/// The process-wide monotonic OAAT clock (#34): see `oaat_core::time`.
 fn now_ns() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64
+    oaat_core::time::now_ns()
 }
 
 /// Answer endpoint-initiated clock sync (RFC §6.2) so endpoints can schedule

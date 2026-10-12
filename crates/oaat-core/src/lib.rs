@@ -6,6 +6,7 @@ pub mod fec;
 pub mod format;
 pub mod message;
 pub mod session;
+pub mod time;
 #[cfg(feature = "tls")]
 pub mod tls;
 pub mod wire;

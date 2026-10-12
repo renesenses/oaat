@@ -94,6 +94,7 @@ Branch `fix/oaat-output` on `tune-server-rust`:
 - `thiserror` for error types, `tracing` for logging, `tokio` for async
 - Wire format is big-endian, audio samples are little-endian
 - All ports reported by actual bind (not config) to handle port 0
+- All OAAT timestamps (clock sync, PTS, scheduling) come from `oaat_core::time::now_ns()`: monotonic, anchored once on the wall clock, one clock domain per process
 - Integration tests use port 0 for all sockets, bind-then-drop to get real ports
 - ConnectedEndpoint aborts its reader task on drop (clean TCP close for reconnection)
 - Endpoint transport loops on accept() for reconnection (no restart needed)

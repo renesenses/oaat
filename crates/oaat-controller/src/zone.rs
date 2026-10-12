@@ -13,7 +13,7 @@ use oaat_core::{
 
 use crate::manager::{EndpointSnapshot, EndpointState};
 use crate::transport::{ConnectedEndpoint, ControllerConfig};
-use crate::{EndpointClockSnapshot, SharedTimeSource, SystemTimeSource};
+use crate::{EndpointClockSnapshot, SharedTimeSource, MonotonicTimeSource};
 
 /// Per-endpoint volume offset model.
 /// Effective volume = clamp(master + offset, 0, 100).
@@ -86,7 +86,7 @@ pub struct Zone {
 
 impl Zone {
     pub fn new(zone_id: String, name: String, config: ControllerConfig) -> Self {
-        Self::new_with_time_source(zone_id, name, config, std::sync::Arc::new(SystemTimeSource))
+        Self::new_with_time_source(zone_id, name, config, std::sync::Arc::new(MonotonicTimeSource))
     }
 
     /// Build a zone with an explicit controller clock while preserving the

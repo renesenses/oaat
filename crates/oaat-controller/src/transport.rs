@@ -11,7 +11,7 @@ use oaat_core::message::*;
 use oaat_core::wire::{AUDIO_HEADER_SIZE, AudioPacketHeader, ClockSyncPacket, ClockSyncType};
 use oaat_core::{Message, OaatError, PROTOCOL_VERSION};
 
-use crate::clock::{ClockMeasurement, SharedTimeSource, SystemTimeSource};
+use crate::clock::{ClockMeasurement, SharedTimeSource, MonotonicTimeSource};
 
 #[derive(Clone)]
 pub struct ControllerConfig {
@@ -59,7 +59,7 @@ impl ConnectedEndpoint {
         config: &ControllerConfig,
         endpoint_addr: SocketAddr,
     ) -> Result<Self, OaatError> {
-        Self::connect_with_time_source(config, endpoint_addr, Arc::new(SystemTimeSource)).await
+        Self::connect_with_time_source(config, endpoint_addr, Arc::new(MonotonicTimeSource)).await
     }
 
     /// Connect using an explicit controller clock.
