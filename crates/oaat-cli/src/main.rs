@@ -273,6 +273,7 @@ async fn main() {
 
             run_endpoint(
                 ep_name,
+                file_config.endpoint.id.clone(),
                 ep_port,
                 ep_audio_device,
                 daemon,
@@ -342,6 +343,7 @@ fn load_or_create_endpoint_id(name: &str) -> String {
 #[allow(clippy::too_many_arguments)]
 async fn run_endpoint(
     name: String,
+    fixed_id: Option<String>,
     port: u16,
     audio_device: Option<String>,
     daemon: bool,
@@ -354,7 +356,10 @@ async fn run_endpoint(
     enable_dsd: bool,
 ) {
     let web_ui_port = web_ui_addr.port();
-    let endpoint_id = load_or_create_endpoint_id(&name);
+    let endpoint_id = match fixed_id.filter(|id| !id.trim().is_empty()) {
+        Some(id) => id.trim().to_string(),
+        None => load_or_create_endpoint_id(&name),
+    };
     let control_addr: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
     let audio_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
     let clock_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();

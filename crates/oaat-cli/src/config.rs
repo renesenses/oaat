@@ -11,6 +11,7 @@ use tracing::info;
 /// name = "Living Room DAC"
 /// port = 9740
 /// # audio_device = "default"
+/// # id = "living-room-1"   # fixed endpoint ID (default: generated, in /var/tmp)
 ///
 /// [capabilities]
 /// pcm_max_rate = 192000
@@ -84,6 +85,10 @@ pub struct EndpointSection {
     pub audio_device: Option<String>,
     /// Enable TLS 1.3 on the control channel.
     pub tls: bool,
+    /// Fixed endpoint ID. Without it the ID is generated and kept in
+    /// /var/tmp, keyed on the name: lost when /var/tmp doesn't survive a
+    /// reboot, and changed by a rename, so controllers see a new endpoint.
+    pub id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,6 +114,7 @@ impl Default for EndpointSection {
             port: 9740,
             audio_device: None,
             tls: false,
+            id: None,
         }
     }
 }
@@ -259,6 +265,7 @@ on_start = "/opt/state start"
         assert_eq!(cfg.web_ui.port, 9750);
         assert!(cfg.web_ui.bind.is_loopback());
         assert_eq!(cfg.hooks.on_start.as_deref(), Some("/opt/state start"));
+        assert!(cfg.endpoint.id.is_none());
         assert!(cfg.hooks.on_stop.is_none());
         // without the sections: listening on all interfaces, no hooks
         let cfg = EndpointFileConfig::default();

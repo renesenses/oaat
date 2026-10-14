@@ -274,6 +274,10 @@ port = 9740
 # ALSA audio device (default: "default", which uses /etc/asound.conf)
 # audio_device = "hw:1,0"
 
+# Fixed endpoint ID (default: generated and kept in /var/tmp, keyed on the
+# name; set it when /var/tmp is not persistent or the name may change)
+# id = "living-room-1"
+
 # TLS (off by default; not needed on a LAN)
 # tls = false
 
