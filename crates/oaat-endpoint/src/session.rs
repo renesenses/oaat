@@ -52,6 +52,7 @@ impl EndpointSession {
                     audio_port,
                     clock_port,
                     buffer_size_ms: buffer_ms,
+                    features: vec![oaat_core::message::FEATURE_ENDPOINT_RELEASE.into()],
                 });
                 self.transition(SessionState::Idle)?;
                 Ok(ack)

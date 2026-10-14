@@ -104,7 +104,7 @@ A **Zone Manager** is the centralized component that manages all zones. It provi
 8. Disconnected  -- TCP control connection closed, endpoint returns to Idle
 ```
 
-State transitions are Controller-initiated except for error conditions and voluntary endpoint departure.
+State transitions are Controller-initiated except for error conditions, voluntary endpoint departure, and an endpoint giving up its audio output (`endpoint_release`, §7.3.1).
 
 ### 2.4 Connection Model
 
@@ -544,9 +544,16 @@ JSON objects over TCP, framed with 4-byte big-endian length prefix:
   },
   "audio_port": 9741,
   "clock_port": 9742,
-  "buffer_size_ms": 1000
+  "buffer_size_ms": 1000,
+  "features": ["endpoint_release"]
 }
 ```
+
+`features` in `hello` and `hello_ack` announce optional protocol features each side supports. Both are optional: a receiver MUST treat a missing list as empty and MUST ignore names it does not know. A side MUST NOT send a message that belongs to an optional feature the peer did not announce. Defined features:
+
+| Feature | In `hello` (controller) | In `hello_ack` (endpoint) |
+|---------|-------------------------|---------------------------|
+| `endpoint_release` | Handles `endpoint_release` (§7.3.1) | May send `endpoint_release` |
 
 ### 7.3 Playback Commands
 
@@ -565,6 +572,34 @@ JSON objects over TCP, framed with 4-byte big-endian length prefix:
 | `volume_report` | E → C | Report volume |
 | `stream_stats` | E → C | Periodic health report: buffer, drift, losses (§6.6) |
 | `mute` | C → E | Mute/unmute |
+| `endpoint_release` | E → C | Endpoint gave up its audio output (§7.3.1) |
+
+#### 7.3.1 Endpoint Release
+
+An endpoint is not always the only thing that uses its audio output: a device can run several players (for example an OAAT endpoint next to other streaming services) and hand the DAC to whichever one the user starts last. When the host takes the output away, the endpoint stops, closes the device and tells the controller:
+
+```json
+// Endpoint -> Controller
+{
+  "type": "endpoint_release",
+  "stream_id": "tune-1",
+  "reason": "local_source"
+}
+```
+
+- `stream_id`: the stream that was playing, or an empty string if none.
+- `reason`: `local_source` (another source on the same device took the output). A receiver MUST accept reasons it does not know.
+
+The endpoint:
+
+- MUST only send `endpoint_release` when the controller announced the `endpoint_release` feature in `hello`. To any other controller it sends nothing, and it MAY simply stop playing (that controller keeps streaming into a silent endpoint).
+- MUST close the audio device before or right after sending the message, without playing out what is buffered, and MUST ignore audio packets and gapless reformats for the released stream.
+- Keeps the control connection open.
+
+The controller:
+
+- MUST stop streaming to that endpoint and MUST NOT resume it on its own, including through automatic reconnection or a watchdog. For a single-endpoint zone, the zone becomes paused, as if the user had paused it. In a multi-endpoint zone, only that endpoint leaves the zone (§7.5.3 semantics); the others keep playing.
+- Resumes only on a user action (play). It then starts a new negotiation (`format_propose`, then `play`), because the endpoint's device is closed. An endpoint SHOULD also accept a bare `play` after a release by reopening the device with the last negotiated format.
 
 ### 7.4 Metadata
 

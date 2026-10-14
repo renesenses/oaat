@@ -45,6 +45,9 @@ pub enum Message {
     // -- Health --
     StreamStats(StreamStats),
 
+    // -- Endpoint release --
+    EndpointRelease(EndpointRelease),
+
     // -- Error --
     Error(ErrorMsg),
 }
@@ -70,7 +73,17 @@ pub struct HelloAck {
     pub audio_port: u16,
     pub clock_port: u16,
     pub buffer_size_ms: u32,
+    /// Optional protocol features the endpoint supports, the counterpart of
+    /// `Hello::features` (e.g. [`FEATURE_ENDPOINT_RELEASE`]). Absent from
+    /// endpoints that predate it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
 }
+
+/// Feature flag for `endpoint_release` (RFC §7.3.1): in `Hello::features`
+/// the controller handles it, in `HelloAck::features` the endpoint may send
+/// it. An endpoint only sends it to a controller that announced the flag.
+pub const FEATURE_ENDPOINT_RELEASE: &str = "endpoint_release";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EndpointCapabilities {
@@ -283,6 +296,29 @@ pub struct NextTrackReformat {
     pub sample_rate: u32,
 }
 
+// -- Endpoint release --
+
+/// Endpoint -> Controller (RFC §7.3.1): the endpoint has given up its audio
+/// output, typically because another source on the same device took the DAC.
+/// It has stopped and closed the device; the controller pauses the stream
+/// and does not resume it on its own.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EndpointRelease {
+    /// The stream that was playing, empty if none.
+    pub stream_id: String,
+    pub reason: ReleaseReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseReason {
+    /// Another source on the same device took the audio output.
+    LocalSource,
+    /// Any reason this version of the protocol does not know.
+    #[serde(other)]
+    Other,
+}
+
 // -- Error --
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -321,6 +357,41 @@ mod tests {
             Message::StreamStats(ss) => assert_eq!(ss.underruns, 0),
             other => panic!("expected StreamStats, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn endpoint_release_json() {
+        let msg = Message::EndpointRelease(EndpointRelease {
+            stream_id: "tune-1".into(),
+            reason: ReleaseReason::LocalSource,
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"endpoint_release","stream_id":"tune-1","reason":"local_source"}"#
+        );
+        // A reason added by a later version still parses.
+        let later = r#"{"type":"endpoint_release","stream_id":"","reason":"power_save"}"#;
+        match serde_json::from_str::<Message>(later).unwrap() {
+            Message::EndpointRelease(r) => assert_eq!(r.reason, ReleaseReason::Other),
+            other => panic!("expected EndpointRelease, got {other:?}"),
+        }
+    }
+
+    /// `features` is optional on the wire both ways: a HelloAck from an
+    /// endpoint that predates it parses, and an empty list is not sent.
+    #[test]
+    fn hello_ack_features_are_optional() {
+        let json = r#"{"type":"hello_ack","protocol_version":1,"endpoint_id":"e","endpoint_name":"n","capabilities":{"pcm_max_rate":192000,"pcm_max_bits":24,"channels_max":2,"formats":["PCM_S16LE"]},"audio_port":1,"clock_port":2,"buffer_size_ms":1000}"#;
+        let Message::HelloAck(mut ack) = serde_json::from_str::<Message>(json).unwrap() else {
+            panic!("expected HelloAck");
+        };
+        assert!(ack.features.is_empty());
+        let out = serde_json::to_string(&Message::HelloAck(ack.clone())).unwrap();
+        assert!(!out.contains("features"));
+        ack.features.push(FEATURE_ENDPOINT_RELEASE.into());
+        let out = serde_json::to_string(&Message::HelloAck(ack)).unwrap();
+        assert!(out.contains(r#""features":["endpoint_release"]"#));
     }
 
     #[test]

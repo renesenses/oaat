@@ -91,6 +91,7 @@ async fn spawn_simulated_endpoint(
             audio_port,
             clock_port,
             buffer_size_ms: 1_000,
+            features: vec![],
         });
         stream.write_all(&FrameCodec::encode(&ack)).await.unwrap();
 

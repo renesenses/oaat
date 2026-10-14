@@ -32,6 +32,9 @@ pub enum EndpointResponse {
     NextTrackReady(NextTrackReady),
     NextTrackReformat(NextTrackReformat),
     StreamStats(StreamStats),
+    /// The endpoint gave up its audio output (RFC §7.3.1). Only sent when
+    /// `ControllerConfig::features` holds `FEATURE_ENDPOINT_RELEASE`.
+    Release(EndpointRelease),
 }
 
 pub struct ConnectedEndpoint {
@@ -247,6 +250,16 @@ impl ConnectedEndpoint {
                                     );
                                     let _ = response_tx
                                         .send(EndpointResponse::StreamStats(ss))
+                                        .await;
+                                }
+                                Message::EndpointRelease(er) => {
+                                    info!(
+                                        stream_id = %er.stream_id,
+                                        reason = ?er.reason,
+                                        "endpoint released its output"
+                                    );
+                                    let _ = response_tx
+                                        .send(EndpointResponse::Release(er))
                                         .await;
                                 }
                                 other => {
