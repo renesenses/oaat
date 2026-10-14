@@ -110,17 +110,14 @@ async fn endpoint_announces_release_in_hello_ack() {
 async fn release_reaches_a_controller_that_handles_it() {
     let (ctrl_tx, mut endpoint) = connect(vec![FEATURE_ENDPOINT_RELEASE.into()]).await;
     ctrl_tx.send(release()).await.unwrap();
-    let resp = tokio::time::timeout(Duration::from_secs(2), endpoint.response_rx.recv())
+    let r = tokio::time::timeout(Duration::from_secs(2), endpoint.release_rx.recv())
         .await
-        .expect("no response from the endpoint")
-        .expect("response channel closed");
-    match resp {
-        EndpointResponse::Release(r) => {
-            assert_eq!(r.stream_id, "s1");
-            assert_eq!(r.reason, ReleaseReason::LocalSource);
-        }
-        other => panic!("expected Release, got {other:?}"),
-    }
+        .expect("no release from the endpoint")
+        .expect("release channel closed");
+    assert_eq!(r.stream_id, "s1");
+    assert_eq!(r.reason, ReleaseReason::LocalSource);
+    // a release is not a reply: response_rx stays empty
+    assert!(endpoint.response_rx.try_recv().is_err());
 }
 
 /// A controller that didn't announce the feature never sees the message; the
@@ -136,6 +133,7 @@ async fn release_is_withheld_from_an_older_controller() {
         .expect("response channel closed");
     assert!(
         matches!(resp, EndpointResponse::StreamStats(_)),
-        "expected only StreamStats, got {resp:?}"
+        "expected StreamStats, got {resp:?}"
     );
+    assert!(endpoint.release_rx.try_recv().is_err());
 }

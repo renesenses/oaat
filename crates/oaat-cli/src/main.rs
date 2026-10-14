@@ -1399,11 +1399,9 @@ async fn run_controller(
     while sample_offset < total_samples {
         // endpoint_release (RFC §7.3.1): the endpoint gave up its output,
         // pause here instead of streaming into the void.
-        while let Ok(resp) = endpoint.response_rx.try_recv() {
-            if let oaat_controller::EndpointResponse::Release(r) = resp {
-                println!("\nEndpoint released its output ({:?}), stream paused.", r.reason);
-                return;
-            }
+        if let Ok(r) = endpoint.release_rx.try_recv() {
+            println!("\nEndpoint released its output ({:?}), stream paused.", r.reason);
+            return;
         }
         let chunk = samples_per_packet.min((total_samples - sample_offset) as usize);
         let mut payload = Vec::with_capacity(chunk * bytes_per_sample);
