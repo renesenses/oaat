@@ -737,6 +737,9 @@ fn writer_loop(
 /// The real device: an ALSA PCM opened with the `alsa` crate.
 struct AlsaPcm {
     pcm: alsa::PCM,
+    /// S16_LE was asked for but the device only takes S32_LE: samples are
+    /// padded on write (`value << 16`, lossless, bit-perfect).
+    widen_s16: bool,
 }
 
 fn alsa_errno(e: &alsa::Error) -> i32 {
@@ -745,6 +748,15 @@ fn alsa_errno(e: &alsa::Error) -> i32 {
 
 impl PcmDevice for AlsaPcm {
     fn write(&mut self, data: &[u8]) -> Result<usize, DeviceError> {
+        // Same frame count either way: the caller's bookkeeping, in S16_LE
+        // frames, stays valid.
+        let widened;
+        let data = if self.widen_s16 {
+            widened = pad_s16_to_s32(data);
+            &widened[..]
+        } else {
+            data
+        };
         let mut interrupted = 0;
         loop {
             match self.pcm.io_bytes().writei(data) {
@@ -805,13 +817,25 @@ fn open_alsa_device(p: &DeviceParams) -> Result<Box<dyn PcmDevice>, String> {
     use alsa::pcm::{Access, HwParams};
     use alsa::{Direction, PCM, ValueOr};
 
-    let fmt = alsa_format(p.format).ok_or_else(|| format!("unknown ALSA format {}", p.format))?;
+    let mut fmt = alsa_format(p.format).ok_or_else(|| format!("unknown ALSA format {}", p.format))?;
+    let mut widen_s16 = false;
     let err = |what: &str, e: alsa::Error| format!("{}: {what}: {e}", p.device);
     let pcm = PCM::new(&p.device, Direction::Playback, false).map_err(|e| err("open", e))?;
     {
         let hwp = HwParams::any(&pcm).map_err(|e| err("hw params", e))?;
         hwp.set_access(Access::RWInterleaved)
             .map_err(|e| err("access", e))?;
+        // A hw: device takes only the formats the DAC supports, and many
+        // (e.g. Chord USB DACs) take no S16_LE: play 16-bit as S32_LE then,
+        // padded on write, instead of failing.
+        if fmt == alsa::pcm::Format::S16LE
+            && hwp.test_format(fmt).is_err()
+            && hwp.test_format(alsa::pcm::Format::S32LE).is_ok()
+        {
+            fmt = alsa::pcm::Format::S32LE;
+            widen_s16 = true;
+            info!(device = %p.device, "device takes no S16_LE, playing 16-bit as S32_LE");
+        }
         hwp.set_format(fmt).map_err(|e| err(p.format, e))?;
         hwp.set_channels(p.channels as u32)
             .map_err(|e| err("channels", e))?;
@@ -854,7 +878,7 @@ fn open_alsa_device(p: &DeviceParams) -> Result<Box<dyn PcmDevice>, String> {
         buffer_ms = if rate > 0 { buffer as u64 * 1000 / rate as u64 } else { 0 },
         "ALSA device opened"
     );
-    Ok(Box::new(AlsaPcm { pcm }))
+    Ok(Box::new(AlsaPcm { pcm, widen_s16 }))
 }
 
 /// Device format for decoded FLAC. Same choice as the former ffmpeg pipe:
@@ -895,6 +919,17 @@ fn pad_s24_to_s32(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() / 3 * 4);
     for chunk in data.as_chunks::<3>().0 {
         out.extend_from_slice(&[0x00, chunk[0], chunk[1], chunk[2]]);
+    }
+    out
+}
+
+/// S16_LE samples → S32_LE, left-justified (`value << 16`): the 16 significant
+/// bits in the high bytes, the low bytes zero. Bit-perfect, like
+/// `pad_s24_to_s32`.
+fn pad_s16_to_s32(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() * 2);
+    for chunk in data.as_chunks::<2>().0 {
+        out.extend_from_slice(&[0x00, 0x00, chunk[0], chunk[1]]);
     }
     out
 }
@@ -1810,6 +1845,23 @@ mod tests {
             let got = i32::from_le_bytes([out[0], out[1], out[2], out[3]]);
             assert_eq!(got, expect_v24 << 8, "src {b:?}");
         }
+    }
+
+    #[test]
+    fn s16_value_is_source_shifted_left_16() {
+        for &(b, v16) in &[
+            ([0x01u8, 0x00], 1i32),
+            ([0xFF, 0xFF], -1i32),
+            ([0xFF, 0x7F], i16::MAX as i32),
+            ([0x00, 0x80], i16::MIN as i32),
+        ] {
+            let out = pad_s16_to_s32(&b);
+            assert_eq!(out.len(), 4);
+            let got = i32::from_le_bytes([out[0], out[1], out[2], out[3]]);
+            assert_eq!(got, v16 << 16, "src {b:?}");
+        }
+        // stereo frames: twice the bytes, same frame count
+        assert_eq!(pad_s16_to_s32(&[0u8; 8]).len(), 16);
     }
 
     #[test]
