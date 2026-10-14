@@ -296,6 +296,22 @@ flac = true
 [logging]
 # Log level: error, warn, info, debug, trace
 level = "info"
+
+[web_ui]
+# Status page (port 9741 by default). It also takes POST /api/release, which
+# makes the endpoint give up the DAC and tell the controller (endpoint_release),
+# and POST /api/device. Bind it to 127.0.0.1 to keep these local to the Pi.
+# enabled = true
+# port = 9741
+# bind = "0.0.0.0"
+
+[hooks]
+# Commands run with /bin/sh -c when the endpoint starts using the DAC (on play)
+# and once it no longer does (stop, release, or closed after a pause).
+# OAAT_EVENT is set to "start" or "stop". Useful to tell other software on the
+# Pi which source plays.
+# on_start = "/usr/local/bin/oaat-state start"
+# on_stop = "/usr/local/bin/oaat-state stop"
 ```
 
 ### Examples, DAC by DAC

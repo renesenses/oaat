@@ -68,7 +68,7 @@ enum Command {
         /// Disable the web status UI
         #[arg(long)]
         no_web_ui: bool,
-        /// Web UI port (default: 9741)
+        /// Web UI port (default: 9741, or [web_ui] port)
         #[arg(long)]
         web_port: Option<u16>,
         /// Advertise native DSD and play via ALSA DSD_U32_BE (USB DACs).
@@ -265,8 +265,9 @@ async fn main() {
             });
 
             let ep_tls = tls || file_config.endpoint.tls;
-            let ep_web_port = web_port.unwrap_or(DEFAULT_WEB_UI_PORT);
-            let ep_web_ui = !no_web_ui;
+            let ep_web_port = web_port.unwrap_or(file_config.web_ui.port);
+            let ep_web_ui = !no_web_ui && file_config.web_ui.enabled;
+            let ep_web_addr = SocketAddr::new(file_config.web_ui.bind, ep_web_port);
             // CLI --dsd ORs with config [capabilities] dsd = true
             let ep_dsd = dsd || file_config.capabilities.dsd;
 
@@ -278,8 +279,9 @@ async fn main() {
                 ep_tls,
                 &file_config.capabilities,
                 &file_config.dac,
+                &file_config.hooks,
                 ep_web_ui,
-                ep_web_port,
+                ep_web_addr,
                 ep_dsd,
             )
             .await;
@@ -346,10 +348,12 @@ async fn run_endpoint(
     tls: bool,
     caps_config: &config::CapabilitiesSection,
     dac_config: &config::DacSection,
+    hooks: &config::HooksSection,
     web_ui_enabled: bool,
-    web_ui_port: u16,
+    web_ui_addr: SocketAddr,
     enable_dsd: bool,
 ) {
+    let web_ui_port = web_ui_addr.port();
     let endpoint_id = load_or_create_endpoint_id(&name);
     let control_addr: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
     let audio_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
@@ -438,6 +442,10 @@ async fn run_endpoint(
     }
 
     // Start web UI
+    // Release requests (POST /api/release): give up the audio output.
+    #[cfg_attr(not(feature = "web-ui"), allow(unused_variables))]
+    let (release_tx, mut release_rx) = mpsc::channel::<()>(4);
+
     #[cfg(feature = "web-ui")]
     let (status_handle, device_switch_rx) = {
         let initial_device = audio_device
@@ -465,7 +473,7 @@ async fn run_endpoint(
         let (handle, _reader) = web_ui::BridgeStatusHandle::new(initial_status);
         let (switch_tx, switch_rx) = mpsc::channel::<String>(8);
         if web_ui_enabled {
-            web_ui::start_web_ui(web_ui_port, handle.clone(), switch_tx).await;
+            web_ui::start_web_ui_on(web_ui_addr, handle.clone(), switch_tx, Some(release_tx.clone())).await;
         }
         (handle, switch_rx)
     };
@@ -564,6 +572,19 @@ async fn run_endpoint(
     let mut servo_interval = tokio::time::interval(Duration::from_secs(1));
     servo_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // Whether the audio output is in use, as the [hooks] report it: set on
+    // play, cleared once the output is stopped, released, or closed after a
+    // pause (2 servo ticks without playing and with the device closed, so a
+    // reconfigure between tracks doesn't count).
+    let hooks = HookRunner::new(hooks);
+    let mut output_in_use = false;
+    let mut output_idle_ticks: u32 = 0;
+    // endpoint_release (RFC §7.3.1) sent: audio and reformats are ignored
+    // until the controller negotiates again or sends play.
+    let mut released = false;
+    let mut last_format: Option<oaat_core::message::FormatPropose> = None;
+    let mut connected = false;
+
     // Initialize hardware DAC mixer (Linux only)
     #[cfg(target_os = "linux")]
     let alsa_mixer = if dac_config.hardware_volume {
@@ -615,6 +636,16 @@ async fn run_endpoint(
             // should be at, and queue a skip/duplicate correction.
             _ = servo_interval.tick() => {
                 servo_ticks += 1;
+                if output_in_use && !audio.is_playing() && !audio.device_open() {
+                    output_idle_ticks += 1;
+                    if output_idle_ticks >= 2 {
+                        output_in_use = false;
+                        output_idle_ticks = 0;
+                        hooks.fire("stop");
+                    }
+                } else {
+                    output_idle_ticks = 0;
+                }
                 // Periodic health report to the controller (RFC §6.6/§7.3).
                 if started && servo_ticks.is_multiple_of(5) && !current_stream_id.is_empty() {
                     let (lost, recovered) = clock.link_stats();
@@ -701,6 +732,7 @@ async fn run_endpoint(
                         controller_id,
                         controller_name,
                     } => {
+                        connected = true;
                         #[cfg(feature = "web-ui")]
                         {
                             let ctrl_name = controller_name.clone();
@@ -746,6 +778,9 @@ async fn run_endpoint(
                         }
                         stream_sample_rate = fp.sample_rate;
                         current_stream_id = fp.stream_id.clone();
+                        // a new negotiation ends a release
+                        released = false;
+                        last_format = Some(fp.clone());
                         // configure() tears down the stream: reset scheduling state.
                         armed = false;
                         started = false;
@@ -804,7 +839,7 @@ async fn run_endpoint(
                         // Sampled before writing this packet (in frames):
                         // needed to relate this packet's PTS to the ring head.
                         let buffered_frames_before = audio.buffer_level() as u64;
-                        if !payload.is_empty() {
+                        if !payload.is_empty() && !released {
                             audio.write_audio(&payload);
                         }
 
@@ -890,6 +925,21 @@ async fn run_endpoint(
                             } else {
                                 println!("Play: {id}");
                             }
+                            // Play after a release without a new negotiation:
+                            // the device was closed, open it again with the
+                            // last format.
+                            if released {
+                                released = false;
+                                if let Some(fp) = last_format.as_ref()
+                                    && let Err(e) = audio.configure_with_device(fp.format, fp.sample_rate, fp.channels, current_audio_device.as_deref())
+                                {
+                                    error!(error = %e, "audio output configuration after release failed");
+                                }
+                            }
+                            if !output_in_use {
+                                output_in_use = true;
+                                hooks.fire("start");
+                            }
                             if started {
                                 // Resume from pause: output is already
                                 // positioned, restart immediately. Drift
@@ -938,6 +988,10 @@ async fn run_endpoint(
                             start_deadline = None;
                             tracker = None;
                             last_drift = 0;
+                            if output_in_use {
+                                output_in_use = false;
+                                hooks.fire("stop");
+                            }
                             #[cfg(feature = "web-ui")]
                             status_handle.update(|s| {
                                 s.stream_format = None;
@@ -1008,6 +1062,10 @@ async fn run_endpoint(
                         format,
                         sample_rate,
                     } => {
+                        if released {
+                            info!(stream_id, "reformat ignored, output released");
+                            continue;
+                        }
                         if daemon {
                             info!(stream_id, format = %format, sample_rate, "reformat for next track");
                         } else {
@@ -1097,6 +1155,12 @@ async fn run_endpoint(
                     }
                     EndpointEvent::Disconnected => {
                         audio.stop();
+                        connected = false;
+                        released = false;
+                        if output_in_use {
+                            output_in_use = false;
+                            hooks.fire("stop");
+                        }
                         #[cfg(feature = "web-ui")]
                         status_handle.update(|s| {
                             s.connected = false;
@@ -1118,6 +1182,34 @@ async fn run_endpoint(
                     EndpointEvent::Error(e) => {
                         error!(error = %e, "endpoint error");
                     }
+                }
+            }
+            // Release requests: give up the output so another source on this
+            // host can open the DAC, and tell the controller (RFC §7.3.1).
+            Some(()) = release_rx.recv() => {
+                info!(stream_id = %current_stream_id, "releasing the audio output");
+                audio.release();
+                released = true;
+                armed = false;
+                started = false;
+                start_deadline = None;
+                tracker = None;
+                last_drift = 0;
+                if connected {
+                    let _ = ctrl_tx
+                        .send(oaat_core::Message::EndpointRelease(oaat_core::message::EndpointRelease {
+                            stream_id: current_stream_id.clone(),
+                            reason: oaat_core::message::ReleaseReason::LocalSource,
+                        }))
+                        .await;
+                }
+                #[cfg(feature = "web-ui")]
+                status_handle.update(|s| {
+                    s.playing = false;
+                }).await;
+                if output_in_use {
+                    output_in_use = false;
+                    hooks.fire("stop");
                 }
             }
             // Handle device switch requests from the web UI
@@ -1144,6 +1236,44 @@ async fn run_endpoint(
                 break;
             }
         }
+    }
+}
+
+/// Runs the [hooks] commands one at a time, in order, off the audio path.
+struct HookRunner {
+    tx: std::sync::mpsc::Sender<&'static str>,
+}
+
+impl HookRunner {
+    fn new(cfg: &config::HooksSection) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<&'static str>();
+        let on_start = cfg.on_start.clone();
+        let on_stop = cfg.on_stop.clone();
+        std::thread::Builder::new()
+            .name("hooks".into())
+            .spawn(move || {
+                for event in rx {
+                    let cmd = if event == "start" { &on_start } else { &on_stop };
+                    let Some(cmd) = cmd else { continue };
+                    match std::process::Command::new("/bin/sh")
+                        .arg("-c")
+                        .arg(cmd)
+                        .env("OAAT_EVENT", event)
+                        .stdin(std::process::Stdio::null())
+                        .status()
+                    {
+                        Ok(st) if st.success() => info!(event, "hook ran"),
+                        Ok(st) => warn!(event, status = %st, "hook failed"),
+                        Err(e) => warn!(event, error = %e, "hook could not run"),
+                    }
+                }
+            })
+            .expect("failed to spawn the hook thread");
+        Self { tx }
+    }
+
+    fn fire(&self, event: &'static str) {
+        let _ = self.tx.send(event);
     }
 }
 
@@ -1184,7 +1314,7 @@ async fn run_controller(
     let config = ControllerConfig {
         controller_id,
         controller_name: name.clone(),
-        features: vec![],
+        features: vec![oaat_core::message::FEATURE_ENDPOINT_RELEASE.into()],
         clock_port,
         tls,
     };
@@ -1267,6 +1397,14 @@ async fn run_controller(
     let start_ns = now_ns() + play_delay_ns;
 
     while sample_offset < total_samples {
+        // endpoint_release (RFC §7.3.1): the endpoint gave up its output,
+        // pause here instead of streaming into the void.
+        while let Ok(resp) = endpoint.response_rx.try_recv() {
+            if let oaat_controller::EndpointResponse::Release(r) = resp {
+                println!("\nEndpoint released its output ({:?}), stream paused.", r.reason);
+                return;
+            }
+        }
         let chunk = samples_per_packet.min((total_samples - sample_offset) as usize);
         let mut payload = Vec::with_capacity(chunk * bytes_per_sample);
 

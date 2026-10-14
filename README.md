@@ -96,6 +96,7 @@ oaat-test 192.168.1.50:9740
 | DSD native + FLAC compressed transport | Done |
 | TLS 1.3 (TOFU) / PSK auth | Done |
 | stream_stats health reporting | Done |
+| Endpoint release (host hands the DAC to another source) | Done |
 | Conformance test tool | Done |
 | CI (GitHub Actions, Linux + macOS) | Done |
 | Tune server integration | Done |

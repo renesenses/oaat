@@ -2,7 +2,9 @@
 //!
 //! Serves a single-page HTML dashboard on port 9741 showing bridge status,
 //! current audio device, available devices, connection state, and stream info.
-//! Also exposes `POST /api/device` to switch the active audio device.
+//! Also exposes `POST /api/device` to switch the active audio device, and
+//! `POST /api/release` to give up the audio output (RFC §7.3.1), for a host
+//! that hands the DAC to another source.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -103,13 +105,37 @@ pub struct BridgeStatusReader {
 pub type DeviceSwitchTx = tokio::sync::mpsc::Sender<String>;
 pub type DeviceSwitchRx = tokio::sync::mpsc::Receiver<String>;
 
-/// Start the web UI HTTP server. Returns immediately, running in the background.
+/// Channel for release requests (`POST /api/release`) from the web UI to the
+/// main loop.
+pub type ReleaseTx = tokio::sync::mpsc::Sender<()>;
+pub type ReleaseRx = tokio::sync::mpsc::Receiver<()>;
+
+/// Start the web UI HTTP server on all interfaces. Returns immediately,
+/// running in the background.
 pub async fn start_web_ui(
     port: u16,
     status_handle: BridgeStatusHandle,
     device_switch_tx: DeviceSwitchTx,
 ) {
-    let addr: SocketAddr = ([0, 0, 0, 0], port).into();
+    start_web_ui_on(
+        ([0, 0, 0, 0], port).into(),
+        status_handle,
+        device_switch_tx,
+        None,
+    )
+    .await;
+}
+
+/// Like [`start_web_ui`], on a chosen address (e.g. `127.0.0.1` to keep the
+/// controls local to the host), and with `POST /api/release` when `release_tx`
+/// is given.
+pub async fn start_web_ui_on(
+    addr: SocketAddr,
+    status_handle: BridgeStatusHandle,
+    device_switch_tx: DeviceSwitchTx,
+    release_tx: Option<ReleaseTx>,
+) {
+    let port = addr.port();
     let listener = match TcpListener::bind(addr).await {
         Ok(l) => {
             info!(
@@ -126,6 +152,7 @@ pub async fn start_web_ui(
 
     let status_handle = Arc::new(status_handle);
     let device_switch_tx = Arc::new(device_switch_tx);
+    let release_tx = Arc::new(release_tx);
 
     tokio::spawn(async move {
         loop {
@@ -139,12 +166,14 @@ pub async fn start_web_ui(
             let io = TokioIo::new(stream);
             let status = status_handle.clone();
             let switch_tx = device_switch_tx.clone();
+            let release_tx = release_tx.clone();
 
             tokio::spawn(async move {
                 let svc = service_fn(move |req| {
                     let status = status.clone();
                     let switch_tx = switch_tx.clone();
-                    async move { handle_request(req, &status, &switch_tx).await }
+                    let release_tx = release_tx.clone();
+                    async move { handle_request(req, &status, &switch_tx, &release_tx).await }
                 });
                 if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
                     // Connection reset is normal for browsers
@@ -161,8 +190,26 @@ async fn handle_request(
     req: Request<hyper::body::Incoming>,
     status_handle: &BridgeStatusHandle,
     device_switch_tx: &DeviceSwitchTx,
+    release_tx: &Option<ReleaseTx>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     match (req.method(), req.uri().path()) {
+        (&Method::POST, "/api/release") if release_tx.is_some() => {
+            info!("web UI: release requested");
+            let sent = match release_tx.as_ref() {
+                Some(tx) => tx.send(()).await.is_ok(),
+                None => false,
+            };
+            let (code, body) = if sent {
+                (200, r#"{"ok":true}"#)
+            } else {
+                (503, r#"{"ok":false,"error":"endpoint not running"}"#)
+            };
+            Ok(Response::builder()
+                .status(code)
+                .header("Content-Type", "application/json")
+                .body(Full::new(Bytes::from(body)))
+                .unwrap())
+        }
         (&Method::GET, "/") | (&Method::GET, "/index.html") => {
             let status = status_handle.snapshot().await;
             let html = render_html(&status);
