@@ -23,6 +23,14 @@ use tracing::info;
 /// [logging]
 /// level = "info"
 ///
+/// # How the controller's volume is applied: "software" (scale the
+/// # samples; bit-perfect at 100 % only), "hardware" (the DAC's mixer) or
+/// # "fixed" (no volume control, the audio reaches the DAC unchanged).
+/// [dac]
+/// # volume = "software"
+/// # card = 1            # for "hardware": ALSA card number or ID ("Hugo2")
+/// # mixer = "PCM"       # for "hardware": the control (default: found)
+///
 /// # Status page and its controls (POST /api/release, /api/device)
 /// [web_ui]
 /// # enabled = true
@@ -131,13 +139,56 @@ impl Default for CapabilitiesSection {
     }
 }
 
+/// How the endpoint applies the controller's volume (RFC §3.3 `vol`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VolumeMode {
+    /// Scale the samples: bit-perfect at 100 % only.
+    Software,
+    /// The DAC's own mixer (`card`, `mixer`).
+    Hardware,
+    /// No volume control: the audio reaches the DAC unchanged and volume
+    /// commands are ignored.
+    Fixed,
+}
+
+/// An ALSA card by number or by ID (`card = 1`, `card = "Hugo2"`): USB card
+/// numbers can change between boots, IDs don't.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum CardRef {
+    Index(u32),
+    Id(String),
+}
+
+impl Default for CardRef {
+    fn default() -> Self {
+        CardRef::Index(0)
+    }
+}
+
+impl std::fmt::Display for CardRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CardRef::Index(n) => write!(f, "{n}"),
+            CardRef::Id(id) => f.write_str(id),
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct DacSection {
-    /// Use ALSA hardware volume control instead of software volume.
+    /// How the volume is applied; without it, `hardware_volume` decides.
+    pub volume: Option<VolumeMode>,
+    /// Use ALSA hardware volume control instead of software volume. Same
+    /// as `volume = "hardware"`, kept for existing configs.
     pub hardware_volume: bool,
-    /// ALSA card number for mixer commands.
-    pub card: u32,
+    /// ALSA card for mixer commands, by number or ID.
+    pub card: CardRef,
+    /// The volume control (`"PCM"` or `"PCM Playback Volume"`). Without
+    /// it, the endpoint picks one.
+    pub mixer: Option<String>,
     /// FIR filter type (ESS 9038 DACs).
     /// Options: "brick wall", "corrected minimum phase fast", "minimum phase slow",
     ///          "minimum phase fast", "linear phase slow", "linear phase fast", "apodizing fast"
@@ -150,6 +201,16 @@ impl Default for LoggingSection {
         Self {
             level: "info".into(),
         }
+    }
+}
+
+impl DacSection {
+    pub fn volume_mode(&self) -> VolumeMode {
+        self.volume.unwrap_or(if self.hardware_volume {
+            VolumeMode::Hardware
+        } else {
+            VolumeMode::Software
+        })
     }
 }
 
@@ -248,6 +309,38 @@ level = "debug"
         assert!(cfg.capabilities.dsd);
         assert!(cfg.capabilities.flac);
         assert_eq!(cfg.logging.level, "debug");
+    }
+
+    #[test]
+    fn parse_dac_volume() {
+        let cfg: EndpointFileConfig = toml::from_str(
+            r#"
+[dac]
+volume = "hardware"
+card = "Hugo2"
+mixer = "PCM"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.dac.volume_mode(), VolumeMode::Hardware);
+        assert_eq!(cfg.dac.card, CardRef::Id("Hugo2".into()));
+        assert_eq!(cfg.dac.card.to_string(), "Hugo2");
+        assert_eq!(cfg.dac.mixer.as_deref(), Some("PCM"));
+
+        let cfg: EndpointFileConfig = toml::from_str("[dac]\nvolume = \"fixed\"\n").unwrap();
+        assert_eq!(cfg.dac.volume_mode(), VolumeMode::Fixed);
+
+        // the older form still works
+        let cfg: EndpointFileConfig =
+            toml::from_str("[dac]\nhardware_volume = true\ncard = 1\n").unwrap();
+        assert_eq!(cfg.dac.volume_mode(), VolumeMode::Hardware);
+        assert_eq!(cfg.dac.card, CardRef::Index(1));
+
+        assert_eq!(
+            EndpointFileConfig::default().dac.volume_mode(),
+            VolumeMode::Software
+        );
+        assert!(toml::from_str::<EndpointFileConfig>("[dac]\nvolume = \"loud\"\n").is_err());
     }
 
     #[test]
