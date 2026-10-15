@@ -137,6 +137,19 @@ impl FlacStreamDecoder {
         self.drain_frames()
     }
 
+    /// Whether the stream header (STREAMINFO) has been read.
+    pub fn is_initialized(&self) -> bool {
+        self.initialized
+    }
+
+    /// Drop buffered input but keep the stream parameters, for the same
+    /// stream resuming after a gap (an `endpoint_release`, RFC §7.3.1): what
+    /// follows doesn't repeat the stream header. Decoding picks up at the
+    /// next frame.
+    pub fn resync(&mut self) {
+        self.buf.clear();
+    }
+
     /// Reset for a new stream.
     pub fn reset(&mut self) {
         self.buf.clear();
@@ -460,6 +473,17 @@ pub(crate) mod tests {
         (out, header_len, lens)
     }
 
+    /// Start offset of each frame in an `encode_flac` stream.
+    pub(crate) fn frame_offsets(header_len: usize, lens: &[usize]) -> Vec<usize> {
+        lens.iter()
+            .scan(header_len, |pos, len| {
+                let start = *pos;
+                *pos += len;
+                Some(start)
+            })
+            .collect()
+    }
+
     /// #32: frames fed after initialization must be decoded, and the input
     /// buffer must not keep everything ever fed.
     #[test]
@@ -527,6 +551,22 @@ pub(crate) mod tests {
         out.extend(dec.feed(&[]));
         assert_eq!(out.len(), 3 * 128 * 2);
         assert!(first.len() < out.len());
+    }
+
+    #[test]
+    fn stream_decoder_resync_resumes_mid_stream_without_header() {
+        let (flac, header_len, lens) = encode_flac(6, 128);
+        let offsets = frame_offsets(header_len, &lens);
+        let mut dec = FlacStreamDecoder::new();
+        let first = dec.feed(&flac[..offsets[2] + 10]);
+        dec.resync();
+        assert!(dec.is_initialized());
+        // the stream goes on from somewhere inside frame 3: frames 4 and 5
+        // decode, without a new stream header
+        let mut out = dec.feed(&flac[offsets[3] + 5..]);
+        out.extend(dec.feed(&[]));
+        assert_eq!(first.len(), 2 * 128 * 2);
+        assert_eq!(out.len(), 2 * 128 * 2);
     }
 
     #[test]

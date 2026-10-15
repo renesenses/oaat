@@ -609,6 +609,7 @@ The controller:
 - MUST stop streaming to that endpoint and MUST NOT resume it on its own, including through automatic reconnection or a watchdog. For a single-endpoint zone, the zone becomes paused, as if the user had paused it. In a multi-endpoint zone, only that endpoint leaves the zone (§7.5.3 semantics); the others keep playing.
 - MUST wait at least 10 s for the answer to a `format_propose`. On a device shared with other players, the endpoint may have to wait for another one to let go of the output before it can accept (§5.3 readiness); it SHOULD fail open within 9 s.
 - Resumes only on a user action (play). It then starts a new negotiation (`format_propose`, then `play`), because the endpoint's device is closed. An endpoint SHOULD also accept a bare `play` after a release by reopening the device with the last negotiated format.
+- When the same stream resumes (the same `stream_id` and format), its audio continues where the controller left off and does not repeat the FLAC stream header: the endpoint keeps the header it already has.
 
 ### 7.4 Metadata
 

@@ -836,6 +836,16 @@ async fn run_endpoint(
                                 fp.format, fp.sample_rate, fp.channels, fp.bits_per_sample
                             );
                         }
+                        // The released stream negotiated again with the same
+                        // format: it resumes where it was (RFC §7.3.1), a FLAC
+                        // stream without a new stream header.
+                        let resumes_released = released
+                            && fp.stream_id == current_stream_id
+                            && last_format.as_ref().is_some_and(|l| {
+                                l.format == fp.format
+                                    && l.sample_rate == fp.sample_rate
+                                    && l.channels == fp.channels
+                            });
                         stream_sample_rate = fp.sample_rate;
                         current_stream_id = fp.stream_id.clone();
                         // a new negotiation ends a release
@@ -854,7 +864,12 @@ async fn run_endpoint(
                             output_in_use = true;
                             hooks.fire("start");
                         }
-                        match audio.configure_with_device(fp.format, fp.sample_rate, fp.channels, current_audio_device.as_deref()) {
+                        let configured = if resumes_released {
+                            audio.reopen_after_release(fp.format, fp.sample_rate, fp.channels, current_audio_device.as_deref())
+                        } else {
+                            audio.configure_with_device(fp.format, fp.sample_rate, fp.channels, current_audio_device.as_deref())
+                        };
+                        match configured {
                             Ok(()) => {
                                 #[cfg(feature = "web-ui")]
                                 {
@@ -1002,7 +1017,7 @@ async fn run_endpoint(
                             if released {
                                 released = false;
                                 if let Some(fp) = last_format.as_ref()
-                                    && let Err(e) = audio.configure_with_device(fp.format, fp.sample_rate, fp.channels, current_audio_device.as_deref())
+                                    && let Err(e) = audio.reopen_after_release(fp.format, fp.sample_rate, fp.channels, current_audio_device.as_deref())
                                 {
                                     error!(error = %e, "audio output configuration after release failed");
                                 }

@@ -522,6 +522,29 @@ impl CpalOutput {
         self.stop();
     }
 
+    /// Open the device again after `release()`, for the same stream. Unlike
+    /// `configure_with_device()`, a FLAC stream keeps its decoder: it holds
+    /// the stream header, which the resumed stream doesn't repeat.
+    pub fn reopen_after_release(
+        &mut self,
+        format: AudioFormat,
+        sample_rate: u32,
+        channels: u8,
+        device_name: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(feature = "flac")]
+        let flac_stream = self.flac_stream.take();
+        self.configure_with_device(format, sample_rate, channels, device_name)?;
+        #[cfg(feature = "flac")]
+        if format == AudioFormat::Flac
+            && let Some(mut dec) = flac_stream.filter(|d| d.is_initialized())
+        {
+            dec.resync();
+            self.flac_stream = Some(dec);
+        }
+        Ok(())
+    }
+
     /// True between `play()` and `pause()`/`stop()`/`release()`.
     pub fn is_playing(&self) -> bool {
         self.playing.load(Ordering::Relaxed)

@@ -356,6 +356,29 @@ impl AlsaDirectOutput {
         Ok(())
     }
 
+    /// Open the device again after `release()`, for the same stream. Unlike
+    /// `configure_with_device()`, a FLAC stream keeps its decoder: it holds
+    /// the stream header, which the resumed stream doesn't repeat.
+    pub fn reopen_after_release(
+        &mut self,
+        format: AudioFormat,
+        sample_rate: u32,
+        channels: u8,
+        device_name: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(feature = "flac")]
+        let flac_stream = self.flac_stream.take();
+        self.configure_with_device(format, sample_rate, channels, device_name)?;
+        #[cfg(feature = "flac")]
+        if format == AudioFormat::Flac
+            && let Some(mut dec) = flac_stream.filter(|d| d.is_initialized())
+        {
+            dec.resync();
+            self.flac_stream = Some(dec);
+        }
+        Ok(())
+    }
+
     pub fn play(&self) {
         self.playing.store(true, Ordering::Relaxed);
         info!("audio output started (ALSA direct)");
@@ -376,9 +399,10 @@ impl AlsaDirectOutput {
 
     /// Give up the device now (endpoint_release): unlike `stop()`, queued
     /// audio is dropped, so another source can open the DAC right away.
-    /// When this returns the ALSA device is closed.
+    /// When this returns the ALSA device is closed. A FLAC decoder keeps the
+    /// stream header, for `reopen_after_release()`.
     pub fn release(&mut self) {
-        self.shutdown(true);
+        self.close_writer(true);
     }
 
     /// True between `play()` and `pause()`/`stop()`/`release()`.
@@ -389,6 +413,15 @@ impl AlsaDirectOutput {
     /// Stop the writer thread; `discard` drops queued audio instead of
     /// playing it out.
     fn shutdown(&mut self, discard: bool) {
+        self.close_writer(discard);
+        #[cfg(feature = "flac")]
+        if let Some(dec) = self.flac_stream.as_mut() {
+            dec.reset();
+        }
+    }
+
+    /// Stop the writer thread, which closes the device.
+    fn close_writer(&mut self, discard: bool) {
         self.playing.store(false, Ordering::Relaxed);
         if let Some(w) = self.writer.take() {
             w.stop.store(discard, Ordering::Relaxed);
@@ -396,10 +429,6 @@ impl AlsaDirectOutput {
             if w.handle.join().is_err() {
                 warn!("ALSA writer thread panicked");
             }
-        }
-        #[cfg(feature = "flac")]
-        if let Some(dec) = self.flac_stream.as_mut() {
-            dec.reset();
         }
     }
 
@@ -1194,6 +1223,29 @@ mod tests {
         assert_eq!(st.open_marks.len(), 1);
         assert_eq!(st.closes, 1, "stop() must close the device");
         assert_eq!(st.drains, 1, "stop() plays out the queue (end of track not cut)");
+    }
+
+    /// A FLAC stream resumed after a release goes on without a new stream
+    /// header: the decoder is kept, and decoding picks up at the next frame.
+    #[cfg(feature = "flac")]
+    #[test]
+    fn flac_stream_resumes_after_release_without_header() {
+        let (st, opener) = fake();
+        let (flac, header_len, lens) = crate::flac_decoder::tests::encode_flac(20, 256);
+        let offsets = crate::flac_decoder::tests::frame_offsets(header_len, &lens);
+        let mut out = AlsaDirectOutput::with_opener(opener);
+        out.configure(AudioFormat::Flac, 44_100, 2).unwrap();
+        out.play();
+        assert_eq!(out.write_audio(&flac[..offsets[5]]), 5 * 256);
+        out.release();
+        out.reopen_after_release(AudioFormat::Flac, 44_100, 2, None)
+            .unwrap();
+        out.play();
+        // the controller paused mid-frame and goes on from frame 10
+        let frames = out.write_audio(&flac[offsets[10]..]);
+        out.stop();
+        assert_eq!(frames, 10 * 256, "frames after the release must decode");
+        assert_eq!(st.lock().unwrap().open_marks.len(), 2);
     }
 
     /// #45: the device is lost mid-stream (DAC unplugged). It is reopened
