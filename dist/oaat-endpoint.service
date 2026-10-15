@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/oaat endpoint --daemon --config /etc/oaat/endpoint.toml
+ExecStart=/usr/local/bin/oaat endpoint --config /etc/oaat/endpoint.toml
 Restart=always
 RestartSec=3
 
