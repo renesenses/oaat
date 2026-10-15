@@ -63,6 +63,8 @@ async fn controller_connects_to_endpoint_and_handshakes() {
         buffer_size_ms: 1000,
         tls: false,
         defer_format_accept: false,
+        accept_timeout: oaat_endpoint::DEFAULT_ACCEPT_TIMEOUT,
+        release_accept_timeout: oaat_endpoint::DEFAULT_RELEASE_ACCEPT_TIMEOUT,
     };
 
     let (event_tx, mut event_rx) = mpsc::channel(32);
@@ -139,6 +141,8 @@ async fn controller_sends_format_propose_and_audio() {
         buffer_size_ms: 1000,
         tls: false,
         defer_format_accept: false,
+        accept_timeout: oaat_endpoint::DEFAULT_ACCEPT_TIMEOUT,
+        release_accept_timeout: oaat_endpoint::DEFAULT_RELEASE_ACCEPT_TIMEOUT,
     };
 
     let (event_tx, mut event_rx) = mpsc::channel(64);
@@ -270,6 +274,8 @@ async fn clock_sync_bootstrap() {
         buffer_size_ms: 1000,
         tls: false,
         defer_format_accept: false,
+        accept_timeout: oaat_endpoint::DEFAULT_ACCEPT_TIMEOUT,
+        release_accept_timeout: oaat_endpoint::DEFAULT_RELEASE_ACCEPT_TIMEOUT,
     };
 
     let (event_tx, _event_rx) = mpsc::channel(32);
@@ -330,6 +336,8 @@ async fn setup_endpoint_and_controller(
         buffer_size_ms: 1000,
         tls: false,
         defer_format_accept: false,
+        accept_timeout: oaat_endpoint::DEFAULT_ACCEPT_TIMEOUT,
+        release_accept_timeout: oaat_endpoint::DEFAULT_RELEASE_ACCEPT_TIMEOUT,
     };
 
     let (event_tx, mut event_rx) = mpsc::channel(64);
@@ -817,6 +825,8 @@ async fn multiroom_zone_streams_to_two_endpoints() {
             buffer_size_ms: 1000,
             tls: false,
             defer_format_accept: false,
+            accept_timeout: oaat_endpoint::DEFAULT_ACCEPT_TIMEOUT,
+            release_accept_timeout: oaat_endpoint::DEFAULT_RELEASE_ACCEPT_TIMEOUT,
         };
 
         let (event_tx, event_rx) = mpsc::channel(256);
@@ -959,6 +969,8 @@ async fn spawn_test_endpoint(index: usize) -> (SocketAddr, mpsc::Receiver<Endpoi
         buffer_size_ms: 1000,
         tls: false,
         defer_format_accept: false,
+        accept_timeout: oaat_endpoint::DEFAULT_ACCEPT_TIMEOUT,
+        release_accept_timeout: oaat_endpoint::DEFAULT_RELEASE_ACCEPT_TIMEOUT,
     };
 
     let (event_tx, event_rx) = mpsc::channel(256);

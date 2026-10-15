@@ -26,6 +26,12 @@ use config::EndpointFileConfig;
 
 const PID_FILE: &str = "/tmp/tune-bridge.pid";
 const DEFAULT_WEB_UI_PORT: u16 = 9741;
+/// How long a format accept waits for the audio device to open (another
+/// player on this host may still hold it, while the start hook makes it let
+/// go), with a controller that doesn't handle endpoint_release: Tune gives
+/// up on a negotiation after 5 s. One that does waits longer (RFC §7.3.1),
+/// see `DEFAULT_RELEASE_ACCEPT_TIMEOUT`.
+const ACCEPT_TIMEOUT: Duration = Duration::from_secs(4);
 
 #[derive(Parser)]
 #[command(
@@ -491,7 +497,13 @@ async fn run_endpoint(
         let (handle, _reader) = web_ui::BridgeStatusHandle::new(initial_status);
         let (switch_tx, switch_rx) = mpsc::channel::<String>(8);
         if web_ui_enabled {
-            web_ui::start_web_ui_on(web_ui_addr, handle.clone(), switch_tx, Some(release_tx.clone())).await;
+            web_ui::start_web_ui_on(
+                web_ui_addr,
+                handle.clone(),
+                switch_tx,
+                Some(release_tx.clone()),
+            )
+            .await;
         }
         (handle, switch_rx)
     };
@@ -537,6 +549,8 @@ async fn run_endpoint(
         // confirm through ctrl_tx below), so the controller's play-delay
         // lead time starts from a ready endpoint.
         defer_format_accept: true,
+        accept_timeout: ACCEPT_TIMEOUT,
+        release_accept_timeout: oaat_endpoint::DEFAULT_RELEASE_ACCEPT_TIMEOUT,
     };
 
     let (event_tx, mut event_rx) = mpsc::channel(256);
@@ -600,6 +614,16 @@ async fn run_endpoint(
     // endpoint_release (RFC §7.3.1) sent: audio and reformats are ignored
     // until the controller negotiates again or sends play.
     let mut released = false;
+    // A release went to the transport, which hasn't handled it yet
+    // (EndpointEvent::ReleaseHandled): a FormatProposed until then belongs to
+    // a negotiation the release ended, and the transport rejected it.
+    let mut release_in_flight = false;
+    // Format accept held back until the device is open: (stream_id, give-up
+    // time). If it doesn't open in time, the transport accepts on its own
+    // (fail-open).
+    let mut accept_pending: Option<(String, tokio::time::Instant)> = None;
+    let mut accept_poll = tokio::time::interval(Duration::from_millis(20));
+    accept_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_format: Option<oaat_core::message::FormatPropose> = None;
     let mut connected = false;
 
@@ -649,12 +673,26 @@ async fn run_endpoint(
                     println!("Playback started (PTS-scheduled, timer late by {late_us} µs)");
                 }
             }
+            // Deferred format accept: sent once the device is open, so the
+            // controller's play delay starts from a ready endpoint.
+            _ = accept_poll.tick(), if accept_pending.is_some() => {
+                if audio.device_open() {
+                    let (stream_id, _) = accept_pending.take().expect("guarded by is_some");
+                    info!(stream_id = %stream_id, "audio device open, format accepted");
+                    let _ = ctrl_tx
+                        .send(oaat_core::Message::FormatAccept(FormatAccept { stream_id }))
+                        .await;
+                } else if accept_pending.as_ref().is_some_and(|(_, t)| tokio::time::Instant::now() >= *t) {
+                    let (stream_id, _) = accept_pending.take().expect("guarded by is_some");
+                    warn!(stream_id = %stream_id, "audio device still not open, the transport accepted the format");
+                }
+            }
             // Drift servo: compare actual playback position (frames consumed
             // by the audio callback) with the position the clock says we
             // should be at, and queue a skip/duplicate correction.
             _ = servo_interval.tick() => {
                 servo_ticks += 1;
-                if output_in_use && !audio.is_playing() && !audio.device_open() {
+                if output_in_use && accept_pending.is_none() && !audio.is_playing() && !audio.device_open() {
                     output_idle_ticks += 1;
                     if output_idle_ticks >= 2 {
                         output_in_use = false;
@@ -780,6 +818,10 @@ async fn run_endpoint(
                         }
                     }
                     EndpointEvent::FormatProposed(fp) => {
+                        if release_in_flight {
+                            info!(stream_id = %fp.stream_id, "format proposal ended by the release, device left closed");
+                            continue;
+                        }
                         if daemon {
                             info!(
                                 format = %fp.format,
@@ -805,6 +847,13 @@ async fn run_endpoint(
                         start_deadline = None;
                         tracker = None;
                         last_drift = 0;
+                        accept_pending = None;
+                        // Before the device is opened: the hook makes the
+                        // other players on this host let go of it.
+                        if !output_in_use {
+                            output_in_use = true;
+                            hooks.fire("start");
+                        }
                         match audio.configure_with_device(fp.format, fp.sample_rate, fp.channels, current_audio_device.as_deref()) {
                             Ok(()) => {
                                 #[cfg(feature = "web-ui")]
@@ -827,14 +876,14 @@ async fn run_endpoint(
                                 } else {
                                     println!("Audio output configured");
                                 }
-                                // Device is open: release the deferred
-                                // FormatAccept so the controller starts its
-                                // play-delay countdown from a ready endpoint.
-                                let _ = ctrl_tx
-                                    .send(oaat_core::Message::FormatAccept(FormatAccept {
-                                        stream_id: fp.stream_id.clone(),
-                                    }))
-                                    .await;
+                                // The device opens in the background (it
+                                // may be busy): the accept goes out once it
+                                // is open, see the accept_poll arm.
+                                accept_pending = Some((
+                                    fp.stream_id.clone(),
+                                    tokio::time::Instant::now()
+                                        + ACCEPT_TIMEOUT.max(oaat_endpoint::DEFAULT_RELEASE_ACCEPT_TIMEOUT),
+                                ));
                             }
                             Err(e) => {
                                 if daemon {
@@ -943,6 +992,10 @@ async fn run_endpoint(
                             } else {
                                 println!("Play: {id}");
                             }
+                            if !output_in_use {
+                                output_in_use = true;
+                                hooks.fire("start");
+                            }
                             // Play after a release without a new negotiation:
                             // the device was closed, open it again with the
                             // last format.
@@ -953,10 +1006,6 @@ async fn run_endpoint(
                                 {
                                     error!(error = %e, "audio output configuration after release failed");
                                 }
-                            }
-                            if !output_in_use {
-                                output_in_use = true;
-                                hooks.fire("start");
                             }
                             if started {
                                 // Resume from pause: output is already
@@ -1006,6 +1055,10 @@ async fn run_endpoint(
                             start_deadline = None;
                             tracker = None;
                             last_drift = 0;
+                            accept_pending = None;
+                            // no stream any more: a release now carries an
+                            // empty stream_id (RFC §7.3.1)
+                            current_stream_id.clear();
                             if output_in_use {
                                 output_in_use = false;
                                 hooks.fire("stop");
@@ -1175,6 +1228,9 @@ async fn run_endpoint(
                         audio.stop();
                         connected = false;
                         released = false;
+                        release_in_flight = false;
+                        accept_pending = None;
+                        current_stream_id.clear();
                         if output_in_use {
                             output_in_use = false;
                             hooks.fire("stop");
@@ -1197,6 +1253,9 @@ async fn run_endpoint(
                         packet_count = 0;
                         total_bytes = 0;
                     }
+                    EndpointEvent::ReleaseHandled => {
+                        release_in_flight = false;
+                    }
                     EndpointEvent::Error(e) => {
                         error!(error = %e, "endpoint error");
                     }
@@ -1208,12 +1267,14 @@ async fn run_endpoint(
                 info!(stream_id = %current_stream_id, "releasing the audio output");
                 audio.release();
                 released = true;
+                accept_pending = None;
                 armed = false;
                 started = false;
                 start_deadline = None;
                 tracker = None;
                 last_drift = 0;
                 if connected {
+                    release_in_flight = true;
                     let _ = ctrl_tx
                         .send(oaat_core::Message::EndpointRelease(oaat_core::message::EndpointRelease {
                             stream_id: current_stream_id.clone(),
@@ -1271,7 +1332,11 @@ impl HookRunner {
             .name("hooks".into())
             .spawn(move || {
                 for event in rx {
-                    let cmd = if event == "start" { &on_start } else { &on_stop };
+                    let cmd = if event == "start" {
+                        &on_start
+                    } else {
+                        &on_stop
+                    };
                     let Some(cmd) = cmd else { continue };
                     match std::process::Command::new("/bin/sh")
                         .arg("-c")
@@ -1418,7 +1483,10 @@ async fn run_controller(
         // endpoint_release (RFC §7.3.1): the endpoint gave up its output,
         // pause here instead of streaming into the void.
         if let Ok(r) = endpoint.release_rx.try_recv() {
-            println!("\nEndpoint released its output ({:?}), stream paused.", r.reason);
+            println!(
+                "\nEndpoint released its output ({:?}), stream paused.",
+                r.reason
+            );
             return;
         }
         let chunk = samples_per_packet.min((total_samples - sample_offset) as usize);

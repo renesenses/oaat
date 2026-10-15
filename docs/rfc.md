@@ -288,7 +288,8 @@ not merely that the format is acceptable. Opening an audio device can take
 hundreds of milliseconds to seconds on some hosts; an accept sent before the
 device is ready silently consumes the Controller's play-delay lead time and
 defeats PTS-scheduled starts (§6.4). Endpoints SHOULD defer the accept until
-the device is open, with a bounded fail-open (RECOMMENDED: 5 s) so a stuck
+the device is open, with a bounded fail-open (RECOMMENDED: 5 s; with a
+Controller that announced `endpoint_release`, up to 9 s, see §7.3.1) so a stuck
 device cannot deadlock the negotiation. `FORMAT_COUNTER` and `FORMAT_REJECT`
 involve no device setup and are sent immediately.
 
@@ -600,11 +601,13 @@ The endpoint:
 
 - MUST only send `endpoint_release` when the controller announced the `endpoint_release` feature in `hello`. To any other controller it sends nothing, and it MAY simply stop playing (that controller keeps streaming into a silent endpoint).
 - MUST close the audio device before or right after sending the message, without playing out what is buffered, and MUST ignore audio packets and gapless reformats for the released stream.
+- If a negotiation is in progress (a `format_propose` it has not answered yet), MUST answer it with `format_reject`, reason `released`, before sending `endpoint_release`, and MUST NOT open the device for it.
 - Keeps the control connection open.
 
 The controller:
 
 - MUST stop streaming to that endpoint and MUST NOT resume it on its own, including through automatic reconnection or a watchdog. For a single-endpoint zone, the zone becomes paused, as if the user had paused it. In a multi-endpoint zone, only that endpoint leaves the zone (§7.5.3 semantics); the others keep playing.
+- MUST wait at least 10 s for the answer to a `format_propose`. On a device shared with other players, the endpoint may have to wait for another one to let go of the output before it can accept (§5.3 readiness); it SHOULD fail open within 9 s.
 - Resumes only on a user action (play). It then starts a new negotiation (`format_propose`, then `play`), because the endpoint's device is closed. An endpoint SHOULD also accept a bare `play` after a release by reopening the device with the last negotiated format.
 
 ### 7.4 Metadata

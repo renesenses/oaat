@@ -70,7 +70,9 @@ impl Default for WebUiSection {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct HooksSection {
-    /// Run before the output is used: on `play`, when it wasn't in use.
+    /// Run before the output is used, when it wasn't in use: on a new
+    /// negotiation (before the device is opened, so the hook can make
+    /// another program let go of it) or on a bare `play` after a release.
     pub on_start: Option<String>,
     /// Run once the output is released: stopped, released, or closed after
     /// a pause.

@@ -14,6 +14,9 @@
 //!   (DAC unplugged), dropping audio while the device is absent instead of
 //!   blocking the caller (#33). The FLAC decoder lives on the caller's side,
 //!   so a reopen needs no stream header: decoding simply goes on (#45);
+//! - retries a device another program holds (`EBUSY`) every `BUSY_RETRY`,
+//!   also before any audio arrives, for `BUSY_WAIT`: on a host that hands
+//!   the DAC from one player to another, the other one is about to let go;
 //! - closes the device after `IDLE_CLOSE` without audio, so an endpoint
 //!   whose stream ended does not keep the DAC open, and reopens it on the
 //!   next audio (#44, #12).
@@ -66,6 +69,16 @@ const RESPAWN_BACKOFF_MAX: Duration = Duration::from_secs(8);
 /// starts the backoff over instead of continuing to double it.
 const RESPAWN_STABLE_RUN: Duration = Duration::from_secs(5);
 
+/// Reopen delay while another program holds the device (`EBUSY`). On a host
+/// that switches players, the other one is about to let go: retry often.
+const BUSY_RETRY: Duration = Duration::from_millis(100);
+/// How long a busy device is retried without audio coming in: covers the
+/// wait between `configure()` and the first audio, while the endpoint holds
+/// its format accept back until the device is open. After that it is only
+/// retried as audio arrives, so an endpoint nobody streams to doesn't grab
+/// the DAC the moment its owner lets go.
+const BUSY_WAIT: Duration = Duration::from_secs(5);
+
 /// What the writer thread opens: device name, ALSA sample format (as ALSA
 /// names it), rate and channel count.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,8 +121,23 @@ pub(crate) trait PcmDevice: Send {
     fn discard(&mut self);
 }
 
+/// Why the device could not be opened.
+#[derive(Debug)]
+pub(crate) enum OpenError {
+    /// Another program holds the device (`EBUSY`).
+    Busy(String),
+    /// Anything else (device absent, parameters not supported).
+    Failed(String),
+}
+
+impl From<String> for OpenError {
+    fn from(e: String) -> Self {
+        OpenError::Failed(e)
+    }
+}
+
 pub(crate) type DeviceOpener =
-    Arc<dyn Fn(&DeviceParams) -> Result<Box<dyn PcmDevice>, String> + Send + Sync>;
+    Arc<dyn Fn(&DeviceParams) -> Result<Box<dyn PcmDevice>, OpenError> + Send + Sync>;
 
 /// State shared between the output and its writer thread.
 #[derive(Default)]
@@ -526,6 +554,8 @@ struct DeviceSlot {
     opened_at: Option<Instant>,
     retry_at: Option<Instant>,
     backoff: Duration,
+    /// Since when the device has been busy (`EBUSY`), while it is.
+    busy_since: Option<Instant>,
 }
 
 impl DeviceSlot {
@@ -540,7 +570,13 @@ impl DeviceSlot {
         }
         match (self.opener)(&self.params) {
             Ok(dev) => {
-                if self.retry_at.is_some() {
+                if let Some(since) = self.busy_since.take() {
+                    info!(
+                        device = %self.params.device,
+                        waited_ms = since.elapsed().as_millis() as u64,
+                        "ALSA device no longer busy, opened"
+                    );
+                } else if self.retry_at.is_some() {
                     info!(device = %self.params.device, "ALSA device reopened after a failure");
                 }
                 self.dev = Some(dev);
@@ -549,7 +585,21 @@ impl DeviceSlot {
                 self.shared.open.store(true, Ordering::Relaxed);
                 true
             }
-            Err(e) => {
+            Err(OpenError::Busy(e)) => {
+                if self.busy_since.is_none() {
+                    self.busy_since = Some(Instant::now());
+                    warn!(
+                        device = %self.params.device,
+                        error = %e,
+                        retry_in_ms = BUSY_RETRY.as_millis() as u64,
+                        "ALSA device busy, retrying"
+                    );
+                }
+                self.retry_at = Some(Instant::now() + BUSY_RETRY);
+                false
+            }
+            Err(OpenError::Failed(e)) => {
+                self.busy_since = None;
                 self.schedule_retry();
                 warn!(
                     device = %self.params.device,
@@ -559,6 +609,15 @@ impl DeviceSlot {
                 );
                 false
             }
+        }
+    }
+
+    /// When to retry a busy device although no audio came in, if it should.
+    fn busy_retry_at(&self) -> Option<Instant> {
+        if self.dev.is_none() && self.busy_since.is_some_and(|t| t.elapsed() < BUSY_WAIT) {
+            self.retry_at
+        } else {
+            None
         }
     }
 
@@ -652,14 +711,23 @@ fn writer_loop(
         opened_at: None,
         retry_at: None,
         backoff: Duration::ZERO,
+        busy_since: None,
     };
     // Open right away: the first audio should not pay for it.
     slot.ensure_open();
     let mut last_write = Instant::now();
     let mut pause_gen = slot.shared.pause_gen.load(Ordering::Relaxed);
     loop {
-        let data = match rx.recv_timeout(idle_close) {
+        let busy_retry_at = slot.busy_retry_at();
+        let wait = busy_retry_at.map_or(idle_close, |at| {
+            at.saturating_duration_since(Instant::now())
+        });
+        let data = match rx.recv_timeout(wait) {
             Ok(d) => d,
+            Err(RecvTimeoutError::Timeout) if busy_retry_at.is_some() => {
+                slot.ensure_open();
+                continue;
+            }
             Err(RecvTimeoutError::Timeout) => {
                 if slot.dev.is_some() {
                     info!(idle_ms = idle_close.as_millis() as u64, "no audio, ALSA device closed until the next stream");
@@ -753,13 +821,19 @@ fn alsa_format(name: &str) -> Option<alsa::pcm::Format> {
 /// Open and configure the ALSA PCM: interleaved access, exact format and
 /// channels, nearest rate, ~2 s buffer in 125 ms periods, start once the
 /// buffer is full (what `aplay` did).
-fn open_alsa_device(p: &DeviceParams) -> Result<Box<dyn PcmDevice>, String> {
+fn open_alsa_device(p: &DeviceParams) -> Result<Box<dyn PcmDevice>, OpenError> {
     use alsa::pcm::{Access, HwParams};
     use alsa::{Direction, PCM, ValueOr};
 
     let fmt = alsa_format(p.format).ok_or_else(|| format!("unknown ALSA format {}", p.format))?;
     let err = |what: &str, e: alsa::Error| format!("{}: {what}: {e}", p.device);
-    let pcm = PCM::new(&p.device, Direction::Playback, false).map_err(|e| err("open", e))?;
+    let pcm = PCM::new(&p.device, Direction::Playback, false).map_err(|e| {
+        if alsa_errno(&e) == libc::EBUSY {
+            OpenError::Busy(err("open", e))
+        } else {
+            OpenError::Failed(err("open", e))
+        }
+    })?;
     {
         let hwp = HwParams::any(&pcm).map_err(|e| err("hw params", e))?;
         hwp.set_access(Access::RWInterleaved)
@@ -999,6 +1073,7 @@ mod tests {
         open_marks: Vec<usize>,
         open_attempts: usize,
         fail_opens: usize, // usize::MAX: always fail
+        busy_opens: usize, // opens that find the device busy, usize::MAX: always
         closes: usize,
         drains: usize,
         discards: usize,
@@ -1055,9 +1130,15 @@ mod tests {
             let mut s = st2.lock().unwrap();
             s.open_attempts += 1;
             s.params = Some(p.clone());
+            if s.busy_opens > 0 {
+                if s.busy_opens != usize::MAX {
+                    s.busy_opens -= 1;
+                }
+                return Err(OpenError::Busy("Device or resource busy".into()));
+            }
             if s.fail_opens > 0 {
                 s.fail_opens = s.fail_opens.saturating_sub(if s.fail_opens == usize::MAX { 0 } else { 1 });
-                return Err("No such device".into());
+                return Err(OpenError::Failed("No such device".into()));
             }
             let mark = s.written.len();
             s.open_marks.push(mark);
@@ -1252,6 +1333,55 @@ mod tests {
         let st = st.lock().unwrap();
         assert_eq!(st.open_marks.len(), 1, "device reopened once it is back");
         assert!(!st.written.is_empty());
+    }
+
+    /// A device another player still holds is retried every `BUSY_RETRY`,
+    /// without waiting for audio, and opened as soon as it is free: the
+    /// endpoint waits for it before accepting the format.
+    #[test]
+    fn busy_device_is_opened_once_free_without_audio() {
+        let (st, opener) = fake();
+        st.lock().unwrap().busy_opens = 5;
+        let mut out = AlsaDirectOutput::with_opener(opener);
+        out.configure(AudioFormat::PcmS16le, 48_000, 2).unwrap();
+        assert!(!out.device_open());
+        let t0 = Instant::now();
+        wait_until("open once free", || out.device_open());
+        let waited = t0.elapsed();
+        assert!(
+            waited < Duration::from_secs(2),
+            "opened {waited:?} after the device came free"
+        );
+        assert_eq!(st.lock().unwrap().open_attempts, 6);
+        out.stop();
+    }
+
+    /// Without audio, a busy device is only retried for `BUSY_WAIT`: an
+    /// endpoint nobody streams to must not take the DAC whenever its owner
+    /// lets go.
+    #[test]
+    fn busy_device_is_not_retried_forever_without_audio() {
+        let (st, opener) = fake();
+        st.lock().unwrap().busy_opens = usize::MAX;
+        let mut out = AlsaDirectOutput::with_opener(opener);
+        out.configure(AudioFormat::PcmS16le, 48_000, 2).unwrap();
+        sleep(BUSY_WAIT + Duration::from_millis(300));
+        let n = st.lock().unwrap().open_attempts;
+        assert!(n >= 40, "retried while waiting, got {n} attempts");
+        sleep(Duration::from_millis(500));
+        assert_eq!(
+            st.lock().unwrap().open_attempts,
+            n,
+            "no retries after BUSY_WAIT without audio"
+        );
+        // audio comes in: retried again
+        st.lock().unwrap().busy_opens = 0;
+        out.play();
+        wait_until("open with audio", || {
+            out.write_audio(&[0u8; 1920]);
+            out.device_open()
+        });
+        out.stop();
     }
 
     /// `flush()` (seek) discards what is queued instead of playing it out.

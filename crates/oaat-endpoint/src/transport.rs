@@ -15,6 +15,13 @@ use oaat_core::{Message, OaatError, PROTOCOL_VERSION};
 
 use crate::sync::SharedClock;
 
+/// Fail-open delay of a deferred format accept (RFC §5.3).
+pub const DEFAULT_ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Fail-open delay of a deferred format accept with a controller that
+/// announced `endpoint_release`: such a controller waits at least 10 s for
+/// the answer (RFC §7.3.1), time for another program to let go of the device.
+pub const DEFAULT_RELEASE_ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(9);
+
 pub struct EndpointConfig {
     pub endpoint_id: String,
     pub endpoint_name: String,
@@ -30,9 +37,30 @@ pub struct EndpointConfig {
     /// control channel). Without this, the accept is sent before the device
     /// is opened, and the controller's play-delay lead time is eaten by the
     /// device setup (~1-2 s on some hosts), defeating PTS scheduling.
-    /// Fail-open: if the application does not answer within 5 s, the accept
-    /// is sent anyway.
+    /// Fail-open: if the application does not answer within `accept_timeout`
+    /// (`release_accept_timeout` with a controller that announced
+    /// `endpoint_release`), the accept is sent anyway.
     pub defer_format_accept: bool,
+    /// See `defer_format_accept`; usually `DEFAULT_ACCEPT_TIMEOUT`.
+    pub accept_timeout: std::time::Duration,
+    /// See `defer_format_accept`; usually `DEFAULT_RELEASE_ACCEPT_TIMEOUT`.
+    pub release_accept_timeout: std::time::Duration,
+}
+
+/// Fail-open delays of a deferred format accept, handed to a session.
+#[derive(Clone, Copy)]
+struct DeferAccept {
+    timeout: std::time::Duration,
+    release_timeout: std::time::Duration,
+}
+
+impl EndpointConfig {
+    fn defer_accept(&self) -> Option<DeferAccept> {
+        self.defer_format_accept.then_some(DeferAccept {
+            timeout: self.accept_timeout,
+            release_timeout: self.release_accept_timeout,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -74,6 +102,13 @@ pub enum EndpointEvent {
     ZoneReleased {
         zone_id: String,
     },
+    /// The transport handled an `endpoint_release` from the application
+    /// (RFC §7.3.1). Events before this one were received before the
+    /// release, so a `FormatProposed` that comes between the application's
+    /// release and this event belongs to a negotiation the release ended:
+    /// it was answered with `format_reject` (`released`) and must not open
+    /// the device.
+    ReleaseHandled,
     Disconnected,
     Error(OaatError),
 }
@@ -175,10 +210,7 @@ impl EndpointTransport {
                             clock.clone(),
                             peer.ip(),
                         );
-                        if let Err(e) = session
-                            .run(&mut control_rx, config.defer_format_accept)
-                            .await
-                        {
+                        if let Err(e) = session.run(&mut control_rx, config.defer_accept()).await {
                             warn!(%peer, error = %e, "session ended");
                         }
                         info!("waiting for next controller connection...");
@@ -208,10 +240,7 @@ impl EndpointTransport {
             );
 
             // Run session inline — when it ends, loop back to accept
-            match session
-                .run(&mut control_rx, config.defer_format_accept)
-                .await
-            {
+            match session.run(&mut control_rx, config.defer_accept()).await {
                 Ok(()) => info!(%peer, "session ended normally"),
                 Err(e) => warn!(%peer, error = %e, "session ended with error"),
             }
@@ -280,7 +309,7 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
     async fn run(
         self,
         control_rx: &mut mpsc::Receiver<Message>,
-        defer_format_accept: bool,
+        defer_accept: Option<DeferAccept>,
     ) -> Result<(), OaatError> {
         // Destructure to get owned fields -- avoids borrow conflicts after split().
         let EndpointSession {
@@ -354,6 +383,14 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
         // announced it handles it: an older one would not know the message.
         let controller_handles_release =
             hello.features.iter().any(|f| f == FEATURE_ENDPOINT_RELEASE);
+        // Such a controller also waits longer for a format accept (§7.3.1).
+        let accept_timeout = defer_accept.map(|d| {
+            if controller_handles_release {
+                d.release_timeout
+            } else {
+                d.timeout
+            }
+        });
 
         info!(
             controller = %hello.controller_name,
@@ -393,6 +430,9 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
         // deadline). While set, the accept is withheld until the application
         // confirms the audio device is ready through the control channel.
         let mut pending_accept: Option<(String, Message, tokio::time::Instant)> = None;
+        // Stream whose accept went out on the fail-open timer: the
+        // application's late confirmation for it is dropped.
+        let mut auto_accepted: Option<String> = None;
 
         // Main control message loop: TCP messages from the controller,
         // application messages to forward (device-ready confirmations,
@@ -409,20 +449,34 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
             tokio::select! {
                 _ = tokio::time::sleep_until(accept_deadline), if pending_accept.is_some() => {
                     let (sid, auto, _) = pending_accept.take().expect("guarded by is_some");
-                    warn!(stream_id = %sid, "device ready confirmation timed out (5s), sending auto accept");
+                    warn!(
+                        stream_id = %sid,
+                        timeout_ms = accept_timeout.unwrap_or_default().as_millis() as u64,
+                        "device ready confirmation timed out, sending auto accept"
+                    );
                     writer.write_all(&FrameCodec::encode(&auto)).await?;
+                    auto_accepted = Some(sid);
                 }
 
                 Some(msg) = control_rx.recv() => {
                     // A release ends any negotiation in progress: the device
-                    // won't be opened for it.
+                    // won't be opened for it, so the controller gets a
+                    // reject instead of waiting for its timeout.
                     if matches!(msg, Message::EndpointRelease(_)) {
-                        pending_accept = None;
+                        if let Some((sid, _, _)) = pending_accept.take() {
+                            info!(stream_id = %sid, "negotiation ended by the release");
+                            let reject = Message::FormatReject(FormatReject {
+                                stream_id: sid,
+                                reason: RELEASE_REJECT_REASON.into(),
+                            });
+                            writer.write_all(&FrameCodec::encode(&reject)).await?;
+                        }
                         if controller_handles_release {
                             writer.write_all(&FrameCodec::encode(&msg)).await?;
                         } else {
                             warn!("controller does not handle endpoint_release, it may keep streaming");
                         }
+                        let _ = event_tx.send(EndpointEvent::ReleaseHandled).await;
                         continue;
                     }
                     let resolves_pending = match (&pending_accept, &msg) {
@@ -430,7 +484,14 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
                         (Some((sid, _, _)), Message::FormatReject(r)) => r.stream_id == *sid,
                         _ => false,
                     };
-                    if resolves_pending {
+                    let late_for_auto_accept = match (&auto_accepted, &msg) {
+                        (Some(sid), Message::FormatAccept(a)) => a.stream_id == *sid,
+                        (Some(sid), Message::FormatReject(r)) => r.stream_id == *sid,
+                        _ => false,
+                    };
+                    if late_for_auto_accept {
+                        debug!("device ready after the auto accept, already answered");
+                    } else if resolves_pending {
                         pending_accept = None;
                         debug!("device ready, sending format response");
                         writer.write_all(&FrameCodec::encode(&msg)).await?;
@@ -463,7 +524,7 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
                         // from a ready endpoint. Counter/reject involve no
                         // device setup and are sent immediately.
                         let deferred =
-                            defer_format_accept && matches!(response, Message::FormatAccept(_));
+                            accept_timeout.is_some() && matches!(response, Message::FormatAccept(_));
                         if !deferred {
                             writer.write_all(&FrameCodec::encode(&response)).await?;
                         }
@@ -499,7 +560,7 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
                                 stream_id,
                                 response,
                                 tokio::time::Instant::now()
-                                    + std::time::Duration::from_secs(5),
+                                    + accept_timeout.unwrap_or_default(),
                             ));
                         }
                     }
