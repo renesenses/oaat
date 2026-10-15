@@ -61,6 +61,8 @@ fn endpoint_config(
         buffer_size_ms: 1000,
         tls: false,
         defer_format_accept: false,
+        accept_timeout: oaat_endpoint::DEFAULT_ACCEPT_TIMEOUT,
+        release_accept_timeout: oaat_endpoint::DEFAULT_RELEASE_ACCEPT_TIMEOUT,
     }
 }
 

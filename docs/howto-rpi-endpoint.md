@@ -310,10 +310,13 @@ level = "info"
 # bind = "0.0.0.0"
 
 [hooks]
-# Commands run with /bin/sh -c when the endpoint starts using the DAC (on play)
-# and once it no longer does (stop, release, or closed after a pause).
-# OAAT_EVENT is set to "start" or "stop". Useful to tell other software on the
-# Pi which source plays.
+# Commands run with /bin/sh -c when the endpoint starts using the DAC (when a
+# stream is negotiated, before the DAC is opened) and once it no longer does
+# (stop, release, or closed after a pause). OAAT_EVENT is set to "start" or
+# "stop". Useful to tell other software on the Pi which source plays, so it
+# lets go of the DAC: while the DAC is busy, the endpoint retries every 100 ms
+# and accepts the stream once it is open (after 4 s at most, or 9 s with a
+# controller that handles endpoint_release).
 # on_start = "/usr/local/bin/oaat-state start"
 # on_stop = "/usr/local/bin/oaat-state stop"
 ```

@@ -302,6 +302,8 @@ pub unsafe extern "C" fn oaat_endpoint_new(name: *const c_char, port: u16) -> *m
         buffer_size_ms: 200,
         tls: false,
         defer_format_accept: false,
+        accept_timeout: oaat_endpoint::DEFAULT_ACCEPT_TIMEOUT,
+        release_accept_timeout: oaat_endpoint::DEFAULT_RELEASE_ACCEPT_TIMEOUT,
     };
 
     // Spawn the endpoint transport on the runtime
@@ -588,7 +590,8 @@ fn convert_event(ep: &OaatEndpoint, event: EndpointEvent) -> OaatEvent {
         | EndpointEvent::NextTrackReformat { .. }
         | EndpointEvent::ZoneAssigned { .. }
         | EndpointEvent::ZoneUpdated { .. }
-        | EndpointEvent::ZoneReleased { .. } => none_event(),
+        | EndpointEvent::ZoneReleased { .. }
+        | EndpointEvent::ReleaseHandled => none_event(),
     }
 }
 

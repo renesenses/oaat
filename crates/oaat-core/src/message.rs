@@ -85,6 +85,10 @@ pub struct HelloAck {
 /// it. An endpoint only sends it to a controller that announced the flag.
 pub const FEATURE_ENDPOINT_RELEASE: &str = "endpoint_release";
 
+/// `format_reject` reason for a negotiation that an `endpoint_release` ended
+/// (RFC §7.3.1).
+pub const RELEASE_REJECT_REASON: &str = "released";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EndpointCapabilities {
     pub pcm_max_rate: u32,
