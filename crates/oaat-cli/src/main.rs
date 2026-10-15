@@ -155,8 +155,16 @@ fn system_hostname() -> String {
         .to_string()
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    let cli = Cli::parse();
+
+    // Daemon mode must fork BEFORE the tokio runtime exists: fork() only copies
+    // the calling thread, so a child forked under #[tokio::main] has no worker
+    // threads (no control port, hung web UI, SIGTERM ignored) (#52).
+    if let Command::Endpoint { daemon: true, list_devices: false, .. } = &cli.command {
+        daemonize();
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -164,8 +172,32 @@ async fn main() {
         )
         .init();
 
-    let cli = Cli::parse();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime")
+        .block_on(run(cli));
+}
 
+/// Fork to background on Unix: the parent prints the child PID and exits,
+/// the child starts a new session. Called before any thread is spawned.
+fn daemonize() {
+    #[cfg(unix)]
+    unsafe {
+        let pid = libc::fork();
+        if pid < 0 {
+            eprintln!("fork failed");
+            std::process::exit(1);
+        }
+        if pid > 0 {
+            println!("Tune Bridge started in background (PID: {})", pid);
+            std::process::exit(0);
+        }
+        libc::setsid();
+    }
+}
+
+async fn run(cli: Cli) {
     match cli.command {
         Command::Endpoint {
             name,
@@ -216,26 +248,7 @@ async fn main() {
                 std::process::exit(0);
             }
 
-            // Daemon mode: fork to background on Unix
             if daemon {
-                #[cfg(unix)]
-                {
-                    // Fork to background using double-fork technique
-                    unsafe {
-                        let pid = libc::fork();
-                        if pid < 0 {
-                            eprintln!("fork failed");
-                            std::process::exit(1);
-                        }
-                        if pid > 0 {
-                            // Parent: print child PID and exit
-                            println!("Tune Bridge started in background (PID: {})", pid);
-                            std::process::exit(0);
-                        }
-                        // Child: create new session
-                        libc::setsid();
-                    }
-                }
                 write_pid_file();
             }
 

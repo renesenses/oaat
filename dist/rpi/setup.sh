@@ -240,7 +240,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=$REAL_USER
-ExecStart=/opt/oaat/oaat endpoint --daemon --config /opt/oaat/endpoint.toml
+ExecStart=/opt/oaat/oaat endpoint --config /opt/oaat/endpoint.toml
 Restart=always
 RestartSec=3
 Environment=RUST_LOG=oaat=info
