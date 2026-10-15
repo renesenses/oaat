@@ -11,6 +11,7 @@ use tracing::info;
 /// name = "Living Room DAC"
 /// port = 9740
 /// # audio_device = "default"
+/// # id = "living-room-1"   # fixed endpoint ID (default: generated, in /var/tmp)
 ///
 /// [capabilities]
 /// pcm_max_rate = 192000
@@ -21,6 +22,19 @@ use tracing::info;
 ///
 /// [logging]
 /// level = "info"
+///
+/// # Status page and its controls (POST /api/release, /api/device)
+/// [web_ui]
+/// # enabled = true
+/// # port = 9741
+/// # bind = "0.0.0.0"   # "127.0.0.1" keeps the controls local to the host
+///
+/// # Commands run (with /bin/sh -c) when the endpoint starts and stops
+/// # using the audio output, e.g. to tell the host which source plays.
+/// # OAAT_EVENT is set to "start" or "stop".
+/// [hooks]
+/// # on_start = "/usr/local/bin/oaat-state start"
+/// # on_stop = "/usr/local/bin/oaat-state stop"
 /// ```
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -29,6 +43,38 @@ pub struct EndpointFileConfig {
     pub capabilities: CapabilitiesSection,
     pub dac: DacSection,
     pub logging: LoggingSection,
+    pub web_ui: WebUiSection,
+    pub hooks: HooksSection,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct WebUiSection {
+    pub enabled: bool,
+    pub port: u16,
+    /// Address the status page listens on.
+    pub bind: std::net::IpAddr,
+}
+
+impl Default for WebUiSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            port: crate::DEFAULT_WEB_UI_PORT,
+            bind: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        }
+    }
+}
+
+/// Commands run when the endpoint starts and stops using the audio output.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct HooksSection {
+    /// Run before the output is used: on `play`, when it wasn't in use.
+    pub on_start: Option<String>,
+    /// Run once the output is released: stopped, released, or closed after
+    /// a pause.
+    pub on_stop: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -39,6 +85,10 @@ pub struct EndpointSection {
     pub audio_device: Option<String>,
     /// Enable TLS 1.3 on the control channel.
     pub tls: bool,
+    /// Fixed endpoint ID. Without it the ID is generated and kept in
+    /// /var/tmp, keyed on the name: lost when /var/tmp doesn't survive a
+    /// reboot, and changed by a rename, so controllers see a new endpoint.
+    pub id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,6 +114,7 @@ impl Default for EndpointSection {
             port: 9740,
             audio_device: None,
             tls: false,
+            id: None,
         }
     }
 }
@@ -197,6 +248,29 @@ level = "debug"
         assert!(cfg.capabilities.dsd);
         assert!(cfg.capabilities.flac);
         assert_eq!(cfg.logging.level, "debug");
+    }
+
+    #[test]
+    fn parse_web_ui_and_hooks() {
+        let toml_str = r#"
+[web_ui]
+port = 9750
+bind = "127.0.0.1"
+
+[hooks]
+on_start = "/opt/state start"
+"#;
+        let cfg: EndpointFileConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.web_ui.enabled);
+        assert_eq!(cfg.web_ui.port, 9750);
+        assert!(cfg.web_ui.bind.is_loopback());
+        assert_eq!(cfg.hooks.on_start.as_deref(), Some("/opt/state start"));
+        assert!(cfg.endpoint.id.is_none());
+        assert!(cfg.hooks.on_stop.is_none());
+        // without the sections: listening on all interfaces, no hooks
+        let cfg = EndpointFileConfig::default();
+        assert!(cfg.web_ui.bind.is_unspecified());
+        assert!(cfg.hooks.on_start.is_none());
     }
 
     #[test]

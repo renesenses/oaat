@@ -346,8 +346,14 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
             audio_port,
             clock_port,
             buffer_size_ms,
+            features: vec![FEATURE_ENDPOINT_RELEASE.into()],
         });
         writer.write_all(&FrameCodec::encode(&ack)).await?;
+
+        // endpoint_release (RFC §7.3.1) only goes to a controller that
+        // announced it handles it: an older one would not know the message.
+        let controller_handles_release =
+            hello.features.iter().any(|f| f == FEATURE_ENDPOINT_RELEASE);
 
         info!(
             controller = %hello.controller_name,
@@ -408,6 +414,17 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
                 }
 
                 Some(msg) = control_rx.recv() => {
+                    // A release ends any negotiation in progress: the device
+                    // won't be opened for it.
+                    if matches!(msg, Message::EndpointRelease(_)) {
+                        pending_accept = None;
+                        if controller_handles_release {
+                            writer.write_all(&FrameCodec::encode(&msg)).await?;
+                        } else {
+                            warn!("controller does not handle endpoint_release, it may keep streaming");
+                        }
+                        continue;
+                    }
                     let resolves_pending = match (&pending_accept, &msg) {
                         (Some((sid, _, _)), Message::FormatAccept(a)) => a.stream_id == *sid,
                         (Some((sid, _, _)), Message::FormatReject(r)) => r.stream_id == *sid,

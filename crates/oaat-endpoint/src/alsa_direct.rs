@@ -346,6 +346,18 @@ impl AlsaDirectOutput {
         self.shutdown(false);
     }
 
+    /// Give up the device now (endpoint_release): unlike `stop()`, queued
+    /// audio is dropped, so another source can open the DAC right away.
+    /// When this returns the ALSA device is closed.
+    pub fn release(&mut self) {
+        self.shutdown(true);
+    }
+
+    /// True between `play()` and `pause()`/`stop()`/`release()`.
+    pub fn is_playing(&self) -> bool {
+        self.playing.load(Ordering::Relaxed)
+    }
+
     /// Stop the writer thread; `discard` drops queued audio instead of
     /// playing it out.
     fn shutdown(&mut self, discard: bool) {

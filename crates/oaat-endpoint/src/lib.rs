@@ -24,4 +24,4 @@ pub use hal::OaatHal;
 pub use sync::{PtsTracker, SharedClock};
 pub use transport::{EndpointConfig, EndpointEvent, EndpointTransport};
 #[cfg(feature = "web-ui")]
-pub use web_ui::{BridgeStatus, BridgeStatusHandle, start_web_ui};
+pub use web_ui::{BridgeStatus, BridgeStatusHandle, start_web_ui, start_web_ui_on};

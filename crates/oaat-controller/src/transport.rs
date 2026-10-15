@@ -45,6 +45,12 @@ pub struct ConnectedEndpoint {
     pub(crate) time_source: SharedTimeSource,
     sequence: u16,
     pub response_rx: mpsc::Receiver<EndpointResponse>,
+    /// `endpoint_release` (RFC §7.3.1): the endpoint gave up its audio
+    /// output. Kept apart from `response_rx`, which carries replies to the
+    /// controller's own requests: a release can arrive at any time. Only
+    /// sent when `ControllerConfig::features` holds
+    /// `FEATURE_ENDPOINT_RELEASE`.
+    pub release_rx: mpsc::Receiver<EndpointRelease>,
     reader_task: tokio::task::JoinHandle<()>,
 }
 
@@ -178,6 +184,7 @@ impl ConnectedEndpoint {
 
         // Channel for forwarding format negotiation responses to the caller
         let (response_tx, response_rx) = mpsc::channel::<EndpointResponse>(32);
+        let (release_tx, release_rx) = mpsc::channel::<EndpointRelease>(4);
 
         let reader_task = tokio::spawn(async move {
             let mut buf = [0u8; 8192];
@@ -249,6 +256,16 @@ impl ConnectedEndpoint {
                                         .send(EndpointResponse::StreamStats(ss))
                                         .await;
                                 }
+                                Message::EndpointRelease(er) => {
+                                    info!(
+                                        stream_id = %er.stream_id,
+                                        reason = ?er.reason,
+                                        "endpoint released its output"
+                                    );
+                                    // never block the reader on it: an unread
+                                    // release only needs to be seen once
+                                    let _ = release_tx.try_send(er);
+                                }
                                 other => {
                                     debug!("received: {:?}", std::mem::discriminant(&other));
                                 }
@@ -274,6 +291,7 @@ impl ConnectedEndpoint {
             time_source,
             sequence: 0,
             response_rx,
+            release_rx,
             reader_task,
         })
     }

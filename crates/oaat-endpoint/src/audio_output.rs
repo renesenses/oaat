@@ -516,6 +516,22 @@ impl CpalOutput {
         self.producer = None;
     }
 
+    /// Give up the device now (endpoint_release). Same as `stop()` here:
+    /// the stream holds nothing worth playing out.
+    pub fn release(&mut self) {
+        self.stop();
+    }
+
+    /// True between `play()` and `pause()`/`stop()`/`release()`.
+    pub fn is_playing(&self) -> bool {
+        self.playing.load(Ordering::Relaxed)
+    }
+
+    /// True while an output stream is open.
+    pub fn device_open(&self) -> bool {
+        self.stream.is_some()
+    }
+
     pub fn flush(&mut self) {
         let fmt = self.format;
         let sr = self.sample_rate;

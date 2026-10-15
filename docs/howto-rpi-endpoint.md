@@ -274,6 +274,10 @@ port = 9740
 # ALSA audio device (default: "default", which uses /etc/asound.conf)
 # audio_device = "hw:1,0"
 
+# Fixed endpoint ID (default: generated and kept in /var/tmp, keyed on the
+# name; set it when /var/tmp is not persistent or the name may change)
+# id = "living-room-1"
+
 # TLS (off by default; not needed on a LAN)
 # tls = false
 
@@ -296,6 +300,22 @@ flac = true
 [logging]
 # Log level: error, warn, info, debug, trace
 level = "info"
+
+[web_ui]
+# Status page (port 9741 by default). It also takes POST /api/release, which
+# makes the endpoint give up the DAC and tell the controller (endpoint_release),
+# and POST /api/device. Bind it to 127.0.0.1 to keep these local to the Pi.
+# enabled = true
+# port = 9741
+# bind = "0.0.0.0"
+
+[hooks]
+# Commands run with /bin/sh -c when the endpoint starts using the DAC (on play)
+# and once it no longer does (stop, release, or closed after a pause).
+# OAAT_EVENT is set to "start" or "stop". Useful to tell other software on the
+# Pi which source plays.
+# on_start = "/usr/local/bin/oaat-state start"
+# on_stop = "/usr/local/bin/oaat-state stop"
 ```
 
 ### Examples, DAC by DAC
