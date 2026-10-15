@@ -870,7 +870,7 @@ fn open_alsa_device(p: &DeviceParams) -> Result<Box<dyn PcmDevice>, String> {
     // requested buffer (#7).
     info!(
         device = %p.device,
-        format = p.format,
+        format = if widen_s16 { "S32_LE" } else { p.format },
         rate,
         channels = p.channels,
         buffer_frames = buffer,
