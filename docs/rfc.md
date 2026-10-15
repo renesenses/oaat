@@ -1,11 +1,17 @@
 # RFC: OAAT -- Open Advanced Audio Transport
 
-**Version**: 0.3.0 (Draft)
-**Date**: 2026-07-04
+**Version**: 0.4.0 (Draft)
+**Date**: 2026-10-15
 **Author**: Bertrand Clech / MozAIk Labs
 **Status**: Draft
 **License**: Specification — Community Specification License 1.0 (see [LICENSE-SPEC](LICENSE-SPEC.md)). Reference implementation (`crates/`) — Apache License 2.0.
 
+> Changes in 0.4.0: new `endpoint_release` message (endpoint to controller),
+> for an endpoint that gives up its audio output (§7.3.1); optional `features`
+> in `hello_ack`, the counterpart of `hello.features`, and the rules for
+> announcing and gating features (§7.2). Backward compatible: `protocol_version`
+> stays at 1.
+>
 > Changes in 0.3.0: FEC is fully specified on the wire (group size, index,
 > length-XOR recovery); FormatAccept now signals device readiness; clock sync
 > is normatively endpoint-initiated with a mandatory controller responder;
