@@ -296,6 +296,7 @@ async fn run(cli: Cli) {
                 &file_config.hooks,
                 ep_web_ui,
                 ep_web_addr,
+                file_config.web_ui.control_token.clone(),
                 ep_dsd,
             )
             .await;
@@ -366,6 +367,7 @@ async fn run_endpoint(
     hooks: &config::HooksSection,
     web_ui_enabled: bool,
     web_ui_addr: SocketAddr,
+    web_control_token: Option<String>,
     enable_dsd: bool,
 ) {
     let web_ui_port = web_ui_addr.port();
@@ -491,7 +493,14 @@ async fn run_endpoint(
         let (handle, _reader) = web_ui::BridgeStatusHandle::new(initial_status);
         let (switch_tx, switch_rx) = mpsc::channel::<String>(8);
         if web_ui_enabled {
-            web_ui::start_web_ui_on(web_ui_addr, handle.clone(), switch_tx, Some(release_tx.clone())).await;
+            web_ui::start_web_ui_with_token(
+                web_ui_addr,
+                handle.clone(),
+                switch_tx,
+                Some(release_tx.clone()),
+                web_control_token,
+            )
+            .await;
         }
         (handle, switch_rx)
     };
