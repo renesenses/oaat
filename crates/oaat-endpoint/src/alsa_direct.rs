@@ -18,10 +18,16 @@
 //!   whose stream ended does not keep the DAC open, and reopens it on the
 //!   next audio (#44, #12).
 //!
+//! `configure()` opens the device before returning, and fails when the device
+//! refuses the stream (a DSD format on a PCM-only DAC, #62): the endpoint
+//! answers FormatReject instead of accepting a stream that cannot play.
+//!
 //! `stop()` is intentional: like closing the `aplay` pipe did, it plays out
 //! what is already queued, then closes the device. The thread is joined, so
 //! the device is released when `stop()` returns, and nothing reopens it
-//! before the next `configure()`. `flush()` (seek) discards instead.
+//! before the next `configure()`. `flush()` (seek) discards instead. Neither
+//! waits forever on a stuck device: past a deadline the thread is left
+//! behind and the endpoint goes on (#62).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -60,6 +66,16 @@ const IDLE_CLOSE: Duration = Duration::from_secs(10);
 
 /// First reopen delay after a fatal device error (#33).
 const RESPAWN_BACKOFF_MIN: Duration = Duration::from_millis(250);
+/// How long `configure()` waits for the writer thread to open the device.
+/// Below the 5 s fail-open of the deferred accept (RFC §5.3),
+/// so a device that does not answer is reported (FormatReject) instead of
+/// being accepted blind.
+const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long `stop()` waits for the writer thread: playing out what is queued
+/// (~1 MiB) and the device buffer (2 s) takes a few seconds at most. Past
+/// that the device is stuck (a drain or write that never returns): the
+/// thread is left behind instead of blocking the endpoint for good (#62).
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 /// Reopen delay cap while the device keeps failing (e.g. DAC unplugged).
 const RESPAWN_BACKOFF_MAX: Duration = Duration::from_secs(8);
 /// A device that played at least this long was healthy: the next failure
@@ -127,6 +143,9 @@ struct Writer {
     tx: SyncSender<Vec<u8>>,
     stop: Arc<AtomicBool>,
     handle: JoinHandle<()>,
+    /// Disconnected when the writer thread returns: lets `shutdown()` wait
+    /// for it with a deadline.
+    done: Receiver<()>,
 }
 
 pub struct AlsaDirectOutput {
@@ -141,6 +160,8 @@ pub struct AlsaDirectOutput {
     format: AudioFormat,
     device_name: Option<String>,
     idle_close: Duration,
+    open_timeout: Duration,
+    shutdown_timeout: Duration,
     #[cfg(feature = "flac")]
     flac_stream: Option<crate::flac_decoder::FlacStreamDecoder>,
 }
@@ -196,6 +217,8 @@ impl AlsaDirectOutput {
             format: AudioFormat::PcmS16le,
             device_name: None,
             idle_close: IDLE_CLOSE,
+            open_timeout: OPEN_TIMEOUT,
+            shutdown_timeout: SHUTDOWN_TIMEOUT,
             #[cfg(feature = "flac")]
             flac_stream: None,
         }
@@ -275,14 +298,44 @@ impl AlsaDirectOutput {
             channels,
             "ALSA direct output configured (in-process, no subprocess)"
         );
-        self.writer = Some(spawn_writer(
+        self.playing.store(false, Ordering::Relaxed);
+        let device = params.device.clone();
+        let (writer, opened) = spawn_writer(
             params,
             self.opener.clone(),
             self.shared.clone(),
             self.idle_close,
-        ));
-        self.playing.store(false, Ordering::Relaxed);
-        Ok(())
+        );
+        // The device is opened now, not on the first audio: a device that
+        // refuses the format (DSD_U32_BE on a PCM-only DAC, #62) is an error
+        // the caller turns into a FormatReject, instead of an accepted stream
+        // that never plays. The output stays unconfigured: the next
+        // configure() starts over.
+        match opened.recv_timeout(self.open_timeout) {
+            Ok(Ok(())) => {
+                self.writer = Some(writer);
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                // The thread returns right after reporting the failure.
+                let _ = writer.handle.join();
+                Err(e.into())
+            }
+            Err(_) => {
+                warn!(
+                    device = %device,
+                    timeout_ms = self.open_timeout.as_millis() as u64,
+                    "ALSA device open did not complete, writer thread left behind"
+                );
+                writer.stop.store(true, Ordering::Relaxed);
+                drop(writer.tx);
+                Err(format!(
+                    "{device}: device open did not complete within {} ms",
+                    self.open_timeout.as_millis()
+                )
+                .into())
+            }
+        }
     }
 
     pub fn play(&self) {
@@ -322,8 +375,16 @@ impl AlsaDirectOutput {
         if let Some(w) = self.writer.take() {
             w.stop.store(discard, Ordering::Relaxed);
             drop(w.tx);
-            if w.handle.join().is_err() {
-                warn!("ALSA writer thread panicked");
+            match w.done.recv_timeout(self.shutdown_timeout) {
+                Err(RecvTimeoutError::Timeout) => warn!(
+                    timeout_ms = self.shutdown_timeout.as_millis() as u64,
+                    "ALSA writer thread did not stop (device stuck), left behind"
+                ),
+                _ => {
+                    if w.handle.join().is_err() {
+                        warn!("ALSA writer thread panicked");
+                    }
+                }
             }
         }
         #[cfg(feature = "flac")]
@@ -458,20 +519,36 @@ impl Drop for AlsaDirectOutput {
     }
 }
 
+/// Start the writer thread. The receiver gets the result of the first
+/// device open; on failure the thread has nothing to do and returns.
 fn spawn_writer(
     params: DeviceParams,
     opener: DeviceOpener,
     shared: Arc<Shared>,
     idle_close: Duration,
-) -> Writer {
+) -> (Writer, Receiver<Result<(), String>>) {
     let (tx, rx) = std::sync::mpsc::sync_channel(WRITE_QUEUE_PAYLOADS);
+    let (opened_tx, opened_rx) = std::sync::mpsc::sync_channel(1);
+    let (done_tx, done) = std::sync::mpsc::sync_channel::<()>(0);
     let stop = Arc::new(AtomicBool::new(false));
     let stop_t = stop.clone();
     let handle = std::thread::Builder::new()
         .name("oaat-alsa-writer".into())
-        .spawn(move || writer_loop(rx, params, opener, shared, stop_t, idle_close))
+        .spawn(move || {
+            // Dropped when the thread returns, even on a panic.
+            let _done = done_tx;
+            writer_loop(rx, opened_tx, params, opener, shared, stop_t, idle_close)
+        })
         .expect("spawn ALSA writer thread");
-    Writer { tx, stop, handle }
+    (
+        Writer {
+            tx,
+            stop,
+            handle,
+            done,
+        },
+        opened_rx,
+    )
 }
 
 /// Device state machine of the writer thread.
@@ -495,17 +572,8 @@ impl DeviceSlot {
         if self.retry_at.is_some_and(|at| Instant::now() < at) {
             return false;
         }
-        match (self.opener)(&self.params) {
-            Ok(dev) => {
-                if self.retry_at.is_some() {
-                    info!(device = %self.params.device, "ALSA device reopened after a failure");
-                }
-                self.dev = Some(dev);
-                self.opened_at = Some(Instant::now());
-                self.retry_at = None;
-                self.shared.open.store(true, Ordering::Relaxed);
-                true
-            }
+        match self.open() {
+            Ok(()) => true,
             Err(e) => {
                 self.schedule_retry();
                 warn!(
@@ -517,6 +585,19 @@ impl DeviceSlot {
                 false
             }
         }
+    }
+
+    /// Open the device now.
+    fn open(&mut self) -> Result<(), String> {
+        let dev = (self.opener)(&self.params)?;
+        if self.retry_at.is_some() {
+            info!(device = %self.params.device, "ALSA device reopened after a failure");
+        }
+        self.dev = Some(dev);
+        self.opened_at = Some(Instant::now());
+        self.retry_at = None;
+        self.shared.open.store(true, Ordering::Relaxed);
+        Ok(())
     }
 
     fn schedule_retry(&mut self) {
@@ -595,6 +676,7 @@ impl DeviceSlot {
 
 fn writer_loop(
     rx: Receiver<Vec<u8>>,
+    opened: SyncSender<Result<(), String>>,
     params: DeviceParams,
     opener: DeviceOpener,
     shared: Arc<Shared>,
@@ -610,8 +692,17 @@ fn writer_loop(
         retry_at: None,
         backoff: Duration::ZERO,
     };
-    // Open right away: the first audio should not pay for it.
-    slot.ensure_open();
+    // Open right away and report it: configure() waits for this (#62).
+    let first = slot.open();
+    if let Err(e) = &first {
+        warn!(device = %slot.params.device, error = %e, "ALSA device open failed");
+    }
+    let failed = first.is_err();
+    // configure() may have given up waiting: nobody to tell then.
+    let _ = opened.send(first);
+    if failed {
+        return;
+    }
     let mut last_write = Instant::now();
     let mut pause_gen = slot.shared.pause_gen.load(Ordering::Relaxed);
     loop {
@@ -977,9 +1068,20 @@ pub(crate) fn resolve_device_name(requested: Option<&str>) -> String {
 /// defines them up to DSD512).
 const DSD_MULTIPLIERS: [u16; 4] = [64, 128, 256, 512];
 
-/// Announced when the device's DSD rates cannot be probed: what the endpoint
-/// always announced before.
-pub const DSD_FALLBACK_MULTIPLIER: u16 = 64;
+/// What the logs say when no native DSD is announced: the server then
+/// converts DSD to PCM (#62).
+const DSD_TO_PCM: &str = "native DSD not supported by device, DSD will be converted to PCM by the server";
+
+/// Why the DSD probe returned no rates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DsdProbeError {
+    /// The `hw:` device opened and refused DSD_U32_BE stereo interleaved
+    /// (`set_format` or `set_channels` failed): it has no native DSD in the
+    /// format this output writes (RME ADI-2 DAC: S32_LE only, #62).
+    Refused(String),
+    /// The probe could not run at all: device absent, busy, no permission.
+    Unavailable(String),
+}
 
 /// ALSA DSD_U32_BE frame rate of a DSD multiplier: the bit rate
 /// (multiplier × 44.1 kHz) over 32 bits per frame, as `alsa_format_and_rate`
@@ -989,35 +1091,49 @@ fn dsd_u32_rate(multiplier: u16) -> u32 {
 }
 
 /// The highest DSD multiplier to announce (`dsd_max_rate`) for the
-/// configured device. `probe` is given the `hw:` device and the DSD_U32_BE
-/// rates to try, and returns those the device accepts. The answer is the
-/// highest multiplier whose rate and every lower one's are accepted. When
-/// the device is not a `hw:` one, the probe fails or DSD64 itself is
-/// refused, it is [`DSD_FALLBACK_MULTIPLIER`], with a warning.
+/// configured device, or `None` to announce no native DSD at all. `probe` is
+/// given the `hw:` device and the DSD_U32_BE rates to try, and returns those
+/// the device accepts. The answer is the highest multiplier whose rate and
+/// every lower one's are accepted.
+///
+/// Nothing is announced (#62) when:
+/// - the device refuses DSD_U32_BE, or accepts it but not at the DSD64 rate:
+///   the server would send DSD the device cannot open;
+/// - the probe cannot run (device busy or absent at startup). Announcing
+///   DSD64 blindly, as before, made the server send native DSD to a device
+///   that may refuse it, and Tune does not fall back to PCM after a refused
+///   DSD negotiation: the track would not play at all. Not announcing only
+///   costs native DSD until the bridge restarts with the DAC available;
+/// - the device is not a `hw:` one (`default`): plug devices cannot carry
+///   DSD_U32_BE.
 pub(crate) fn announced_dsd_max(
     device_name: Option<&str>,
-    probe: impl FnOnce(&str, &[u32]) -> Result<Vec<u32>, String>,
-) -> u16 {
+    probe: impl FnOnce(&str, &[u32]) -> Result<Vec<u32>, DsdProbeError>,
+) -> Option<u16> {
     let device = dsd_hw_device(&resolve_device_name(device_name));
     if !device.starts_with("hw:") {
         warn!(
             device = %device,
-            dsd_max = DSD_FALLBACK_MULTIPLIER,
-            "DSD rates not probed: native DSD needs a hw: device, announcing DSD64"
+            reason = "native DSD needs a hw: device, this one is not probed",
+            "{DSD_TO_PCM}"
         );
-        return DSD_FALLBACK_MULTIPLIER;
+        return None;
     }
     let rates: Vec<u32> = DSD_MULTIPLIERS.iter().map(|&m| dsd_u32_rate(m)).collect();
     let accepted = match probe(&device, &rates) {
         Ok(accepted) => accepted,
-        Err(e) => {
+        Err(DsdProbeError::Refused(e)) => {
+            warn!(device = %device, error = %e, "{DSD_TO_PCM}");
+            return None;
+        }
+        Err(DsdProbeError::Unavailable(e)) => {
             warn!(
                 device = %device,
                 error = %e,
-                dsd_max = DSD_FALLBACK_MULTIPLIER,
-                "DSD rate probe failed, announcing DSD64"
+                reason = "the DSD probe could not run (device busy or absent at startup); restart tune-bridge with the DAC free to probe it again",
+                "{DSD_TO_PCM}"
             );
-            return DSD_FALLBACK_MULTIPLIER;
+            return None;
         }
     };
     let max = DSD_MULTIPLIERS
@@ -1026,37 +1142,36 @@ pub(crate) fn announced_dsd_max(
         .last()
         .copied();
     match max {
-        Some(m) => {
-            info!(device = %device, dsd_max = m, "native DSD rates probed");
-            m
-        }
-        None => {
-            warn!(
-                device = %device,
-                accepted_rates = ?accepted,
-                dsd_max = DSD_FALLBACK_MULTIPLIER,
-                "device does not accept DSD64 in DSD_U32_BE, announcing DSD64"
-            );
-            DSD_FALLBACK_MULTIPLIER
-        }
+        Some(m) => info!(device = %device, dsd_max = m, "native DSD rates probed"),
+        None => warn!(
+            device = %device,
+            accepted_rates = ?accepted,
+            reason = "DSD_U32_BE accepted but not at the DSD64 rate",
+            "{DSD_TO_PCM}"
+        ),
     }
+    max
 }
 
 /// Which of `rates` the `hw:` device accepts in DSD_U32_BE stereo,
 /// interleaved: the hw_params space is queried, nothing is played. The
-/// device is opened non-blocking and closed on return.
-fn probe_dsd_rates(device: &str, rates: &[u32]) -> Result<Vec<u32>, String> {
+/// device is opened non-blocking and closed on return. A device that cannot
+/// be opened is [`DsdProbeError::Unavailable`]; one that opens and refuses
+/// the format is [`DsdProbeError::Refused`].
+fn probe_dsd_rates(device: &str, rates: &[u32]) -> Result<Vec<u32>, DsdProbeError> {
     use alsa::pcm::{Access, Format, HwParams};
     use alsa::{Direction, PCM};
 
     let err = |what: &str, e: alsa::Error| format!("{device}: {what}: {e}");
-    let pcm = PCM::new(device, Direction::Playback, true).map_err(|e| err("open", e))?;
-    let hwp = HwParams::any(&pcm).map_err(|e| err("hw params", e))?;
+    let unavailable = |what: &str, e| DsdProbeError::Unavailable(err(what, e));
+    let refused = |what: &str, e| DsdProbeError::Refused(err(what, e));
+    let pcm = PCM::new(device, Direction::Playback, true).map_err(|e| unavailable("open", e))?;
+    let hwp = HwParams::any(&pcm).map_err(|e| unavailable("hw params", e))?;
     hwp.set_access(Access::RWInterleaved)
-        .map_err(|e| err("access", e))?;
+        .map_err(|e| refused("access", e))?;
     hwp.set_format(Format::DSDU32BE)
-        .map_err(|e| err("DSD_U32_BE", e))?;
-    hwp.set_channels(2).map_err(|e| err("channels", e))?;
+        .map_err(|e| refused("DSD_U32_BE", e))?;
+    hwp.set_channels(2).map_err(|e| refused("channels", e))?;
     Ok(rates
         .iter()
         .copied()
@@ -1067,8 +1182,9 @@ fn probe_dsd_rates(device: &str, rates: &[u32]) -> Result<Vec<u32>, String> {
 impl AlsaDirectOutput {
     /// The `dsd_max_rate` to announce for `device_name` (the configured or
     /// auto-detected device), from the DSD_U32_BE rates its `hw:` device
-    /// accepts. Falls back to DSD64, logged, when that cannot be probed.
-    pub fn dsd_max_multiplier(device_name: Option<&str>) -> u16 {
+    /// accepts; `None` (no native DSD, the server converts to PCM) when the
+    /// device refuses DSD or cannot be probed. See [`announced_dsd_max`].
+    pub fn dsd_max_multiplier(device_name: Option<&str>) -> Option<u16> {
         announced_dsd_max(device_name, probe_dsd_rates)
     }
 }
@@ -1211,6 +1327,14 @@ mod tests {
         script: VecDeque<(usize, Next)>, // (write index, action)
         writes: usize,
         params: Option<DeviceParams>,
+        /// Opening in this ALSA format fails like `set_format` on a DAC
+        /// that does not offer it (EINVAL).
+        refuse_format: Option<&'static str>,
+        /// Opening in this ALSA format takes this long (a device that does
+        /// not answer).
+        slow_open: Option<(&'static str, Duration)>,
+        /// `drain()` takes this long (a stuck device).
+        slow_drain: Duration,
     }
 
     /// A stand-in for the ALSA PCM: records frames, plays scripted errors,
@@ -1240,7 +1364,12 @@ mod tests {
             Ok(())
         }
         fn drain(&mut self) {
-            self.st.lock().unwrap().drains += 1;
+            let slow = {
+                let mut st = self.st.lock().unwrap();
+                st.drains += 1;
+                st.slow_drain
+            };
+            sleep(slow);
         }
         fn discard(&mut self) {
             self.st.lock().unwrap().discards += 1;
@@ -1257,9 +1386,22 @@ mod tests {
         let st = Arc::new(Mutex::new(FakeState::default()));
         let st2 = st.clone();
         let opener: DeviceOpener = Arc::new(move |p: &DeviceParams| {
+            let slow = {
+                let s = st2.lock().unwrap();
+                s.slow_open.filter(|(f, _)| *f == p.format).map(|(_, d)| d)
+            };
+            if let Some(d) = slow {
+                sleep(d);
+            }
             let mut s = st2.lock().unwrap();
             s.open_attempts += 1;
             s.params = Some(p.clone());
+            if s.refuse_format == Some(p.format) {
+                return Err(format!(
+                    "{}: {}: ALSA function 'snd_pcm_hw_params_set_format' failed with error 'Invalid argument (22)'",
+                    p.device, p.format
+                ));
+            }
             if s.fail_opens > 0 {
                 s.fail_opens = s.fail_opens.saturating_sub(if s.fail_opens == usize::MAX { 0 } else { 1 });
                 return Err("No such device".into());
@@ -1433,9 +1575,16 @@ mod tests {
     #[test]
     fn persistent_open_failure_is_retried_with_backoff() {
         let (st, opener) = fake();
-        st.lock().unwrap().fail_opens = usize::MAX;
         let mut out = AlsaDirectOutput::with_opener(opener);
         out.configure(AudioFormat::PcmS16le, 48_000, 2).unwrap();
+        // The DAC goes away on the first write and stays away.
+        {
+            let mut s = st.lock().unwrap();
+            s.script.push_back((0, Next::Fatal));
+            s.fail_opens = usize::MAX;
+            s.open_attempts = 0;
+            s.open_marks.clear();
+        }
         out.play();
         let chunk = vec![0u8; 480 * 4];
         let end = Instant::now() + Duration::from_secs(3);
@@ -1457,6 +1606,81 @@ mod tests {
         let st = st.lock().unwrap();
         assert_eq!(st.open_marks.len(), 1, "device reopened once it is back");
         assert!(!st.written.is_empty());
+    }
+
+    // -- #62: a device that refuses the stream never blocks the output --
+
+    /// The RME ADI-2 DAC case: the device opens in PCM but refuses
+    /// DSD_U32_BE. `configure()` reports it (the endpoint answers
+    /// FormatReject) instead of accepting a stream that cannot play, keeps no
+    /// writer behind, and the next PCM stream plays.
+    #[test]
+    fn un_format_refuse_par_le_peripherique_fait_echouer_configure() {
+        let (st, opener) = fake();
+        st.lock().unwrap().refuse_format = Some("DSD_U32_BE");
+        let mut out = AlsaDirectOutput::with_opener(opener);
+        let t0 = Instant::now();
+        let err = out
+            .configure_with_device(AudioFormat::DsdU8, 2_822_400, 2, Some("hw:CARD=DAC52052082,DEV=0"))
+            .expect_err("a refused DSD format must fail configure()");
+        assert!(t0.elapsed() < Duration::from_secs(1), "reported at once");
+        assert!(err.to_string().contains("DSD_U32_BE"), "{err}");
+        assert!(!out.device_open());
+        out.play();
+        assert_eq!(out.write_audio(&[0x69u8; 8 * 64]), 0, "nothing queued for a refused stream");
+        out.stop();
+
+        out.configure_with_device(AudioFormat::PcmS16le, 44_100, 2, Some("hw:CARD=DAC52052082,DEV=0"))
+            .expect("the next PCM stream opens");
+        out.play();
+        assert_eq!(out.write_audio(&[1u8; 441 * 4]), 441);
+        out.stop();
+        let st = st.lock().unwrap();
+        assert_eq!(st.open_attempts, 2, "one refused open, one PCM open, no retry loop");
+        assert_eq!(st.written, vec![1u8; 441 * 4]);
+        assert_eq!(st.params.as_ref().unwrap().format, "S16_LE");
+    }
+
+    /// A device that does not answer its open: `configure()` gives up after
+    /// its deadline instead of blocking the endpoint, and a later stream on
+    /// a format that opens plays.
+    #[test]
+    fn une_ouverture_qui_ne_repond_pas_ne_bloque_pas_configure() {
+        let (st, opener) = fake();
+        st.lock().unwrap().slow_open = Some(("DSD_U32_BE", Duration::from_secs(2)));
+        let mut out = AlsaDirectOutput::with_opener(opener);
+        out.open_timeout = Duration::from_millis(200);
+        let t0 = Instant::now();
+        let err = out
+            .configure_with_device(AudioFormat::DsdU8, 2_822_400, 2, Some("hw:1,0"))
+            .expect_err("an open that does not complete must fail configure()");
+        assert!(t0.elapsed() < Duration::from_secs(1), "waited {:?}", t0.elapsed());
+        assert!(err.to_string().contains("did not complete"), "{err}");
+        out.stop();
+        out.configure_with_device(AudioFormat::PcmS16le, 44_100, 2, Some("hw:1,0"))
+            .unwrap();
+        out.play();
+        assert_eq!(out.write_audio(&[2u8; 441 * 4]), 441);
+        out.stop();
+        assert_eq!(st.lock().unwrap().written, vec![2u8; 441 * 4]);
+    }
+
+    /// A device whose drain never ends: `stop()` returns after its deadline
+    /// instead of blocking the endpoint for good.
+    #[test]
+    fn un_peripherique_bloque_ne_bloque_pas_stop() {
+        let (st, opener) = fake();
+        st.lock().unwrap().slow_drain = Duration::from_secs(3);
+        let mut out = AlsaDirectOutput::with_opener(opener);
+        out.shutdown_timeout = Duration::from_millis(200);
+        out.configure(AudioFormat::PcmS16le, 48_000, 2).unwrap();
+        out.play();
+        out.write_audio(&[0u8; 480 * 4]);
+        let t0 = Instant::now();
+        out.stop();
+        assert!(t0.elapsed() < Duration::from_secs(1), "stop() took {:?}", t0.elapsed());
+        out.configure(AudioFormat::PcmS16le, 48_000, 2).unwrap();
+        out.release();
     }
 
     /// `flush()` (seek) discards what is queued instead of playing it out.
@@ -1868,7 +2092,7 @@ mod tests {
     fn probe_accepting<'a>(
         multipliers: &'static [u16],
         asked: &'a mut Option<String>,
-    ) -> impl FnOnce(&str, &[u32]) -> Result<Vec<u32>, String> + 'a {
+    ) -> impl FnOnce(&str, &[u32]) -> Result<Vec<u32>, DsdProbeError> + 'a {
         move |device, rates| {
             *asked = Some(device.to_string());
             let ok: Vec<u32> = multipliers.iter().map(|&m| dsd_u32_rate(m)).collect();
@@ -1896,7 +2120,7 @@ mod tests {
             Some("plughw:CARD=Hugo2,DEV=0"),
             probe_accepting(&[64], &mut asked),
         );
-        assert_eq!(max, 64);
+        assert_eq!(max, Some(64));
         assert_eq!(
             asked.as_deref(),
             Some("hw:CARD=Hugo2,DEV=0"),
@@ -1911,7 +2135,7 @@ mod tests {
             Some("plughw:CARD=Hugo2,DEV=0"),
             probe_accepting(&[64, 128, 256], &mut asked),
         );
-        assert_eq!(max, 256);
+        assert_eq!(max, Some(256));
     }
 
     #[test]
@@ -1921,71 +2145,99 @@ mod tests {
             Some("hw:CARD=Hugo2,DEV=0"),
             probe_accepting(&[64, 128, 256, 512], &mut asked),
         );
-        assert_eq!(max, 512);
+        assert_eq!(max, Some(512));
     }
 
     #[test]
     fn un_trou_dans_les_frequences_arrete_l_annonce() {
         let mut asked = None;
         let max = announced_dsd_max(Some("hw:1,0"), probe_accepting(&[64, 256], &mut asked));
-        assert_eq!(max, 64, "DSD128 refused: DSD256 is not announced");
+        assert_eq!(max, Some(64), "DSD128 refused: DSD256 is not announced");
     }
 
+    /// #62, RME ADI-2 DAC: the hw: device opens but refuses DSD_U32_BE
+    /// (`set_format`: EINVAL). Announcing DSD64 anyway made Tune send native
+    /// DSD the device could not open: nothing is announced, and the log says
+    /// the server will convert to PCM.
     #[test]
-    fn sonde_en_echec_garde_dsd64_et_le_journalise() {
-        let mut max = 0;
+    fn format_dsd_refuse_par_le_dac_rien_n_est_annonce() {
+        let mut max = Some(0);
         let logs = capture_logs(|| {
-            max = announced_dsd_max(Some("hw:CARD=Hugo2,DEV=0"), |_, _| {
-                Err("hw:CARD=Hugo2,DEV=0: open: Device or resource busy".into())
+            max = announced_dsd_max(Some("hw:CARD=DAC52052082,DEV=0"), |_, _| {
+                Err(DsdProbeError::Refused(
+                    "hw:CARD=DAC52052082,DEV=0: DSD_U32_BE: ALSA function 'snd_pcm_hw_params_set_format' failed with error 'Invalid argument (22)'".into(),
+                ))
             })
         });
-        assert_eq!(max, DSD_FALLBACK_MULTIPLIER);
-        assert!(
-            logs.contains("WARN") && logs.contains("DSD rate probe failed"),
-            "{logs}"
-        );
+        assert_eq!(max, None, "a DAC that refuses DSD must not announce native DSD");
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(logs.contains(DSD_TO_PCM), "{logs}");
+        assert!(logs.contains("Invalid argument"), "the ALSA error is logged: {logs}");
+        assert!(!logs.contains("dsd_max=64"), "{logs}");
+    }
+
+    /// The probe could not run (device busy at startup): nothing is
+    /// announced either (see `announced_dsd_max` for why), and the log says
+    /// so and how to probe again.
+    #[test]
+    fn sonde_impossible_rien_n_est_annonce_et_c_est_journalise() {
+        let mut max = Some(0);
+        let logs = capture_logs(|| {
+            max = announced_dsd_max(Some("hw:CARD=Hugo2,DEV=0"), |_, _| {
+                Err(DsdProbeError::Unavailable(
+                    "hw:CARD=Hugo2,DEV=0: open: Device or resource busy".into(),
+                ))
+            })
+        });
+        assert_eq!(max, None);
+        assert!(logs.contains("WARN") && logs.contains(DSD_TO_PCM), "{logs}");
         assert!(logs.contains("busy"), "the probe error is logged: {logs}");
+        assert!(logs.contains("could not run"), "{logs}");
     }
 
     #[test]
-    fn dsd64_refuse_par_la_sonde_garde_dsd64() {
+    fn dsd64_refuse_par_la_sonde_rien_n_est_annonce() {
         let mut asked = None;
-        let mut max = 0;
+        let mut max = Some(0);
         let logs = capture_logs(|| {
             max = announced_dsd_max(Some("hw:1,0"), probe_accepting(&[128], &mut asked))
         });
-        assert_eq!(max, 64);
-        assert!(logs.contains("WARN"), "{logs}");
+        assert_eq!(max, None, "DSD64 refused: no native DSD at all");
+        assert!(logs.contains("WARN") && logs.contains(DSD_TO_PCM), "{logs}");
     }
 
     #[test]
     fn sans_peripherique_hw_la_sonde_n_est_pas_lancee() {
         let mut called = false;
-        let mut max = 0;
+        let mut max = Some(0);
         let logs = capture_logs(|| {
             max = announced_dsd_max(None, |_, _| {
                 called = true;
                 Ok(vec![])
             })
         });
-        assert_eq!(max, 64);
+        assert_eq!(max, None);
         assert!(!called, "default cannot open DSD_U32_BE: nothing to probe");
         assert!(
-            logs.contains("WARN") && logs.contains("DSD rates not probed"),
+            logs.contains("WARN") && logs.contains("needs a hw: device"),
             "{logs}"
         );
     }
 
     /// The real ALSA probe on a card that does not exist (CI and Shrek have
-    /// no sound card): the open fails, DSD64 is kept.
+    /// no sound card): the open fails, the probe could not run, nothing is
+    /// announced.
     #[test]
-    fn la_vraie_sonde_sur_une_carte_absente_garde_dsd64() {
-        assert!(probe_dsd_rates("hw:CARD=OaatAbsentCard,DEV=0", &[88_200]).is_err());
-        let mut max = 0;
+    fn la_vraie_sonde_sur_une_carte_absente_n_annonce_rien() {
+        assert!(matches!(
+            probe_dsd_rates("hw:CARD=OaatAbsentCard,DEV=0", &[88_200]),
+            Err(DsdProbeError::Unavailable(_))
+        ));
+        let mut max = Some(0);
         let logs = capture_logs(|| {
             max = AlsaDirectOutput::dsd_max_multiplier(Some("plughw:CARD=OaatAbsentCard,DEV=0"))
         });
-        assert_eq!(max, DSD_FALLBACK_MULTIPLIER);
-        assert!(logs.contains("DSD rate probe failed"), "{logs}");
+        assert_eq!(max, None);
+        assert!(logs.contains("could not run"), "{logs}");
     }
 }
