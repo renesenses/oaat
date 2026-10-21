@@ -149,63 +149,30 @@ impl AlsaDirectOutput {
     /// ALSA playback devices, one line per card/device, in the format of
     /// `aplay -l` (`card 1: X [Y], device 0: Z [W]`).
     pub fn list_devices() -> Vec<String> {
-        let mut out = Vec::new();
-        for card in alsa::card::Iter::new().flatten() {
-            let Ok(ctl) = alsa::Ctl::from_card(&card, false) else {
-                continue;
-            };
-            let Ok(info) = ctl.card_info() else { continue };
-            let card_id = info.get_id().unwrap_or("").to_string();
-            let card_name = info.get_name().unwrap_or("").to_string();
-            for dev in alsa::ctl::DeviceIter::new(&ctl) {
-                let Ok(pi) = ctl.pcm_info(dev as u32, 0, alsa::Direction::Playback) else {
-                    continue;
-                };
-                out.push(format!(
-                    "card {}: {} [{}], device {}: {} [{}]",
-                    card.get_index(),
-                    card_id,
-                    card_name,
-                    dev,
-                    pi.get_id().unwrap_or(""),
-                    pi.get_name().unwrap_or("")
-                ));
-            }
-        }
-        out
+        playback_devices()
+            .iter()
+            .map(PlaybackDevice::aplay_line)
+            .collect()
     }
 
     pub fn default_device_name() -> Option<String> {
         Some("default".to_string())
     }
 
+    /// The DAC to use when none is configured, as a name the output opens
+    /// (`plughw:CARD=<id>,DEV=<n>`), or `None` to play on `default`.
+    /// See [`choose_dac`] for the rules.
     pub fn auto_detect_usb_dac() -> Option<String> {
-        let devices = Self::list_devices();
-        // On ALSA, prefer device with USB/DAC in name
-        for d in &devices {
-            let lower = d.to_lowercase();
-            if lower.contains("usb") || lower.contains("dac") {
-                return Some(d.clone());
-            }
+        let devices = playback_devices();
+        let chosen = choose_dac(&devices);
+        match &chosen {
+            Some(name) => info!(device = %name, "audio device auto-detected"),
+            None => info!(
+                cards = devices.len(),
+                "no DAC auto-detected, playing on the ALSA default device"
+            ),
         }
-        // Fallback: use sysdefault:CARD=X if only one card exists (likely USB DAC)
-        let cards: Vec<_> = devices
-            .iter()
-            .filter(|d| d.starts_with("sysdefault:CARD="))
-            .collect();
-        if cards.len() == 1 {
-            return Some(cards[0].clone());
-        }
-        // Last resort: first non-builtin sysdefault
-        for d in &devices {
-            if d.starts_with("sysdefault:CARD=") {
-                let lower = d.to_lowercase();
-                if !lower.contains("hdmi") && !lower.contains("builtin") {
-                    return Some(d.clone());
-                }
-            }
-        }
-        None
+        chosen
     }
 
     pub fn current_device_name(&self) -> Option<&str> {
@@ -268,17 +235,7 @@ impl AlsaDirectOutput {
         self.channels = channels;
         self.device_name = device_name.map(|s| s.to_string());
 
-        let mut device = match device_name {
-            Some(d)
-                if d.starts_with("hw:")
-                    || d.starts_with("plughw:")
-                    || d.starts_with("default")
-                    || d.starts_with("sysdefault:") =>
-            {
-                d.to_string()
-            }
-            _ => "default".to_string(),
-        };
+        let mut device = resolve_device_name(device_name);
 
         // Native DSD requires a raw hw: device — plug/sysdefault cannot open
         // SPECIAL DSD_U32_BE. Map sysdefault:CARD=X → hw:CARD=X,DEV=0.
@@ -868,6 +825,254 @@ fn dsd_hw_device(device: &str) -> String {
     device.to_string()
 }
 
+/// A playback PCM of an ALSA card, as `aplay -l` lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlaybackDevice {
+    pub card: i32,
+    /// Card ID (`Hugo2`, `vc4hdmi0`): stable across reboots, unlike `card`.
+    pub card_id: String,
+    pub card_name: String,
+    /// Kernel driver (`USB-Audio` for every USB Audio Class DAC).
+    pub driver: String,
+    pub device: u32,
+    pub pcm_id: String,
+    pub pcm_name: String,
+}
+
+impl PlaybackDevice {
+    fn aplay_line(&self) -> String {
+        format!(
+            "card {}: {} [{}], device {}: {} [{}]",
+            self.card, self.card_id, self.card_name, self.device, self.pcm_id, self.pcm_name
+        )
+    }
+
+    /// The name the output opens for PCM. `dsd_hw_device` turns it into
+    /// `hw:CARD=<id>,DEV=<n>` for native DSD.
+    fn plughw_name(&self) -> String {
+        if self.card_id.is_empty() {
+            format!("plughw:{},{}", self.card, self.device)
+        } else {
+            format!("plughw:CARD={},DEV={}", self.card_id, self.device)
+        }
+    }
+
+    fn text(&self) -> String {
+        format!(
+            "{} {} {} {}",
+            self.card_id, self.card_name, self.pcm_id, self.pcm_name
+        )
+        .to_lowercase()
+    }
+
+    fn is_hdmi(&self) -> bool {
+        self.text().contains("hdmi")
+    }
+
+    fn is_usb(&self) -> bool {
+        self.driver == "USB-Audio" || self.text().contains("usb")
+    }
+
+    /// The Raspberry Pi headphone jack and other on-board outputs.
+    fn is_builtin(&self) -> bool {
+        let t = self.text();
+        t.contains("bcm2835") || t.contains("headphones") || t.contains("builtin")
+    }
+}
+
+/// Every ALSA playback PCM of every card.
+fn playback_devices() -> Vec<PlaybackDevice> {
+    let mut out = Vec::new();
+    for card in alsa::card::Iter::new().flatten() {
+        let Ok(ctl) = alsa::Ctl::from_card(&card, false) else {
+            continue;
+        };
+        let Ok(info) = ctl.card_info() else { continue };
+        for dev in alsa::ctl::DeviceIter::new(&ctl) {
+            let Ok(pi) = ctl.pcm_info(dev as u32, 0, alsa::Direction::Playback) else {
+                continue;
+            };
+            out.push(PlaybackDevice {
+                card: card.get_index(),
+                card_id: info.get_id().unwrap_or("").to_string(),
+                card_name: info.get_name().unwrap_or("").to_string(),
+                driver: info.get_driver().unwrap_or("").to_string(),
+                device: dev as u32,
+                pcm_id: pi.get_id().unwrap_or("").to_string(),
+                pcm_name: pi.get_name().unwrap_or("").to_string(),
+            });
+        }
+    }
+    out
+}
+
+/// The DAC to play on when none is configured, by order of preference:
+/// 1. a USB card (USB-Audio driver, or "USB" in its names);
+/// 2. a card or PCM named "DAC" (I2S HATs such as the I-Sabre);
+/// 3. the only card left once HDMI and on-board outputs are set aside.
+///
+/// HDMI is never chosen. Returns a `plughw:CARD=<id>,DEV=<n>` name, which
+/// the output accepts as is (and maps to `hw:` for native DSD); `None`
+/// leaves the output on `default`.
+pub(crate) fn choose_dac(devices: &[PlaybackDevice]) -> Option<String> {
+    let candidates: Vec<&PlaybackDevice> = devices.iter().filter(|d| !d.is_hdmi()).collect();
+    if let Some(d) = candidates.iter().find(|d| d.is_usb()) {
+        return Some(d.plughw_name());
+    }
+    if let Some(d) = candidates.iter().find(|d| d.text().contains("dac")) {
+        return Some(d.plughw_name());
+    }
+    let external: Vec<&&PlaybackDevice> = candidates.iter().filter(|d| !d.is_builtin()).collect();
+    let first = external.first()?;
+    if external.iter().all(|d| d.card == first.card) {
+        return Some(first.plughw_name());
+    }
+    None
+}
+
+/// `card 1: Hugo2 [Chord Hugo2], device 0: USB Audio [USB Audio]`, as
+/// `list_devices()` and the web UI device list give it, to
+/// `plughw:CARD=Hugo2,DEV=0`.
+fn plughw_from_aplay_line(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("card ")?;
+    let (_, rest) = rest.split_once(": ")?;
+    let (card_id, rest) = rest.split_once(" [")?;
+    let (_, rest) = rest.split_once("], device ")?;
+    let (dev, _) = rest.split_once(':')?;
+    let dev: u32 = dev.trim().parse().ok()?;
+    let card_id = card_id.trim();
+    if card_id.is_empty() || card_id.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(format!("plughw:CARD={card_id},DEV={dev}"))
+}
+
+/// The name the writer opens for the configured one. ALSA names (`hw:`,
+/// `plughw:`, `default`, `sysdefault:`) pass through, an `aplay -l` line is
+/// translated; anything else plays on `default`, with a warning that names
+/// what was refused.
+pub(crate) fn resolve_device_name(requested: Option<&str>) -> String {
+    let Some(name) = requested else {
+        return "default".to_string();
+    };
+    if name.starts_with("hw:")
+        || name.starts_with("plughw:")
+        || name.starts_with("default")
+        || name.starts_with("sysdefault:")
+    {
+        return name.to_string();
+    }
+    if let Some(plughw) = plughw_from_aplay_line(name) {
+        return plughw;
+    }
+    warn!(
+        requested = %name,
+        used = "default",
+        "audio device name not accepted (expected hw:, plughw:, default or sysdefault:), playing on default"
+    );
+    "default".to_string()
+}
+
+/// DSD multipliers the endpoint can announce, lowest first (RFC §5.6
+/// defines them up to DSD512).
+const DSD_MULTIPLIERS: [u16; 4] = [64, 128, 256, 512];
+
+/// Announced when the device's DSD rates cannot be probed: what the endpoint
+/// always announced before.
+pub const DSD_FALLBACK_MULTIPLIER: u16 = 64;
+
+/// ALSA DSD_U32_BE frame rate of a DSD multiplier: the bit rate
+/// (multiplier × 44.1 kHz) over 32 bits per frame, as `alsa_format_and_rate`
+/// opens it (DSD64 → 88 200).
+fn dsd_u32_rate(multiplier: u16) -> u32 {
+    multiplier as u32 * 44_100 / 32
+}
+
+/// The highest DSD multiplier to announce (`dsd_max_rate`) for the
+/// configured device. `probe` is given the `hw:` device and the DSD_U32_BE
+/// rates to try, and returns those the device accepts. The answer is the
+/// highest multiplier whose rate and every lower one's are accepted. When
+/// the device is not a `hw:` one, the probe fails or DSD64 itself is
+/// refused, it is [`DSD_FALLBACK_MULTIPLIER`], with a warning.
+pub(crate) fn announced_dsd_max(
+    device_name: Option<&str>,
+    probe: impl FnOnce(&str, &[u32]) -> Result<Vec<u32>, String>,
+) -> u16 {
+    let device = dsd_hw_device(&resolve_device_name(device_name));
+    if !device.starts_with("hw:") {
+        warn!(
+            device = %device,
+            dsd_max = DSD_FALLBACK_MULTIPLIER,
+            "DSD rates not probed: native DSD needs a hw: device, announcing DSD64"
+        );
+        return DSD_FALLBACK_MULTIPLIER;
+    }
+    let rates: Vec<u32> = DSD_MULTIPLIERS.iter().map(|&m| dsd_u32_rate(m)).collect();
+    let accepted = match probe(&device, &rates) {
+        Ok(accepted) => accepted,
+        Err(e) => {
+            warn!(
+                device = %device,
+                error = %e,
+                dsd_max = DSD_FALLBACK_MULTIPLIER,
+                "DSD rate probe failed, announcing DSD64"
+            );
+            return DSD_FALLBACK_MULTIPLIER;
+        }
+    };
+    let max = DSD_MULTIPLIERS
+        .iter()
+        .take_while(|&&m| accepted.contains(&dsd_u32_rate(m)))
+        .last()
+        .copied();
+    match max {
+        Some(m) => {
+            info!(device = %device, dsd_max = m, "native DSD rates probed");
+            m
+        }
+        None => {
+            warn!(
+                device = %device,
+                accepted_rates = ?accepted,
+                dsd_max = DSD_FALLBACK_MULTIPLIER,
+                "device does not accept DSD64 in DSD_U32_BE, announcing DSD64"
+            );
+            DSD_FALLBACK_MULTIPLIER
+        }
+    }
+}
+
+/// Which of `rates` the `hw:` device accepts in DSD_U32_BE stereo,
+/// interleaved: the hw_params space is queried, nothing is played. The
+/// device is opened non-blocking and closed on return.
+fn probe_dsd_rates(device: &str, rates: &[u32]) -> Result<Vec<u32>, String> {
+    use alsa::pcm::{Access, Format, HwParams};
+    use alsa::{Direction, PCM};
+
+    let err = |what: &str, e: alsa::Error| format!("{device}: {what}: {e}");
+    let pcm = PCM::new(device, Direction::Playback, true).map_err(|e| err("open", e))?;
+    let hwp = HwParams::any(&pcm).map_err(|e| err("hw params", e))?;
+    hwp.set_access(Access::RWInterleaved)
+        .map_err(|e| err("access", e))?;
+    hwp.set_format(Format::DSDU32BE)
+        .map_err(|e| err("DSD_U32_BE", e))?;
+    hwp.set_channels(2).map_err(|e| err("channels", e))?;
+    Ok(rates
+        .iter()
+        .copied()
+        .filter(|&r| hwp.test_rate(r).is_ok())
+        .collect())
+}
+
+impl AlsaDirectOutput {
+    /// The `dsd_max_rate` to announce for `device_name` (the configured or
+    /// auto-detected device), from the DSD_U32_BE rates its `hw:` device
+    /// accepts. Falls back to DSD64, logged, when that cannot be probed.
+    pub fn dsd_max_multiplier(device_name: Option<&str>) -> u16 {
+        announced_dsd_max(device_name, probe_dsd_rates)
+    }
+}
+
 /// ALSA format name + rate for the device.
 /// DsdU8 arrives with the DSD *bit* rate (e.g. 2_822_400); ALSA DSD_U32 uses rate/32.
 fn alsa_format_and_rate(format: AudioFormat, sample_rate: u32) -> Option<(&'static str, u32)> {
@@ -1450,5 +1655,337 @@ mod tests {
         assert_eq!(out[5], 0x04u8.reverse_bits());
         assert_eq!(out[6], 0x06u8.reverse_bits());
         assert_eq!(out[7], 0x08u8.reverse_bits());
+    }
+
+    // -- Device choice without --audio-device (forum 2358, tune-server-rust#6698) --
+
+    fn card(card: i32, id: &str, name: &str, driver: &str, pcm: &str) -> PlaybackDevice {
+        PlaybackDevice {
+            card,
+            card_id: id.into(),
+            card_name: name.into(),
+            driver: driver.into(),
+            device: 0,
+            pcm_id: pcm.into(),
+            pcm_name: pcm.into(),
+        }
+    }
+
+    fn rpi_onboard() -> Vec<PlaybackDevice> {
+        vec![
+            card(
+                0,
+                "Headphones",
+                "bcm2835 Headphones",
+                "bcm2835_headpho",
+                "bcm2835 Headphones",
+            ),
+            card(
+                1,
+                "vc4hdmi0",
+                "vc4-hdmi-0",
+                "vc4-hdmi",
+                "MAI PCM i2s-hifi-0",
+            ),
+            card(
+                2,
+                "vc4hdmi1",
+                "vc4-hdmi-1",
+                "vc4-hdmi",
+                "MAI PCM i2s-hifi-0",
+            ),
+        ]
+    }
+
+    /// Everything the tracing macros print while `f` runs. A callsite first
+    /// hit with no subscriber at all may have its interest cached as
+    /// "never": every test that reaches a warning checked here goes through
+    /// this function, one at a time.
+    fn capture_logs(f: impl FnOnce()) -> String {
+        static SERIAL: Mutex<()> = Mutex::new(());
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+            type Writer = Buf;
+            fn make_writer(&'a self) -> Buf {
+                self.clone()
+            }
+        }
+        let buf = Buf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8(buf.0.lock().unwrap().clone()).unwrap()
+    }
+
+    #[test]
+    fn le_dac_usb_est_choisi_en_plughw_par_son_id_de_carte() {
+        let mut devices = rpi_onboard();
+        devices.push(card(3, "Hugo2", "Chord Hugo2", "USB-Audio", "USB Audio"));
+        let chosen = choose_dac(&devices);
+        assert_eq!(chosen.as_deref(), Some("plughw:CARD=Hugo2,DEV=0"));
+        // The name passes the output's filter unchanged: it is really used.
+        assert_eq!(
+            resolve_device_name(chosen.as_deref()),
+            "plughw:CARD=Hugo2,DEV=0"
+        );
+    }
+
+    #[test]
+    fn un_dac_usb_est_reconnu_a_son_pilote_meme_sans_usb_dans_le_nom() {
+        let mut devices = rpi_onboard();
+        devices.push(card(3, "D10s", "Topping D10s", "USB-Audio", "Topping D10s"));
+        assert_eq!(
+            choose_dac(&devices).as_deref(),
+            Some("plughw:CARD=D10s,DEV=0")
+        );
+    }
+
+    #[test]
+    fn sans_dac_usb_le_dac_i2s_est_choisi() {
+        let mut devices = rpi_onboard();
+        devices.push(card(
+            3,
+            "Q2M",
+            "I-Sabre Q2M DAC",
+            "snd_rpi_isabre_",
+            "I-Sabre Q2M DAC HiFi ess9038q2m-hifi-0",
+        ));
+        assert_eq!(
+            choose_dac(&devices).as_deref(),
+            Some("plughw:CARD=Q2M,DEV=0")
+        );
+    }
+
+    #[test]
+    fn hdmi_seul_ou_sortie_integree_laisse_default() {
+        let hdmi_only = vec![card(
+            0,
+            "vc4hdmi0",
+            "vc4-hdmi-0",
+            "vc4-hdmi",
+            "MAI PCM i2s-hifi-0",
+        )];
+        assert_eq!(choose_dac(&hdmi_only), None);
+        assert_eq!(
+            choose_dac(&rpi_onboard()),
+            None,
+            "HDMI and the jack are never chosen"
+        );
+        assert_eq!(choose_dac(&[]), None);
+        assert_eq!(resolve_device_name(None), "default");
+    }
+
+    #[test]
+    fn deux_cartes_externes_sans_indice_restent_ambigues() {
+        let devices = vec![
+            card(0, "PCH", "HDA Intel PCH", "HDA-Intel", "ALC892 Analog"),
+            card(1, "Other", "Some Card", "snd_other", "Other PCM"),
+        ];
+        assert_eq!(choose_dac(&devices), None);
+        // The only external card is taken.
+        assert_eq!(
+            choose_dac(&devices[..1]).as_deref(),
+            Some("plughw:CARD=PCH,DEV=0")
+        );
+    }
+
+    #[test]
+    fn une_ligne_de_la_liste_des_peripheriques_est_traduite_en_plughw() {
+        let line = card(3, "Hugo2", "Chord Hugo2", "USB-Audio", "USB Audio").aplay_line();
+        assert_eq!(
+            line,
+            "card 3: Hugo2 [Chord Hugo2], device 0: USB Audio [USB Audio]"
+        );
+        assert_eq!(resolve_device_name(Some(&line)), "plughw:CARD=Hugo2,DEV=0");
+    }
+
+    #[test]
+    fn un_nom_refuse_est_journalise_en_warn_avec_le_nom_recu() {
+        let mut used = String::new();
+        let logs = capture_logs(|| used = resolve_device_name(Some("iec958:CARD=Hugo2")));
+        assert_eq!(used, "default");
+        assert!(
+            logs.contains("WARN"),
+            "the fallback must be a warning: {logs}"
+        );
+        assert!(
+            logs.contains("iec958:CARD=Hugo2"),
+            "the refused name must be logged: {logs}"
+        );
+        // An accepted name logs nothing.
+        let logs = capture_logs(|| used = resolve_device_name(Some("hw:CARD=Hugo2,DEV=0")));
+        assert_eq!(used, "hw:CARD=Hugo2,DEV=0");
+        assert!(!logs.contains("WARN"), "{logs}");
+    }
+
+    #[test]
+    fn le_dac_detecte_s_ouvre_en_plughw_pour_le_pcm_et_en_hw_pour_le_dsd() {
+        let mut devices = rpi_onboard();
+        devices.push(card(3, "Hugo2", "Chord Hugo2", "USB-Audio", "USB Audio"));
+        let chosen = choose_dac(&devices);
+
+        let (st, opener) = fake();
+        let mut out = AlsaDirectOutput::with_opener(opener);
+        out.configure_with_device(AudioFormat::PcmS24le, 96_000, 2, chosen.as_deref())
+            .unwrap();
+        out.play();
+        out.write_audio(&[0u8; 6 * 64]);
+        wait_until("PCM open", || st.lock().unwrap().open_attempts >= 1);
+        let p = st.lock().unwrap().params.clone().unwrap();
+        assert_eq!(p.device, "plughw:CARD=Hugo2,DEV=0");
+
+        out.configure_with_device(AudioFormat::DsdU8, 2_822_400, 2, chosen.as_deref())
+            .unwrap();
+        out.play();
+        out.write_audio(&[0x69u8; 8 * 64]);
+        wait_until("DSD open", || st.lock().unwrap().open_attempts >= 2);
+        let p = st.lock().unwrap().params.clone().unwrap();
+        assert_eq!(
+            (p.device.as_str(), p.format, p.rate),
+            ("hw:CARD=Hugo2,DEV=0", "DSD_U32_BE", 88_200)
+        );
+        out.stop();
+    }
+
+    // -- Native DSD rates announced (dsd_max_rate) --
+
+    /// A probe that accepts the given multipliers' DSD_U32_BE rates and
+    /// records the device it was asked about.
+    fn probe_accepting<'a>(
+        multipliers: &'static [u16],
+        asked: &'a mut Option<String>,
+    ) -> impl FnOnce(&str, &[u32]) -> Result<Vec<u32>, String> + 'a {
+        move |device, rates| {
+            *asked = Some(device.to_string());
+            let ok: Vec<u32> = multipliers.iter().map(|&m| dsd_u32_rate(m)).collect();
+            Ok(rates.iter().copied().filter(|r| ok.contains(r)).collect())
+        }
+    }
+
+    #[test]
+    fn les_frequences_dsd_sondees_sont_celles_qu_ouvre_la_sortie() {
+        for (mult, bit_rate) in [
+            (64, 2_822_400),
+            (128, 5_644_800),
+            (256, 11_289_600),
+            (512, 22_579_200),
+        ] {
+            let (_, rate) = alsa_format_and_rate(AudioFormat::DsdU8, bit_rate).unwrap();
+            assert_eq!(dsd_u32_rate(mult), rate, "DSD{mult}");
+        }
+    }
+
+    #[test]
+    fn sonde_dsd64_seul_annonce_dsd64() {
+        let mut asked = None;
+        let max = announced_dsd_max(
+            Some("plughw:CARD=Hugo2,DEV=0"),
+            probe_accepting(&[64], &mut asked),
+        );
+        assert_eq!(max, 64);
+        assert_eq!(
+            asked.as_deref(),
+            Some("hw:CARD=Hugo2,DEV=0"),
+            "the probe asks the hw: device"
+        );
+    }
+
+    #[test]
+    fn sonde_jusqu_a_dsd256_annonce_dsd256() {
+        let mut asked = None;
+        let max = announced_dsd_max(
+            Some("plughw:CARD=Hugo2,DEV=0"),
+            probe_accepting(&[64, 128, 256], &mut asked),
+        );
+        assert_eq!(max, 256);
+    }
+
+    #[test]
+    fn sonde_jusqu_a_dsd512_annonce_dsd512() {
+        let mut asked = None;
+        let max = announced_dsd_max(
+            Some("hw:CARD=Hugo2,DEV=0"),
+            probe_accepting(&[64, 128, 256, 512], &mut asked),
+        );
+        assert_eq!(max, 512);
+    }
+
+    #[test]
+    fn un_trou_dans_les_frequences_arrete_l_annonce() {
+        let mut asked = None;
+        let max = announced_dsd_max(Some("hw:1,0"), probe_accepting(&[64, 256], &mut asked));
+        assert_eq!(max, 64, "DSD128 refused: DSD256 is not announced");
+    }
+
+    #[test]
+    fn sonde_en_echec_garde_dsd64_et_le_journalise() {
+        let mut max = 0;
+        let logs = capture_logs(|| {
+            max = announced_dsd_max(Some("hw:CARD=Hugo2,DEV=0"), |_, _| {
+                Err("hw:CARD=Hugo2,DEV=0: open: Device or resource busy".into())
+            })
+        });
+        assert_eq!(max, DSD_FALLBACK_MULTIPLIER);
+        assert!(
+            logs.contains("WARN") && logs.contains("DSD rate probe failed"),
+            "{logs}"
+        );
+        assert!(logs.contains("busy"), "the probe error is logged: {logs}");
+    }
+
+    #[test]
+    fn dsd64_refuse_par_la_sonde_garde_dsd64() {
+        let mut asked = None;
+        let mut max = 0;
+        let logs = capture_logs(|| {
+            max = announced_dsd_max(Some("hw:1,0"), probe_accepting(&[128], &mut asked))
+        });
+        assert_eq!(max, 64);
+        assert!(logs.contains("WARN"), "{logs}");
+    }
+
+    #[test]
+    fn sans_peripherique_hw_la_sonde_n_est_pas_lancee() {
+        let mut called = false;
+        let mut max = 0;
+        let logs = capture_logs(|| {
+            max = announced_dsd_max(None, |_, _| {
+                called = true;
+                Ok(vec![])
+            })
+        });
+        assert_eq!(max, 64);
+        assert!(!called, "default cannot open DSD_U32_BE: nothing to probe");
+        assert!(
+            logs.contains("WARN") && logs.contains("DSD rates not probed"),
+            "{logs}"
+        );
+    }
+
+    /// The real ALSA probe on a card that does not exist (CI and Shrek have
+    /// no sound card): the open fails, DSD64 is kept.
+    #[test]
+    fn la_vraie_sonde_sur_une_carte_absente_garde_dsd64() {
+        assert!(probe_dsd_rates("hw:CARD=OaatAbsentCard,DEV=0", &[88_200]).is_err());
+        let mut max = 0;
+        let logs = capture_logs(|| {
+            max = AlsaDirectOutput::dsd_max_multiplier(Some("plughw:CARD=OaatAbsentCard,DEV=0"))
+        });
+        assert_eq!(max, DSD_FALLBACK_MULTIPLIER);
+        assert!(logs.contains("DSD rate probe failed"), "{logs}");
     }
 }
