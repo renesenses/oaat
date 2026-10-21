@@ -2,10 +2,11 @@
 //! behaves like the RME ADI-2 DAC (it opens, takes S32_LE, refuses
 //! DSD_U32_BE with EINVAL), driven by an OAAT controller.
 //!
-//! The fake device is ALSA configuration, not code: a `~/.asoundrc` (HOME
-//! points to a temporary directory) redefines `pcm.hw` as a plug onto the
-//! `null` PCM, restricted to S32_LE. alsa-lib reloads the file when it
-//! changes, so a test can change what the "DAC" accepts mid-session.
+//! The fake device is ALSA configuration, not code: a file added to
+//! `ALSA_CONFIG_PATH`, after the system `alsa.conf`, redefines `pcm.hw` as a
+//! plug onto the `null` PCM, restricted to S32_LE. alsa-lib reloads the
+//! files of `ALSA_CONFIG_PATH` when one changes, so a test can change what
+//! the "DAC" accepts mid-session.
 #![cfg(target_os = "linux")]
 
 use std::path::{Path, PathBuf};
@@ -54,6 +55,10 @@ impl Bridge {
             .args(["--port", &port.to_string(), "--no-web-ui", "--dsd"])
             .args(["--audio-device", DEVICE])
             .env("HOME", &home)
+            .env(
+                "ALSA_CONFIG_PATH",
+                format!("{SYSTEM_ALSA_CONF}:{}", home.join(FAKE_DAC_CONF).display()),
+            )
             .env("RUST_LOG", "info")
             .stdin(Stdio::null())
             .stdout(log.try_clone().unwrap())
@@ -98,13 +103,16 @@ impl Drop for Bridge {
     }
 }
 
-/// Write the fake DAC's `~/.asoundrc`. alsa-lib reloads its configuration
-/// when a file's inode or mtime (in seconds) changes: written then renamed,
-/// the file gets a new inode, so a change within the same second is seen.
-fn set_dac(home: &Path, asoundrc: &str) {
-    let tmp = home.join(".asoundrc.new");
-    std::fs::write(&tmp, asoundrc).unwrap();
-    std::fs::rename(&tmp, home.join(".asoundrc")).unwrap();
+const SYSTEM_ALSA_CONF: &str = "/usr/share/alsa/alsa.conf";
+const FAKE_DAC_CONF: &str = "fake-dac.conf";
+
+/// Write the fake DAC's configuration. alsa-lib reloads it when the file's
+/// inode or mtime (in seconds) changes: written then renamed, it gets a new
+/// inode, so a change within the same second is seen.
+fn set_dac(home: &Path, conf: &str) {
+    let tmp = home.join("fake-dac.new");
+    std::fs::write(&tmp, conf).unwrap();
+    std::fs::rename(&tmp, home.join(FAKE_DAC_CONF)).unwrap();
 }
 
 fn dsd64(stream_id: &str) -> FormatPropose {
