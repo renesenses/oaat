@@ -298,6 +298,7 @@ async fn run(cli: Cli) {
                 &file_config.hooks,
                 ep_web_ui,
                 ep_web_addr,
+                file_config.web_ui.control_token.clone(),
                 ep_dsd,
             )
             .await;
@@ -368,6 +369,7 @@ async fn run_endpoint(
     hooks: &config::HooksSection,
     web_ui_enabled: bool,
     web_ui_addr: SocketAddr,
+    web_control_token: Option<String>,
     enable_dsd: bool,
 ) {
     let web_ui_port = web_ui_addr.port();
@@ -408,12 +410,28 @@ async fn run_endpoint(
     if caps_config.flac {
         formats.push(AudioFormat::Flac);
     }
-    if enable_dsd {
-        formats.push(AudioFormat::DsdU8);
-        formats.push(AudioFormat::DsdU16le);
-        formats.push(AudioFormat::DsdU32le);
-        info!("native DSD capability enabled (ALSA DSD_U32_BE)");
-    }
+    // Highest native DSD rate announced: what the hw: device accepts in
+    // DSD_U32_BE (probed once, here). None when the device refuses DSD or
+    // cannot be probed: no DSD format is announced and the server converts
+    // DSD to PCM (#62).
+    let dsd_max: Option<u16> = if enable_dsd {
+        #[cfg(target_os = "linux")]
+        let max = AlsaDirectOutput::dsd_max_multiplier(audio_device.as_deref());
+        #[cfg(not(target_os = "linux"))]
+        let max = Some(64);
+        if let Some(max) = max {
+            formats.push(AudioFormat::DsdU8);
+            formats.push(AudioFormat::DsdU16le);
+            formats.push(AudioFormat::DsdU32le);
+            info!(
+                dsd_max = max,
+                "native DSD capability enabled (ALSA DSD_U32_BE)"
+            );
+        }
+        max
+    } else {
+        None
+    };
 
     // Hardware volume needs ALSA: elsewhere it is software volume.
     let volume_mode = match dac_config.volume_mode() {
@@ -433,7 +451,7 @@ async fn run_endpoint(
     let capabilities = EndpointCapabilities {
         pcm_max_rate: caps_config.pcm_max_rate,
         pcm_max_bits: caps_config.pcm_max_bits,
-        dsd_max_rate: if enable_dsd { Some(64) } else { None },
+        dsd_max_rate: dsd_max,
         channels_max: caps_config.channels_max,
         formats,
         volume: Some(VolumeCapability {
@@ -449,7 +467,7 @@ async fn run_endpoint(
     let mdns_caps = oaat_core::capability::Capabilities {
         pcm_max_rate_khz: caps_config.pcm_max_rate / 1000,
         pcm_max_bits: caps_config.pcm_max_bits,
-        dsd_max_multiplier: if enable_dsd { Some(64) } else { None },
+        dsd_max_multiplier: dsd_max,
         flac: caps_config.flac,
         opus: false,
         truehd: false,
@@ -512,7 +530,14 @@ async fn run_endpoint(
         let (handle, _reader) = web_ui::BridgeStatusHandle::new(initial_status);
         let (switch_tx, switch_rx) = mpsc::channel::<String>(8);
         if web_ui_enabled {
-            web_ui::start_web_ui_on(web_ui_addr, handle.clone(), switch_tx, Some(release_tx.clone())).await;
+            web_ui::start_web_ui_with_token(
+                web_ui_addr,
+                handle.clone(),
+                switch_tx,
+                Some(release_tx.clone()),
+                web_control_token,
+            )
+            .await;
         }
         (handle, switch_rx)
     };

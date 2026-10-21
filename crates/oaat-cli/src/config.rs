@@ -35,7 +35,8 @@ use tracing::info;
 /// [web_ui]
 /// # enabled = true
 /// # port = 9741
-/// # bind = "0.0.0.0"   # "127.0.0.1" keeps the controls local to the host
+/// # bind = "127.0.0.1"   # loopback by default
+/// # control_token = "a-long-random-secret"
 ///
 /// # Commands run (with /bin/sh -c) when the endpoint starts and stops
 /// # using the audio output, e.g. to tell the host which source plays.
@@ -55,13 +56,29 @@ pub struct EndpointFileConfig {
     pub hooks: HooksSection,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(default)]
 pub struct WebUiSection {
     pub enabled: bool,
     pub port: u16,
     /// Address the status page listens on.
     pub bind: std::net::IpAddr,
+    /// Optional Bearer token for control requests; never exposed by the status API.
+    pub control_token: Option<String>,
+}
+
+impl std::fmt::Debug for WebUiSection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebUiSection")
+            .field("enabled", &self.enabled)
+            .field("port", &self.port)
+            .field("bind", &self.bind)
+            .field(
+                "control_token",
+                &self.control_token.as_ref().map(|_| "[redacted]"),
+            )
+            .finish()
+    }
 }
 
 impl Default for WebUiSection {
@@ -69,7 +86,8 @@ impl Default for WebUiSection {
         Self {
             enabled: true,
             port: crate::DEFAULT_WEB_UI_PORT,
-            bind: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            control_token: None,
         }
     }
 }
@@ -195,7 +213,6 @@ pub struct DacSection {
     pub fir_filter: Option<String>,
 }
 
-
 impl Default for LoggingSection {
     fn default() -> Self {
         Self {
@@ -214,10 +231,7 @@ impl DacSection {
     }
 }
 
-const DEFAULT_CONFIG_PATHS: &[&str] = &[
-    "/etc/tune-bridge/config.toml",
-    "/etc/oaat/endpoint.toml",
-];
+const DEFAULT_CONFIG_PATHS: &[&str] = &["/etc/tune-bridge/config.toml", "/etc/oaat/endpoint.toml"];
 
 impl EndpointFileConfig {
     /// Load config from an explicit path, the default path, or built-in defaults.
@@ -360,10 +374,41 @@ on_start = "/opt/state start"
         assert_eq!(cfg.hooks.on_start.as_deref(), Some("/opt/state start"));
         assert!(cfg.endpoint.id.is_none());
         assert!(cfg.hooks.on_stop.is_none());
-        // without the sections: listening on all interfaces, no hooks
+        // without the sections: loopback controls, no hooks
         let cfg = EndpointFileConfig::default();
-        assert!(cfg.web_ui.bind.is_unspecified());
+        assert!(cfg.web_ui.bind.is_loopback());
+        assert!(cfg.web_ui.control_token.is_none());
         assert!(cfg.hooks.on_start.is_none());
+    }
+
+    #[test]
+    fn verox_loopback_bind_keeps_working() {
+        // What Verox writes to the endpoint configuration.
+        let cfg: EndpointFileConfig = toml::from_str("[web_ui]\nbind = \"127.0.0.1\"\n").unwrap();
+        assert!(cfg.web_ui.enabled);
+        assert_eq!(cfg.web_ui.port, 9741);
+        assert_eq!(
+            std::net::SocketAddr::new(cfg.web_ui.bind, cfg.web_ui.port),
+            "127.0.0.1:9741".parse().unwrap()
+        );
+        assert!(cfg.web_ui.control_token.is_none());
+    }
+
+    #[test]
+    fn default_web_ui_listens_on_loopback_port_9741_only() {
+        let cfg = EndpointFileConfig::default();
+        assert_eq!(
+            std::net::SocketAddr::new(cfg.web_ui.bind, cfg.web_ui.port),
+            "127.0.0.1:9741".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn control_token_is_parsed_but_redacted_from_debug() {
+        let cfg: EndpointFileConfig =
+            toml::from_str("[web_ui]\ncontrol_token = 'test-secret'").unwrap();
+        assert_eq!(cfg.web_ui.control_token.as_deref(), Some("test-secret"));
+        assert!(!format!("{cfg:?}").contains("test-secret"));
     }
 
     #[test]
