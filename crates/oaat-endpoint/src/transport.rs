@@ -952,3 +952,60 @@ fn best_rate_in_family(proposed_rate: u32, max_rate: u32) -> u32 {
 fn now_ns() -> u64 {
     oaat_core::time::now_ns()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oaat_core::format::{AudioFormat, ChannelLayout};
+
+    fn dsd_caps(max: u16) -> EndpointCapabilities {
+        EndpointCapabilities {
+            pcm_max_rate: 192_000,
+            pcm_max_bits: 24,
+            dsd_max_rate: Some(max),
+            channels_max: 2,
+            formats: vec![AudioFormat::PcmS24le, AudioFormat::DsdU8],
+            volume: None,
+            gapless: true,
+            seek: true,
+        }
+    }
+
+    /// What Tune proposes for a DSF file (native DSD fast path).
+    fn dsd_propose(multiplier: u16) -> FormatPropose {
+        FormatPropose {
+            stream_id: format!("dsd{multiplier}"),
+            format: AudioFormat::DsdU8,
+            sample_rate: multiplier as u32 * 44_100,
+            channels: 2,
+            channel_layout: ChannelLayout::Stereo,
+            bits_per_sample: 1,
+            dsd_rate: Some(multiplier),
+        }
+    }
+
+    /// tune-server-rust#6698: the endpoint used to announce DSD64 only, so
+    /// DSD128/256 always went to PCM. With the probed maximum, every rate up
+    /// to it is accepted natively and those above are still refused.
+    #[test]
+    fn les_frequences_dsd_sont_acceptees_jusqu_au_maximum_annonce() {
+        let caps = dsd_caps(256);
+        for m in [64, 128, 256] {
+            assert!(
+                matches!(
+                    negotiate_format(&caps, &dsd_propose(m)),
+                    Message::FormatAccept(_)
+                ),
+                "DSD{m} must be accepted up to DSD256"
+            );
+        }
+        assert!(matches!(
+            negotiate_format(&caps, &dsd_propose(512)),
+            Message::FormatReject(_)
+        ));
+        assert!(matches!(
+            negotiate_format(&dsd_caps(64), &dsd_propose(128)),
+            Message::FormatReject(_)
+        ));
+    }
+}

@@ -304,10 +304,12 @@ level = "info"
 [web_ui]
 # Status page (port 9741 by default). It also takes POST /api/release, which
 # makes the endpoint give up the DAC and tell the controller (endpoint_release),
-# and POST /api/device. Bind it to 127.0.0.1 to keep these local to the Pi.
+# and POST /api/device. Loopback is the default; controls require
+# Content-Type: application/json, and a browser Origin must match the page.
 # enabled = true
 # port = 9741
-# bind = "0.0.0.0"
+# bind = "127.0.0.1"
+# control_token = "a-long-random-secret"
 
 [hooks]
 # Commands run with /bin/sh -c when the endpoint starts using the DAC (when a
@@ -320,6 +322,35 @@ level = "info"
 # on_start = "/usr/local/bin/oaat-state start"
 # on_stop = "/usr/local/bin/oaat-state stop"
 ```
+
+### Status page and control access
+
+The status server binds to `127.0.0.1:9741` by default. An explicit
+`[web_ui] bind = "0.0.0.0"` makes the status page and `GET /api/status`
+available on the LAN, but without a configured `control_token` the two
+control endpoints still reject clients outside loopback.
+
+Both `POST /api/release` and `POST /api/device` require
+`Content-Type: application/json` (the body of a release may be empty).
+When the request carries an `Origin` header, as every browser does, it must
+match the HTTP address and port used to connect: use the numeric address, or
+`localhost` for loopback; arbitrary DNS names and cross-origin requests are
+rejected. Clients that send no `Origin` (command-line tools, a host
+controller) are accepted from loopback, or with the token below.
+For example, on the Pi:
+
+```sh
+curl --request POST http://127.0.0.1:9741/api/release \
+  --header 'Content-Type: application/json'
+```
+
+If `control_token` is configured, every control request, local or remote,
+must also carry `Authorization: Bearer <token>`. An empty configured token
+fails closed. Keep the configuration readable only by the service user;
+the token is never included in the status response or configuration debug
+output. This server uses HTTP: for control across an untrusted network,
+keep the loopback bind and use an SSH tunnel. Do not expose the bearer token
+through a public URL or place it in a query string.
 
 ### Examples, DAC by DAC
 

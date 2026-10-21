@@ -39,3 +39,6 @@ audio-output = ["dep:cpal", "dep:ringbuf"]
 flac = ["dep:symphonia"]
 tls = ["dep:tokio-rustls", "dep:rustls", "oaat-core/tls"]
 web-ui = ["dep:hyper", "dep:hyper-util", "dep:http-body-util"]
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }

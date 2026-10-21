@@ -110,7 +110,7 @@ pub type DeviceSwitchRx = tokio::sync::mpsc::Receiver<String>;
 pub type ReleaseTx = tokio::sync::mpsc::Sender<()>;
 pub type ReleaseRx = tokio::sync::mpsc::Receiver<()>;
 
-/// Start the web UI HTTP server on all interfaces. Returns immediately,
+/// Start the web UI HTTP server on loopback. Returns immediately,
 /// running in the background.
 pub async fn start_web_ui(
     port: u16,
@@ -118,7 +118,7 @@ pub async fn start_web_ui(
     device_switch_tx: DeviceSwitchTx,
 ) {
     start_web_ui_on(
-        ([0, 0, 0, 0], port).into(),
+        ([127, 0, 0, 1], port).into(),
         status_handle,
         device_switch_tx,
         None,
@@ -135,6 +135,18 @@ pub async fn start_web_ui_on(
     device_switch_tx: DeviceSwitchTx,
     release_tx: Option<ReleaseTx>,
 ) {
+    start_web_ui_with_token(addr, status_handle, device_switch_tx, release_tx, None).await;
+}
+
+/// A shared token authenticates control requests, including on a LAN bind.
+/// Status GETs remain read-only and do not require a token.
+pub async fn start_web_ui_with_token(
+    addr: SocketAddr,
+    status_handle: BridgeStatusHandle,
+    device_switch_tx: DeviceSwitchTx,
+    release_tx: Option<ReleaseTx>,
+    control_token: Option<String>,
+) {
     let port = addr.port();
     let listener = match TcpListener::bind(addr).await {
         Ok(l) => {
@@ -149,19 +161,44 @@ pub async fn start_web_ui_on(
             return;
         }
     };
+    serve_web_ui(
+        listener,
+        status_handle,
+        device_switch_tx,
+        release_tx,
+        control_token,
+    );
+}
 
+/// Serve the web UI on an already-bound listener, in the background.
+fn serve_web_ui(
+    listener: TcpListener,
+    status_handle: BridgeStatusHandle,
+    device_switch_tx: DeviceSwitchTx,
+    release_tx: Option<ReleaseTx>,
+    control_token: Option<String>,
+) {
     let status_handle = Arc::new(status_handle);
     let device_switch_tx = Arc::new(device_switch_tx);
     let release_tx = Arc::new(release_tx);
+    let control_token = Arc::new(control_token);
 
     tokio::spawn(async move {
         loop {
-            let (stream, _peer) = match listener.accept().await {
+            let (stream, peer) = match listener.accept().await {
                 Ok(s) => s,
                 Err(e) => {
                     warn!(error = %e, "web UI accept error");
                     continue;
                 }
+            };
+            let Ok(local) = stream.local_addr() else {
+                continue;
+            };
+            let policy = ControlPolicy {
+                local,
+                peer,
+                token: control_token.clone(),
             };
             let io = TokioIo::new(stream);
             let status = status_handle.clone();
@@ -173,7 +210,8 @@ pub async fn start_web_ui_on(
                     let status = status.clone();
                     let switch_tx = switch_tx.clone();
                     let release_tx = release_tx.clone();
-                    async move { handle_request(req, &status, &switch_tx, &release_tx).await }
+                    let policy = policy.clone();
+                    async move { handle_request(req, &status, &switch_tx, &release_tx, &policy).await }
                 });
                 if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
                     // Connection reset is normal for browsers
@@ -186,12 +224,116 @@ pub async fn start_web_ui_on(
     });
 }
 
-async fn handle_request(
-    req: Request<hyper::body::Incoming>,
+#[derive(Clone)]
+struct ControlPolicy {
+    local: SocketAddr,
+    peer: SocketAddr,
+    token: Arc<Option<String>>,
+}
+
+impl ControlPolicy {
+    fn authorize<B>(&self, req: &Request<B>) -> Result<(), StatusCode> {
+        // Ok(None): header absent; Err: repeated or not valid UTF-8.
+        let header = |name: &str| -> Result<Option<&str>, StatusCode> {
+            let mut values = req.headers().get_all(name).iter();
+            let Some(first) = values.next() else {
+                return Ok(None);
+            };
+            if values.next().is_some() {
+                return Err(StatusCode::FORBIDDEN);
+            }
+            first.to_str().map(Some).map_err(|_| StatusCode::FORBIDDEN)
+        };
+        let one_header = |name: &str| header(name).ok().flatten();
+        // Browsers always send Origin on POST, so a missing Origin means a
+        // non-browser client (e.g. a host controller calling the loopback
+        // API): it cannot be driven by a web page, and still has to pass the
+        // JSON, peer and token checks below. A present Origin must be the
+        // page itself, on a Host that is this listener (DNS rebinding).
+        if let Some(origin) = header("origin")? {
+            self.check_same_origin(origin, header("host")?.ok_or(StatusCode::FORBIDDEN)?)?;
+        }
+        let json = one_header("content-type")
+            .and_then(|v| v.split(';').next())
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("application/json"));
+        if !json {
+            return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        }
+        match self.token.as_deref() {
+            Some(expected) => {
+                let supplied = one_header("authorization")
+                    .and_then(|v| v.strip_prefix("Bearer "))
+                    .ok_or(StatusCode::UNAUTHORIZED)?;
+                if expected.is_empty() || !same_token(expected.as_bytes(), supplied.as_bytes()) {
+                    return Err(StatusCode::UNAUTHORIZED);
+                }
+            }
+            None if !self.peer.ip().is_loopback() => return Err(StatusCode::FORBIDDEN),
+            None => {}
+        }
+        Ok(())
+    }
+
+    fn check_same_origin(&self, origin: &str, host: &str) -> Result<(), StatusCode> {
+        let authority = self.local.to_string();
+        let localhost = format!("localhost:{}", self.local.port());
+        let default_port = self.local.port() == 80;
+        let numeric_host = if default_port {
+            authority.trim_end_matches(":80")
+        } else {
+            &authority
+        };
+        // Do not trust Host alone: an attacker can point their DNS at loopback.
+        let local_name = self.local.ip().is_loopback()
+            && (host == localhost || (default_port && host == "localhost"));
+        if host != authority && host != numeric_host && !local_name {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        let origin_host = if default_port {
+            host.trim_end_matches(":80")
+        } else {
+            host
+        };
+        if origin != format!("http://{origin_host}") && origin != format!("http://{host}") {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        Ok(())
+    }
+}
+
+fn same_token(expected: &[u8], supplied: &[u8]) -> bool {
+    if expected.len() != supplied.len() {
+        return false;
+    }
+    expected
+        .iter()
+        .zip(supplied)
+        .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+        == 0
+}
+
+async fn handle_request<B>(
+    req: Request<B>,
     status_handle: &BridgeStatusHandle,
     device_switch_tx: &DeviceSwitchTx,
     release_tx: &Option<ReleaseTx>,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    policy: &ControlPolicy,
+) -> Result<Response<Full<Bytes>>, hyper::Error>
+where
+    B: hyper::body::Body<Data = Bytes>,
+{
+    if req.method() == Method::POST
+        && matches!(req.uri().path(), "/api/device" | "/api/release")
+        && let Err(code) = policy.authorize(&req)
+    {
+        return Ok(Response::builder()
+            .status(code)
+            .header("Content-Type", "application/json")
+            .body(Full::new(Bytes::from_static(
+                b"{\"ok\":false,\"error\":\"control request rejected\"}",
+            )))
+            .unwrap());
+    }
     match (req.method(), req.uri().path()) {
         (&Method::POST, "/api/release") if release_tx.is_some() => {
             info!("web UI: release requested");
@@ -236,19 +378,9 @@ async fn handle_request(
                 .await
                 .map(|c| c.to_bytes())
                 .unwrap_or_default();
-            let body_str = String::from_utf8_lossy(&body);
-
-            // Parse simple JSON: {"device": "name"}
-            let device_name = body_str
-                .trim()
-                .strip_prefix('{')
-                .and_then(|s| s.strip_suffix('}'))
-                .and_then(|s| {
-                    // Very simple JSON parsing — no external dep needed
-                    s.split(':')
-                        .nth(1)
-                        .map(|v| v.trim().trim_matches('"').to_string())
-                });
+            let device_name = serde_json::from_slice::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v.get("device")?.as_str().map(str::to_owned));
 
             match device_name {
                 Some(name) if !name.is_empty() => {
@@ -257,10 +389,9 @@ async fn handle_request(
                     Ok(Response::builder()
                         .status(200)
                         .header("Content-Type", "application/json")
-                        .body(Full::new(Bytes::from(format!(
-                            r#"{{"ok":true,"device":"{}"}}"#,
-                            name
-                        ))))
+                        .body(Full::new(Bytes::from(
+                            serde_json::json!({"ok":true,"device":name}).to_string(),
+                        )))
                         .unwrap())
                 }
                 _ => Ok(Response::builder()
@@ -473,3 +604,6 @@ fn render_html(status: &BridgeStatus) -> String {
         current_device = status.current_device,
     )
 }
+
+#[cfg(test)]
+mod control_tests;
