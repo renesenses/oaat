@@ -408,17 +408,29 @@ async fn run_endpoint(
     if caps_config.flac {
         formats.push(AudioFormat::Flac);
     }
-    if enable_dsd {
+    // Highest native DSD rate announced: what the hw: device accepts in
+    // DSD_U32_BE (probed once, here), DSD64 when that cannot be probed.
+    let dsd_max: Option<u16> = if enable_dsd {
         formats.push(AudioFormat::DsdU8);
         formats.push(AudioFormat::DsdU16le);
         formats.push(AudioFormat::DsdU32le);
-        info!("native DSD capability enabled (ALSA DSD_U32_BE)");
-    }
+        #[cfg(target_os = "linux")]
+        let max = AlsaDirectOutput::dsd_max_multiplier(audio_device.as_deref());
+        #[cfg(not(target_os = "linux"))]
+        let max = 64;
+        info!(
+            dsd_max = max,
+            "native DSD capability enabled (ALSA DSD_U32_BE)"
+        );
+        Some(max)
+    } else {
+        None
+    };
 
     let capabilities = EndpointCapabilities {
         pcm_max_rate: caps_config.pcm_max_rate,
         pcm_max_bits: caps_config.pcm_max_bits,
-        dsd_max_rate: if enable_dsd { Some(64) } else { None },
+        dsd_max_rate: dsd_max,
         channels_max: caps_config.channels_max,
         formats,
         volume: None,
@@ -430,7 +442,7 @@ async fn run_endpoint(
     let mdns_caps = oaat_core::capability::Capabilities {
         pcm_max_rate_khz: caps_config.pcm_max_rate / 1000,
         pcm_max_bits: caps_config.pcm_max_bits,
-        dsd_max_multiplier: if enable_dsd { Some(64) } else { None },
+        dsd_max_multiplier: dsd_max,
         flac: caps_config.flac,
         opus: false,
         truehd: false,
