@@ -144,12 +144,11 @@ fn pcm(stream_id: &str) -> FormatPropose {
 enum Answer {
     Accept,
     Reject(String),
-    Other(String),
 }
 
 /// Propose and wait for the answer, longer than the endpoint's 5 s
-/// fail-open on the deferred accept.
-async fn propose(ep: &mut ConnectedEndpoint, fp: FormatPropose) -> Answer {
+/// fail-open on the deferred accept. Any other outcome fails the test.
+async fn propose(bridge: &Bridge, ep: &mut ConnectedEndpoint, fp: FormatPropose) -> Answer {
     ep.send_message(&Message::FormatPropose(fp)).await.unwrap();
     let end = Instant::now() + Duration::from_secs(8);
     loop {
@@ -158,9 +157,9 @@ async fn propose(ep: &mut ConnectedEndpoint, fp: FormatPropose) -> Answer {
             Ok(Some(EndpointResponse::FormatAccept(_))) => return Answer::Accept,
             Ok(Some(EndpointResponse::FormatReject(r))) => return Answer::Reject(r.reason),
             Ok(Some(EndpointResponse::StreamStats(_))) => continue,
-            Ok(Some(other)) => return Answer::Other(format!("{other:?}")),
-            Ok(None) => return Answer::Other("connection closed".into()),
-            Err(_) => return Answer::Other("no answer within 8 s".into()),
+            Ok(Some(other)) => panic!("unexpected answer {other:?}\n{}", bridge.log()),
+            Ok(None) => panic!("connection closed\n{}", bridge.log()),
+            Err(_) => panic!("no answer within 8 s\n{}", bridge.log()),
         }
     }
 }
@@ -206,11 +205,11 @@ async fn un_dac_qui_refuse_le_dsd_n_annonce_aucun_dsd_natif() {
     );
     assert!(!log.contains("native DSD capability enabled"), "{log}");
 
-    match propose(&mut ep, dsd64("dsd-1")).await {
+    match propose(&bridge, &mut ep, dsd64("dsd-1")).await {
         Answer::Reject(_) => {}
         other => panic!("DSD must be refused, got {other:?}\n{}", bridge.log()),
     }
-    match propose(&mut ep, pcm("pcm-1")).await {
+    match propose(&bridge, &mut ep, pcm("pcm-1")).await {
         Answer::Accept => {}
         other => panic!("PCM must be accepted, got {other:?}\n{}", bridge.log()),
     }
@@ -233,7 +232,7 @@ async fn une_ouverture_refusee_en_session_est_signalee_et_le_pcm_suivant_joue() 
     set_dac(&bridge.home, DAC_PCM_ONLY);
 
     let t0 = Instant::now();
-    match propose(&mut ep, dsd64("dsd-1")).await {
+    match propose(&bridge, &mut ep, dsd64("dsd-1")).await {
         Answer::Reject(reason) => assert!(
             reason.contains("DSD_U32_BE"),
             "the reason carries the device error: {reason}"
@@ -246,7 +245,7 @@ async fn une_ouverture_refusee_en_session_est_signalee_et_le_pcm_suivant_joue() 
         t0.elapsed()
     );
 
-    match propose(&mut ep, pcm("pcm-1")).await {
+    match propose(&bridge, &mut ep, pcm("pcm-1")).await {
         Answer::Accept => {}
         other => panic!("next PCM stream must be accepted, got {other:?}\n{}", bridge.log()),
     }
@@ -258,7 +257,7 @@ async fn une_ouverture_refusee_en_session_est_signalee_et_le_pcm_suivant_joue() 
     // the next track comes on a new connection, as Tune does it
     tokio::time::sleep(Duration::from_millis(500)).await;
     let mut ep = bridge.connect().await;
-    match propose(&mut ep, pcm("pcm-2")).await {
+    match propose(&bridge, &mut ep, pcm("pcm-2")).await {
         Answer::Accept => {}
         other => panic!("PCM after reconnect must be accepted, got {other:?}\n{}", bridge.log()),
     }
