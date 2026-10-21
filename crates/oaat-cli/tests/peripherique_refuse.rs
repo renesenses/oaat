@@ -98,8 +98,13 @@ impl Drop for Bridge {
     }
 }
 
+/// Write the fake DAC's `~/.asoundrc`. alsa-lib reloads its configuration
+/// when a file's inode or mtime (in seconds) changes: written then renamed,
+/// the file gets a new inode, so a change within the same second is seen.
 fn set_dac(home: &Path, asoundrc: &str) {
-    std::fs::write(home.join(".asoundrc"), asoundrc).unwrap();
+    let tmp = home.join(".asoundrc.new");
+    std::fs::write(&tmp, asoundrc).unwrap();
+    std::fs::rename(&tmp, home.join(".asoundrc")).unwrap();
 }
 
 fn dsd64(stream_id: &str) -> FormatPropose {
