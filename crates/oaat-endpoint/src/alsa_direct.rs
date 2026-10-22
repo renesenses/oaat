@@ -90,10 +90,11 @@ const RESPAWN_STABLE_RUN: Duration = Duration::from_secs(5);
 const BUSY_RETRY: Duration = Duration::from_millis(100);
 /// How long a busy device is retried without audio coming in: covers the
 /// wait between `configure()` and the first audio, while the endpoint holds
-/// its format accept back until the device is open. After that it is only
-/// retried as audio arrives, so an endpoint nobody streams to doesn't grab
-/// the DAC the moment its owner lets go.
-const BUSY_WAIT: Duration = Duration::from_secs(5);
+/// its format accept back until the device is open, up to its fail-open delay
+/// (the longest one, with a controller that announced `endpoint_release`).
+/// After that it is only retried as audio arrives, so an endpoint nobody
+/// streams to doesn't grab the DAC the moment its owner lets go.
+const BUSY_WAIT: Duration = crate::transport::DEFAULT_RELEASE_ACCEPT_TIMEOUT;
 
 /// What the writer thread opens: device name, ALSA sample format (as ALSA
 /// names it), rate and channel count.
