@@ -22,6 +22,9 @@ pub use alsa_mixer::AlsaMixer;
 pub use audio_output::CpalOutput;
 pub use hal::OaatHal;
 pub use sync::{PtsTracker, SharedClock};
-pub use transport::{EndpointConfig, EndpointEvent, EndpointTransport};
+pub use transport::{
+    DEFAULT_ACCEPT_TIMEOUT, DEFAULT_RELEASE_ACCEPT_TIMEOUT, EndpointConfig, EndpointEvent,
+    EndpointTransport,
+};
 #[cfg(feature = "web-ui")]
 pub use web_ui::{BridgeStatus, BridgeStatusHandle, start_web_ui, start_web_ui_on};

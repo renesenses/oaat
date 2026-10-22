@@ -274,6 +274,11 @@ port = 9740
 # Périphérique audio ALSA (défaut : "default", utilise /etc/asound.conf)
 # audio_device = "hw:1,0"
 
+# Identifiant fixe de l'endpoint (défaut : généré et conservé dans /var/tmp,
+# selon le nom ; à définir si /var/tmp n'est pas persistant ou si le nom peut
+# changer)
+# id = "salon-1"
+
 # TLS (désactivé par défaut, pas nécessaire en LAN)
 # tls = false
 
@@ -296,6 +301,26 @@ flac = true
 [logging]
 # Niveau de log : error, warn, info, debug, trace
 level = "info"
+
+[web_ui]
+# Page d'état (port 9741 par défaut). Elle accepte aussi POST /api/release, qui
+# fait libérer le DAC par l'endpoint et en informe le contrôleur
+# (endpoint_release), et POST /api/device. Liez-la à 127.0.0.1 pour que ces
+# commandes restent locales au Pi.
+# enabled = true
+# port = 9741
+# bind = "0.0.0.0"
+
+[hooks]
+# Commandes lancées avec /bin/sh -c quand l'endpoint commence à utiliser le DAC
+# (à la négociation d'un flux, avant l'ouverture du DAC) et quand il ne l'utilise
+# plus (arrêt, libération, ou fermeture après une pause). OAAT_EVENT vaut
+# "start" ou "stop". Utile pour indiquer aux autres logiciels du Pi quelle
+# source joue, afin qu'ils libèrent le DAC : tant que le DAC est occupé,
+# l'endpoint réessaie toutes les 100 ms et accepte le flux dès qu'il est ouvert
+# (au plus tard après 4 s, ou 9 s avec un contrôleur qui gère endpoint_release).
+# on_start = "/usr/local/bin/oaat-state start"
+# on_stop = "/usr/local/bin/oaat-state stop"
 ```
 
 ### Exemples par DAC
