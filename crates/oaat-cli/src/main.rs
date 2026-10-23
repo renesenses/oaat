@@ -9,7 +9,9 @@ use tracing::{error, info, warn};
 use oaat_controller::{ClockResponder, ConnectedEndpoint, ControllerConfig, ControllerDiscovery};
 use oaat_core::ChannelLayout;
 use oaat_core::format::AudioFormat;
-use oaat_core::message::{EndpointCapabilities, FormatAccept, FormatReject, TrackMetadata};
+use oaat_core::message::{
+    EndpointCapabilities, FormatAccept, FormatReject, TrackMetadata, VolumeCapability, VolumeType,
+};
 use oaat_core::wire::PacketFlags;
 use oaat_endpoint::discovery::EndpointAnnouncement;
 use oaat_endpoint::sync::{PtsTracker, SharedClock};
@@ -431,13 +433,32 @@ async fn run_endpoint(
         None
     };
 
+    // Hardware volume needs ALSA: elsewhere it is software volume.
+    let volume_mode = match dac_config.volume_mode() {
+        config::VolumeMode::Hardware if !cfg!(target_os = "linux") => {
+            warn!("hardware volume needs ALSA, using software volume");
+            config::VolumeMode::Software
+        }
+        mode => mode,
+    };
+    let (volume_type, volume_vol) = match volume_mode {
+        config::VolumeMode::Software => (VolumeType::Sw, "sw"),
+        config::VolumeMode::Hardware => (VolumeType::Hw, "hw"),
+        config::VolumeMode::Fixed => (VolumeType::Fixed, "fixed"),
+    };
+    info!(volume = volume_vol, "volume control");
+
     let capabilities = EndpointCapabilities {
         pcm_max_rate: caps_config.pcm_max_rate,
         pcm_max_bits: caps_config.pcm_max_bits,
         dsd_max_rate: dsd_max,
         channels_max: caps_config.channels_max,
         formats,
-        volume: None,
+        volume: Some(VolumeCapability {
+            vol_type: volume_type,
+            range: [0, 100],
+            step: 1,
+        }),
         gapless: true,
         seek: true,
     };
@@ -468,7 +489,7 @@ async fn run_endpoint(
         endpoint_id: endpoint_id.clone(),
         capabilities: mdns_caps,
         channels_max: caps_config.channels_max,
-        volume_type: Some(if dac_config.hardware_volume { "hw" } else { "sw" }.into()),
+        volume_type: Some(volume_vol.into()),
         model: None,
         vendor: Some("MozAIk Labs".into()),
         firmware: Some(env!("CARGO_PKG_VERSION").into()),
@@ -630,8 +651,11 @@ async fn run_endpoint(
 
     // Initialize hardware DAC mixer (Linux only)
     #[cfg(target_os = "linux")]
-    let alsa_mixer = if dac_config.hardware_volume {
-        let mixer = oaat_endpoint::AlsaMixer::new(dac_config.card);
+    let alsa_mixer = if volume_mode == config::VolumeMode::Hardware {
+        let mixer = oaat_endpoint::AlsaMixer::with_control(
+            &dac_config.card.to_string(),
+            dac_config.mixer.as_deref(),
+        );
         mixer.init(dac_config.fir_filter.as_deref());
         Some(mixer)
     } else {
@@ -1143,6 +1167,9 @@ async fn run_endpoint(
                         }
                     }
                     EndpointEvent::Volume(cmd) => match cmd {
+                        VolumeCommand::Set(level) if volume_mode == config::VolumeMode::Fixed => {
+                            info!(level, "volume ignored, fixed volume");
+                        }
                         VolumeCommand::Set(level) => {
                             #[cfg(target_os = "linux")]
                             if let Some(ref mixer) = alsa_mixer {

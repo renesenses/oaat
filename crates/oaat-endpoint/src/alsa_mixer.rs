@@ -9,7 +9,8 @@ use tracing::{info, warn};
 ///
 /// Controls are resolved by name first; numid fallbacks remain for ESS HATs.
 pub struct AlsaMixer {
-    card: u32,
+    /// Card number or ID, as `amixer -c` takes it.
+    card: String,
     volume_numid: Option<u32>,
     volume_min: i32,
     volume_max: i32,
@@ -18,27 +19,54 @@ pub struct AlsaMixer {
 
 impl AlsaMixer {
     pub fn new(card: u32) -> Self {
+        Self::with_control(&card.to_string(), None)
+    }
+
+    /// The mixer of `card` (number or ID). `control` names the volume
+    /// control (`"PCM"` or `"PCM Playback Volume"`); without it, or when the
+    /// card has no such control, the control is found as `new()` does.
+    pub fn with_control(card: &str, control: Option<&str>) -> Self {
         let mut mixer = Self {
-            card,
+            card: card.to_string(),
             volume_numid: None,
             volume_min: 0,
             volume_max: 100,
             mute_numid: None,
         };
-        mixer.discover_controls();
+        mixer.discover_controls(control);
         mixer
     }
 
-    fn discover_controls(&mut self) {
+    fn discover_controls(&mut self, control: Option<&str>) {
         let Some(contents) = self.amixer_contents() else {
             // Legacy ESS fallback when discovery fails.
             self.volume_numid = Some(1);
             self.volume_min = 0;
             self.volume_max = 100;
             self.mute_numid = Some(2);
-            warn!(card = self.card, "amixer contents unavailable; using numid 1/2 fallback");
+            warn!(card = %self.card, "amixer contents unavailable; using numid 1/2 fallback");
             return;
         };
+
+        if let Some(control) = control {
+            if let Some((numid, min, max)) = find_named_volume(&contents, control) {
+                self.volume_numid = Some(numid);
+                self.volume_min = min;
+                self.volume_max = if max > min { max } else { min + 1 };
+                self.mute_numid = find_named_switch(&contents, control)
+                    .or_else(|| find_playback_switch(&contents));
+                info!(
+                    card = %self.card,
+                    control,
+                    numid,
+                    min = self.volume_min,
+                    max = self.volume_max,
+                    "ALSA volume control configured"
+                );
+                return;
+            }
+            warn!(card = %self.card, control, "no such volume control, looking for one");
+        }
 
         // Prefer a real Playback Volume control (SMSL USB, many USB DACs).
         if let Some((numid, min, max)) = find_playback_volume(&contents) {
@@ -46,7 +74,7 @@ impl AlsaMixer {
             self.volume_min = min;
             self.volume_max = if max > min { max } else { min + 1 };
             info!(
-                card = self.card,
+                card = %self.card,
                 numid,
                 min = self.volume_min,
                 max = self.volume_max,
@@ -58,7 +86,7 @@ impl AlsaMixer {
             self.volume_min = 0;
             self.volume_max = 100;
             warn!(
-                card = self.card,
+                card = %self.card,
                 "no Playback Volume control; falling back to numid=1"
             );
         }
@@ -132,7 +160,7 @@ impl AlsaMixer {
 
     pub fn init(&self, fir_filter: Option<&str>) {
         self.set_mute(false);
-        info!(card = self.card, "DAC unmuted");
+        info!(card = %self.card, "DAC unmuted");
 
         if let Some(filter) = fir_filter
             && self.set_fir_filter(filter)
@@ -147,7 +175,7 @@ impl AlsaMixer {
 
     fn amixer_contents(&self) -> Option<String> {
         Command::new("amixer")
-            .args(["-c", &self.card.to_string(), "contents"])
+            .args(["-c", &self.card, "contents"])
             .output()
             .ok()
             .filter(|o| o.status.success())
@@ -156,7 +184,7 @@ impl AlsaMixer {
 
     fn amixer_cset(&self, control: &str, value: &str) -> bool {
         match Command::new("amixer")
-            .args(["-c", &self.card.to_string(), "cset", control, value])
+            .args(["-c", &self.card, "cset", control, value])
             .output()
         {
             Ok(out) if out.status.success() => true,
@@ -178,7 +206,7 @@ impl AlsaMixer {
 
     fn amixer_cget(&self, control: &str) -> Option<String> {
         Command::new("amixer")
-            .args(["-c", &self.card.to_string(), "cget", control])
+            .args(["-c", &self.card, "cget", control])
             .output()
             .ok()
             .filter(|o| o.status.success())
@@ -233,6 +261,53 @@ fn find_playback_volume(contents: &str) -> Option<(u32, i32, i32)> {
         }
     }
     best
+}
+
+/// The control's name in an `amixer contents` block header:
+/// "4,iface=MIXER,name='PCM Playback Volume'" -> "PCM Playback Volume".
+fn control_name(first_line: &str) -> Option<&str> {
+    let start = first_line.find("name='")? + "name='".len();
+    let end = first_line[start..].rfind('\'')? + start;
+    Some(&first_line[start..end])
+}
+
+/// A mixer control by name, as `amixer sget` names it ("PCM") or in full
+/// ("PCM Playback Volume"): (numid, min, max).
+fn find_named_volume(contents: &str, control: &str) -> Option<(u32, i32, i32)> {
+    let wanted = [control.to_string(), format!("{control} Playback Volume")];
+    for block in contents.split("numid=") {
+        let Some(first_line) = block.lines().next() else {
+            continue;
+        };
+        let Some(numid) = first_line
+            .split(',')
+            .next()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Some(name) = control_name(first_line) else {
+            continue;
+        };
+        if !wanted.iter().any(|w| w == name) || !block.contains("type=INTEGER") {
+            continue;
+        }
+        let min = parse_range_value(block, "min=").unwrap_or(0);
+        let max = parse_range_value(block, "max=").unwrap_or(100);
+        return Some((numid, min, max));
+    }
+    None
+}
+
+/// The switch that goes with a named control ("PCM Playback Switch").
+fn find_named_switch(contents: &str, control: &str) -> Option<u32> {
+    let base = control.strip_suffix(" Playback Volume").unwrap_or(control);
+    let wanted = format!("{base} Playback Switch");
+    contents.split("numid=").find_map(|block| {
+        let first_line = block.lines().next()?;
+        let numid = first_line.split(',').next()?.parse::<u32>().ok()?;
+        (control_name(first_line)? == wanted).then_some(numid)
+    })
 }
 
 fn find_playback_switch(contents: &str) -> Option<u32> {
@@ -313,6 +388,35 @@ numid=4,iface=MIXER,name='SMSL USB AUDIO  Playback Volume'
 "#;
         assert_eq!(find_playback_volume(contents), Some((4, 0, 127)));
         assert_eq!(find_playback_switch(contents), Some(2));
+    }
+
+    #[test]
+    fn named_control_wins_over_the_lowest_numid() {
+        let contents = r#"
+numid=2,iface=MIXER,name='Master Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=2,min=0,max=100,step=0
+  : values=100,100
+numid=5,iface=MIXER,name='Digital Playback Switch'
+  ; type=BOOLEAN,access=rw------,values=2
+  : values=on,on
+numid=6,iface=MIXER,name='Digital Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=2,min=0,max=207,step=0
+  : values=207,207
+"#;
+        assert_eq!(find_playback_volume(contents), Some((2, 0, 100)));
+        assert_eq!(find_named_volume(contents, "Digital"), Some((6, 0, 207)));
+        assert_eq!(
+            find_named_volume(contents, "Digital Playback Volume"),
+            Some((6, 0, 207))
+        );
+        assert_eq!(find_named_switch(contents, "Digital"), Some(5));
+        assert_eq!(find_named_volume(contents, "Headphone"), None);
+        // `amixer contents` starts right at "numid=": the empty first block
+        // must not end the search
+        assert_eq!(
+            find_named_volume(contents.trim_start(), "Digital"),
+            Some((6, 0, 207))
+        );
     }
 
     #[test]

@@ -297,6 +297,18 @@ dsd = false
 # FLAC compression for transport (cuts bandwidth by roughly half)
 flac = true
 
+[dac]
+# How the controller's volume is applied:
+# - "software": the endpoint scales the samples (bit-perfect at 100 % only);
+# - "hardware": the DAC's own mixer, set by card and mixer below;
+# - "fixed": no volume control, the audio reaches the DAC unchanged and
+#   volume commands are ignored. Announced to the controller (vol=fixed).
+# volume = "software"
+# ALSA card, by number or ID (an ID survives USB card renumbering)
+# card = "Hugo2"
+# Volume control (default: the endpoint picks a Playback Volume control)
+# mixer = "PCM"
+
 [logging]
 # Log level: error, warn, info, debug, trace
 level = "info"
