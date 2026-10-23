@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
+use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use oaat_core::format::AudioFormat;
-use oaat_core::message::{TrackMetadata, ZoneAssign, ZoneRelease, ZoneUpdate};
+use oaat_core::message::{EndpointRelease, TrackMetadata, ZoneAssign, ZoneRelease, ZoneUpdate};
 use oaat_core::wire::PacketFlags;
 use oaat_core::{
     ChannelLayout, DEFAULT_MULTIROOM_PLAY_DELAY_MS, DEFAULT_SINGLE_PLAY_DELAY_MS, Message,
@@ -54,17 +55,28 @@ struct ActiveStream {
     playing: bool,
 }
 
+/// `endpoint_release` (RFC §7.3.1) from one endpoint of a zone.
+#[derive(Debug, Clone)]
+pub struct ZoneEndpointRelease {
+    pub endpoint_id: String,
+    pub release: EndpointRelease,
+}
+
 /// Per-endpoint health + address tracking.
 struct EndpointEntry {
     endpoint: ConnectedEndpoint,
     addr: SocketAddr,
     state: EndpointState,
     clock_sync_handle: Option<tokio::task::JoinHandle<()>>,
+    release_forward_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for EndpointEntry {
     fn drop(&mut self) {
         if let Some(h) = self.clock_sync_handle.take() {
+            h.abort();
+        }
+        if let Some(h) = self.release_forward_handle.take() {
             h.abort();
         }
     }
@@ -82,6 +94,8 @@ pub struct Zone {
     fec_encoder: Option<oaat_core::fec::FecEncoder>,
     play_delay_override_ms: Option<u64>,
     time_source: SharedTimeSource,
+    release_tx: mpsc::Sender<ZoneEndpointRelease>,
+    release_rx: Option<mpsc::Receiver<ZoneEndpointRelease>>,
 }
 
 impl Zone {
@@ -97,6 +111,7 @@ impl Zone {
         config: ControllerConfig,
         time_source: SharedTimeSource,
     ) -> Self {
+        let (release_tx, release_rx) = mpsc::channel(16);
         Self {
             zone_id,
             name,
@@ -109,7 +124,20 @@ impl Zone {
             fec_encoder: None,
             play_delay_override_ms: None,
             time_source,
+            release_tx,
+            release_rx: Some(release_rx),
         }
+    }
+
+    /// The `endpoint_release` messages (RFC §7.3.1) of every endpoint in the
+    /// zone, each with the `endpoint_id` it came from. Endpoints only send
+    /// them when `ControllerConfig::features` holds `FEATURE_ENDPOINT_RELEASE`.
+    ///
+    /// The zone doesn't act on a release itself: the controller removes that
+    /// endpoint (`remove_endpoint_and_notify`), and the others keep playing.
+    /// Can be taken once; `None` after that.
+    pub fn take_release_rx(&mut self) -> Option<mpsc::Receiver<ZoneEndpointRelease>> {
+        self.release_rx.take()
     }
 
     // -- Query methods --
@@ -216,11 +244,15 @@ impl Zone {
         .await
         .ok();
 
+        let release_forward_handle =
+            Some(spawn_release_forward(&mut ep, ep_id.clone(), self.release_tx.clone()));
+
         let mut entry = EndpointEntry {
             endpoint: ep,
             addr,
             state: EndpointState::Ready,
             clock_sync_handle: None,
+            release_forward_handle,
         };
 
         // Start steady-state clock sync for this endpoint
@@ -694,6 +726,27 @@ impl Zone {
         }
     }
 
+}
+
+/// Forward an endpoint's releases to the zone's channel, tagged with its id.
+fn spawn_release_forward(
+    ep: &mut ConnectedEndpoint,
+    endpoint_id: String,
+    zone_tx: mpsc::Sender<ZoneEndpointRelease>,
+) -> tokio::task::JoinHandle<()> {
+    let (_, closed) = mpsc::channel(1);
+    let mut rx = std::mem::replace(&mut ep.release_rx, closed);
+    tokio::spawn(async move {
+        while let Some(release) = rx.recv().await {
+            let release = ZoneEndpointRelease {
+                endpoint_id: endpoint_id.clone(),
+                release,
+            };
+            if zone_tx.send(release).await.is_err() {
+                break;
+            }
+        }
+    })
 }
 
 fn spawn_endpoint_clock_sync(ep: &ConnectedEndpoint) -> tokio::task::JoinHandle<()> {
