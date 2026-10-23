@@ -13,4 +13,4 @@ pub use clock_responder::ClockResponder;
 pub use discovery::{ControllerDiscovery, DiscoveredEndpoint};
 pub use manager::{EndpointSnapshot, EndpointState, ZoneEvent, ZoneManager, ZoneSnapshot};
 pub use transport::{ConnectedEndpoint, ControllerConfig, EndpointResponse};
-pub use zone::Zone;
+pub use zone::{Zone, ZoneEndpointRelease};

@@ -1833,12 +1833,13 @@ async fn run_multiroom(
     let config = ControllerConfig {
         controller_id: uuid::Uuid::new_v4().to_string(),
         controller_name: "OAAT Multi-Room".into(),
-        features: vec![],
+        features: vec![oaat_core::message::FEATURE_ENDPOINT_RELEASE.into()],
         clock_port: spawn_clock_responder().await,
         tls: false,
     };
 
     let mut zone = Zone::new("zone-1".into(), "Demo Zone".into(), config);
+    let mut releases = zone.take_release_rx().expect("fresh zone");
     zone.set_play_delay_ms(play_delay);
     if let Some(group_size) = fec {
         zone.enable_fec(group_size);
@@ -1905,6 +1906,21 @@ async fn run_multiroom(
     let start_ns = now_ns() + play_delay_ns;
 
     while sample_offset < total_samples {
+        // endpoint_release (RFC §7.3.1): only that endpoint leaves the zone
+        while let Ok(r) = releases.try_recv() {
+            zone.remove_endpoint_and_notify(&r.endpoint_id).await;
+            println!(
+                "  {} released its output ({:?}), {} endpoint(s) left",
+                r.endpoint_id,
+                r.release.reason,
+                zone.endpoint_count()
+            );
+        }
+        if zone.endpoint_count() == 0 {
+            println!("\nAll endpoints released their output, stopping.");
+            return;
+        }
+
         let chunk = samples_per_packet.min((total_samples - sample_offset) as usize);
         let mut payload = Vec::with_capacity(chunk * bytes_per_sample);
 
