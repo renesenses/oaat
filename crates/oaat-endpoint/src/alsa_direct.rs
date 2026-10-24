@@ -740,6 +740,9 @@ struct AlsaPcm {
     /// S16_LE was asked for but the device only takes S32_LE: samples are
     /// padded on write (`value << 16`, lossless, bit-perfect).
     widen_s16: bool,
+    /// S32_LE was asked for but the device only takes S24_LE: samples are
+    /// shifted down on write (`value >> 8`, bit-perfect for 24-bit sources).
+    narrow_s32: bool,
 }
 
 fn alsa_errno(e: &alsa::Error) -> i32 {
@@ -750,10 +753,13 @@ impl PcmDevice for AlsaPcm {
     fn write(&mut self, data: &[u8]) -> Result<usize, DeviceError> {
         // Same frame count either way: the caller's bookkeeping, in S16_LE
         // frames, stays valid.
-        let widened;
+        let converted;
         let data = if self.widen_s16 {
-            widened = pad_s16_to_s32(data);
-            &widened[..]
+            converted = pad_s16_to_s32(data);
+            &converted[..]
+        } else if self.narrow_s32 {
+            converted = narrow_s32_to_s24(data);
+            &converted[..]
         } else {
             data
         };
@@ -819,6 +825,7 @@ fn open_alsa_device(p: &DeviceParams) -> Result<Box<dyn PcmDevice>, String> {
 
     let mut fmt = alsa_format(p.format).ok_or_else(|| format!("unknown ALSA format {}", p.format))?;
     let mut widen_s16 = false;
+    let mut narrow_s32 = false;
     let err = |what: &str, e: alsa::Error| format!("{}: {what}: {e}", p.device);
     let pcm = PCM::new(&p.device, Direction::Playback, false).map_err(|e| err("open", e))?;
     {
@@ -835,6 +842,17 @@ fn open_alsa_device(p: &DeviceParams) -> Result<Box<dyn PcmDevice>, String> {
             fmt = alsa::pcm::Format::S32LE;
             widen_s16 = true;
             info!(device = %p.device, "device takes no S16_LE, playing 16-bit as S32_LE");
+        }
+        // 24-bit audio comes as S32_LE, which I2S/S/PDIF HATs (e.g. the WM8804
+        // on an Allo DigiOne) don't take: play it as S24_LE then, shifted down
+        // on write.
+        if fmt == alsa::pcm::Format::S32LE
+            && hwp.test_format(fmt).is_err()
+            && hwp.test_format(alsa::pcm::Format::S24LE).is_ok()
+        {
+            fmt = alsa::pcm::Format::S24LE;
+            narrow_s32 = true;
+            info!(device = %p.device, "device takes no S32_LE, playing as S24_LE");
         }
         hwp.set_format(fmt).map_err(|e| err(p.format, e))?;
         hwp.set_channels(p.channels as u32)
@@ -870,7 +888,13 @@ fn open_alsa_device(p: &DeviceParams) -> Result<Box<dyn PcmDevice>, String> {
     // requested buffer (#7).
     info!(
         device = %p.device,
-        format = if widen_s16 { "S32_LE" } else { p.format },
+        format = if widen_s16 {
+            "S32_LE"
+        } else if narrow_s32 {
+            "S24_LE"
+        } else {
+            p.format
+        },
         rate,
         channels = p.channels,
         buffer_frames = buffer,
@@ -878,7 +902,11 @@ fn open_alsa_device(p: &DeviceParams) -> Result<Box<dyn PcmDevice>, String> {
         buffer_ms = if rate > 0 { buffer as u64 * 1000 / rate as u64 } else { 0 },
         "ALSA device opened"
     );
-    Ok(Box::new(AlsaPcm { pcm, widen_s16 }))
+    Ok(Box::new(AlsaPcm {
+        pcm,
+        widen_s16,
+        narrow_s32,
+    }))
 }
 
 /// Device format for decoded FLAC. Same choice as the former ffmpeg pipe:
@@ -930,6 +958,18 @@ fn pad_s16_to_s32(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() * 2);
     for chunk in data.as_chunks::<2>().0 {
         out.extend_from_slice(&[0x00, 0x00, chunk[0], chunk[1]]);
+    }
+    out
+}
+
+/// S32_LE samples → S24_LE (`value >> 8`): the 24 significant bits in the low
+/// bytes, the high byte the sign extension. The reverse of `pad_s24_to_s32`,
+/// so bit-perfect for 24-bit sources; a 32-bit source loses its low byte.
+fn narrow_s32_to_s24(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    for chunk in data.as_chunks::<4>().0 {
+        let sign = if chunk[3] & 0x80 != 0 { 0xFF } else { 0x00 };
+        out.extend_from_slice(&[chunk[1], chunk[2], chunk[3], sign]);
     }
     out
 }
@@ -1862,6 +1902,42 @@ mod tests {
         }
         // stereo frames: twice the bytes, same frame count
         assert_eq!(pad_s16_to_s32(&[0u8; 8]).len(), 16);
+    }
+
+    #[test]
+    fn narrow_s32_is_source_shifted_right_8() {
+        // Positive 0x7F1234 as S32 (00 34 12 7F) -> S24_LE 34 12 7F 00.
+        assert_eq!(
+            narrow_s32_to_s24(&[0x00, 0x34, 0x12, 0x7F]),
+            vec![0x34, 0x12, 0x7F, 0x00]
+        );
+        // The S24_LE output, read as i32, is the S32 value >> 8, sign kept.
+        for v in [0i32, 0x100, -0x100, 0x7FFFFF00, i32::MIN, -1 << 8] {
+            let out = narrow_s32_to_s24(&v.to_le_bytes());
+            assert_eq!(out.len(), 4);
+            let got = i32::from_le_bytes([out[0], out[1], out[2], out[3]]);
+            assert_eq!(got, v >> 8, "src {v:#x}");
+        }
+        // stereo frames: same bytes, same frame count
+        assert_eq!(narrow_s32_to_s24(&[0u8; 16]), vec![0u8; 16]);
+    }
+
+    #[test]
+    fn narrow_s32_undoes_pad_s24() {
+        // A 24-bit source padded to S32_LE and narrowed for an S24_LE device
+        // reaches the DAC unchanged: bit-perfect.
+        let src: Vec<u8> = vec![0x34, 0x12, 0x7F, 0x00, 0x00, 0x80, 0xFF, 0xFF, 0xFF];
+        let out = narrow_s32_to_s24(&pad_s24_to_s32(&src));
+        let back: Vec<u8> = out
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|c| [c[0], c[1], c[2]])
+            .collect();
+        assert_eq!(back, src);
+        // the high byte is the sign extension
+        assert_eq!(out[7], 0xFF);
+        assert_eq!(out[3], 0x00);
     }
 
     #[test]
