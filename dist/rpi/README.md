@@ -6,10 +6,10 @@ Setup scripts for running an OAAT audio endpoint on Raspberry Pi 3B+, 4, or 5 wi
 
 ```bash
 ssh pi@oaat-endpoint.local
-curl -sL https://raw.githubusercontent.com/renesenses/oaat/main/dist/rpi/setup.sh | sudo bash
+curl -sL https://raw.githubusercontent.com/renesenses/oaat/main/dist/rpi/setup.sh | sudo bash -s -- --dac hifiberry
 ```
 
-The script prompts for your DAC model and handles everything automatically.
+Replace `hifiberry` with your DAC model (see the table below). Without `--dac`, the script asks for the model on the terminal, then handles everything automatically. The binary is installed as `/opt/oaat/tune-bridge`.
 
 ## Supported DACs
 

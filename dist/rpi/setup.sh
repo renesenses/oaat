@@ -2,6 +2,9 @@
 # OAAT Endpoint setup for Raspberry Pi 3B+ / 4 / 5
 # Supports multiple I2S DAC HATs
 # Run as root: sudo bash setup.sh [--dac <model>]
+# Through a pipe: curl -sL …/setup.sh | sudo bash -s -- --dac <model>
+#   (without --dac, the menu reads the answer from the terminal, /dev/tty,
+#   since stdin is the script itself)
 #
 # Supported DAC models:
 #   ess9038      Audiophonics ESS 9038Q2M
@@ -82,7 +85,22 @@ if [ -z "$DAC_MODEL" ]; then
     echo "  5) IQaudio DAC+"
     echo "  6) JustBoom DAC HAT"
     echo ""
-    read -p "Votre choix [1-6] : " choice
+    # tune-server-rust#7958 — lancé par « curl … | sudo bash », l'entrée
+    # standard EST le script : `read` y lisait la ligne suivante du script
+    # (« Choix invalide »), et la réponse tapée partait au shell. La réponse
+    # se lit sur le terminal ; sans terminal, on dit d'utiliser --dac.
+    if [ -t 0 ]; then
+        read -r -p "Votre choix [1-6] : " choice
+    elif { exec 3</dev/tty; } 2>/dev/null; then
+        read -r -p "Votre choix [1-6] : " choice <&3
+        exec 3<&-
+    else
+        echo "Aucun terminal pour lire le choix. / No terminal to read the choice from."
+        echo "Relancer avec --dac <modèle> / Re-run with --dac <model>:"
+        echo "  curl -sL https://raw.githubusercontent.com/renesenses/oaat/main/dist/rpi/setup.sh | sudo bash -s -- --dac hifiberry"
+        echo "Modèles / Models: ${!DAC_OVERLAYS[*]}"
+        exit 1
+    fi
     case "$choice" in
         1) DAC_MODEL="ess9038" ;;
         2) DAC_MODEL="hifiberry" ;;
@@ -196,16 +214,22 @@ fi
 echo "[6/7] Compilation de OAAT (release)..."
 OAAT_DIR=/opt/oaat
 mkdir -p "$OAAT_DIR"
+# tune-server-rust#7958 — l'arbre appartient à l'utilisateur AVANT que git
+# et cargo y écrivent (cargo, lancé sous son nom, ne pouvait pas écrire
+# Cargo.lock dans un clone fait par root ; un `git pull` de root dans un
+# arbre de l'utilisateur est refusé, « dubious ownership »).
+chown -R "$REAL_USER":"$REAL_USER" "$OAAT_DIR"
 if [ ! -d "$OAAT_DIR/src" ]; then
-    git clone https://github.com/renesenses/oaat.git "$OAAT_DIR/src"
+    su - "$REAL_USER" -c "git clone https://github.com/renesenses/oaat.git $OAAT_DIR/src"
 else
-    cd "$OAAT_DIR/src" && git pull
+    su - "$REAL_USER" -c "cd $OAAT_DIR/src && git pull --ff-only"
 fi
 
 cd "$OAAT_DIR/src"
 echo "  -> cargo build --release (cela peut prendre 8-20 min selon le modèle)..."
-su - "$REAL_USER" -c "cd $OAAT_DIR/src && source ~/.cargo/env && cargo build --release --bin oaat"
-cp target/release/oaat "$OAAT_DIR/oaat"
+# La cible s'appelle `tune-bridge` (crates/oaat-cli) ; l'ancienne cible `oaat` n'existe plus.
+su - "$REAL_USER" -c "cd $OAAT_DIR/src && source ~/.cargo/env && cargo build --release --bin tune-bridge"
+cp target/release/tune-bridge "$OAAT_DIR/tune-bridge"
 
 # Generate config for this DAC
 cat > "$OAAT_DIR/endpoint.toml" << EOF
@@ -225,8 +249,8 @@ level = "info"
 EOF
 
 chown -R "$REAL_USER":"$REAL_USER" "$OAAT_DIR"
-BINARY_SIZE=$(du -h "$OAAT_DIR/oaat" | cut -f1)
-echo "  -> Binaire : $OAAT_DIR/oaat ($BINARY_SIZE)"
+BINARY_SIZE=$(du -h "$OAAT_DIR/tune-bridge" | cut -f1)
+echo "  -> Binaire : $OAAT_DIR/tune-bridge ($BINARY_SIZE)"
 echo "  -> Config  : $OAAT_DIR/endpoint.toml"
 
 # 7. Systemd service
@@ -240,7 +264,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=$REAL_USER
-ExecStart=/opt/oaat/oaat endpoint --config /opt/oaat/endpoint.toml
+ExecStart=/opt/oaat/tune-bridge endpoint --config /opt/oaat/endpoint.toml
 Restart=always
 RestartSec=3
 Environment=RUST_LOG=oaat=info
@@ -258,7 +282,7 @@ echo "=== Installation terminée ==="
 echo ""
 echo "DAC      : $DAC_NAME"
 echo "Overlay  : $DAC_OVERLAY"
-echo "Binaire  : $OAAT_DIR/oaat ($BINARY_SIZE)"
+echo "Binaire  : $OAAT_DIR/tune-bridge ($BINARY_SIZE)"
 echo "Config   : $OAAT_DIR/endpoint.toml"
 echo "Service  : systemctl {start|stop|status} oaat-endpoint"
 echo ""
