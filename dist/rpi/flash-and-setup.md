@@ -42,7 +42,7 @@ ssh <user>@oaat-endpoint.local
 ## 4. Installer OAAT
 
 ```bash
-curl -sL https://raw.githubusercontent.com/renesenses/oaat/main/dist/rpi/setup.sh | sudo bash
+curl -sL https://raw.githubusercontent.com/renesenses/oaat/main/dist/rpi/setup.sh | sudo bash -s -- --dac hifiberry
 ```
 
 ## 5. Reboot
