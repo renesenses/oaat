@@ -474,8 +474,16 @@ async fn run_endpoint(
         firmware: Some(env!("CARGO_PKG_VERSION").into()),
     };
     if let Err(e) = announcement.register(&mdns) {
-        warn!(error = %e, "mDNS registration failed, continuing without discovery");
+        warn!(error = %e, "mDNS registration failed, retrying in the background");
     }
+    // Re-announce periodically and recreate the daemon if it dies: a single
+    // announcement at startup left the endpoint undiscoverable for good once
+    // a controller query was missed.
+    let mdns_keepalive = oaat_endpoint::discovery::MdnsKeepalive::spawn(
+        announcement,
+        mdns.clone(),
+        oaat_endpoint::discovery::REANNOUNCE_INTERVAL,
+    );
 
     // Start web UI
     // Release requests (POST /api/release): give up the audio output.
@@ -1267,6 +1275,7 @@ async fn run_endpoint(
             _ = &mut sigint => {
                 info!("Tune Bridge shutting down gracefully");
                 audio.stop();
+                mdns_keepalive.stop();
                 let _ = mdns.shutdown();
                 remove_pid_file();
                 break;
@@ -1274,6 +1283,7 @@ async fn run_endpoint(
             _ = sigterm.recv() => {
                 info!("Tune Bridge shutting down gracefully (SIGTERM)");
                 audio.stop();
+                mdns_keepalive.stop();
                 let _ = mdns.shutdown();
                 remove_pid_file();
                 break;
