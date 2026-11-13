@@ -32,6 +32,9 @@ pub struct BridgeStatus {
     pub stream_sample_rate: Option<u32>,
     pub stream_bits: Option<u8>,
     pub stream_channels: Option<u8>,
+    /// What the audio device was opened with, i.e. what the DAC receives
+    /// (#8677, RFC §5.3.1). `None` while nothing is open.
+    pub device_format: Option<oaat_core::message::DeviceFormat>,
     pub track_title: Option<String>,
     pub track_artist: Option<String>,
     pub track_album: Option<String>,
@@ -53,6 +56,7 @@ impl Default for BridgeStatus {
             stream_sample_rate: None,
             stream_bits: None,
             stream_channels: None,
+            device_format: None,
             track_title: None,
             track_artist: None,
             track_album: None,
@@ -417,6 +421,24 @@ fn json_str(s: &Option<String>) -> String {
     }
 }
 
+/// Minimal HTML escaping for text that comes from the device or the API.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// The "ALSA → DAC" line of the status page (#8677), empty while nothing
+/// is open.
+fn device_format_line(status: &BridgeStatus) -> String {
+    status
+        .device_format
+        .as_ref()
+        .map(|f| html_escape(&f.summary()))
+        .unwrap_or_default()
+}
+
 fn render_status_json(status: &BridgeStatus) -> String {
     let devices_json: Vec<String> = status
         .available_devices
@@ -424,7 +446,7 @@ fn render_status_json(status: &BridgeStatus) -> String {
         .map(|d| format!(r#""{}""#, d.replace('"', r#"\""#)))
         .collect();
     format!(
-        r#"{{"bridge_name":"{}","version":"{}","current_device":"{}","available_devices":[{}],"connected":{},"controller_name":{},"playing":{},"volume":{},"track_title":{},"track_artist":{},"track_album":{},"artwork_url":{},"stream_format":{},"stream_sample_rate":{},"stream_bits":{},"stream_channels":{}}}"#,
+        r#"{{"bridge_name":"{}","version":"{}","current_device":"{}","available_devices":[{}],"connected":{},"controller_name":{},"playing":{},"volume":{},"track_title":{},"track_artist":{},"track_album":{},"artwork_url":{},"stream_format":{},"stream_sample_rate":{},"stream_bits":{},"stream_channels":{},"device_format":{},"device_format_summary":{}}}"#,
         status.bridge_name.replace('"', r#"\""#),
         status.version,
         status.current_device.replace('"', r#"\""#),
@@ -441,6 +463,9 @@ fn render_status_json(status: &BridgeStatus) -> String {
         status.stream_sample_rate.unwrap_or(0),
         status.stream_bits.unwrap_or(0),
         status.stream_channels.unwrap_or(0),
+        serde_json::to_string(&status.device_format).unwrap_or_else(|_| "null".into()),
+        serde_json::to_string(&status.device_format.as_ref().map(|f| f.summary()))
+            .unwrap_or_else(|_| "null".into()),
     )
 }
 
@@ -551,6 +576,8 @@ fn render_html(status: &BridgeStatus) -> String {
                                          border-radius:50%; background:#4ade80; cursor:pointer; }}
     .vol-val {{ font-size:0.8rem; color:#888; width:2.5rem; text-align:right; }}
     .device {{ font-size:0.7rem; color:#555; text-align:center; }}
+    .dac {{ font-size:0.75rem; color:#4ade80; text-align:center; font-variant-numeric:tabular-nums; }}
+    .dac:empty {{ display:none; }}
   </style>
 </head>
 <body>
@@ -568,6 +595,7 @@ fn render_html(status: &BridgeStatus) -> String {
         <span class="vol-val" id="vol-val">{volume}%</span>
       </div>
     </div>
+    <div class="dac" id="dac" title="Format opened on the audio device">{device_format}</div>
     <div class="device">{current_device}</div>
   </main>
   <script>
@@ -585,6 +613,7 @@ fn render_html(status: &BridgeStatus) -> String {
       try {{
         const r = await fetch('/api/status');
         const s = await r.json();
+        document.getElementById('dac').textContent = s.device_format_summary || '';
         if (s.track_title) {{
           document.querySelector('.track-title').textContent = s.track_title || 'Unknown';
           document.querySelector('.track-artist').textContent = s.track_artist || '';
@@ -602,8 +631,64 @@ fn render_html(status: &BridgeStatus) -> String {
         now_playing = now_playing,
         volume = status.volume,
         current_device = status.current_device,
+        device_format = device_format_line(status),
     )
 }
 
 #[cfg(test)]
 mod control_tests;
+
+#[cfg(test)]
+mod device_format_tests {
+    use super::*;
+    use oaat_core::message::{DeviceFormat, DeviceMode};
+
+    fn dsd256() -> BridgeStatus {
+        BridgeStatus {
+            device_format: Some(DeviceFormat {
+                api: "ALSA".into(),
+                sample_format: "DSD_U32_BE".into(),
+                sample_rate: 352_800,
+                channels: 2,
+                mode: DeviceMode::DsdNative,
+                dsd_rate: Some(256),
+            }),
+            ..BridgeStatus::default()
+        }
+    }
+
+    /// #8677: the status page shows what the DAC receives.
+    #[test]
+    fn status_page_shows_the_opened_device_format_8677() {
+        let html = render_html(&dsd256());
+        assert!(
+            html.contains("ALSA \u{2192} DAC: DSD_U32_BE 352.8 kHz, 2 ch (DSD256 native)"),
+            "{html}"
+        );
+        let idle = render_html(&BridgeStatus::default());
+        assert!(idle.contains(r#"<div class="dac" id="dac" title="Format opened on the audio device"></div>"#));
+    }
+
+    #[test]
+    fn status_json_carries_the_device_format_8677() {
+        let v: serde_json::Value = serde_json::from_str(&render_status_json(&dsd256())).unwrap();
+        assert_eq!(v["device_format"]["sample_format"], "DSD_U32_BE");
+        assert_eq!(v["device_format"]["mode"], "dsd_native");
+        assert_eq!(v["device_format"]["dsd_rate"], 256);
+        assert_eq!(
+            v["device_format_summary"],
+            "ALSA \u{2192} DAC: DSD_U32_BE 352.8 kHz, 2 ch (DSD256 native)"
+        );
+        let idle: serde_json::Value =
+            serde_json::from_str(&render_status_json(&BridgeStatus::default())).unwrap();
+        assert!(idle["device_format"].is_null());
+        assert!(idle["device_format_summary"].is_null());
+    }
+
+    #[test]
+    fn device_format_is_escaped_on_the_page_8677() {
+        let mut st = dsd256();
+        st.device_format.as_mut().unwrap().api = "<b>x</b>".into();
+        assert!(device_format_line(&st).starts_with("&lt;b&gt;x&lt;/b&gt;"));
+    }
+}

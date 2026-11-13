@@ -816,6 +816,8 @@ fn negotiate_format(caps: &EndpointCapabilities, fp: &FormatPropose) -> Message 
         if rate_ok && bits_ok {
             return Message::FormatAccept(FormatAccept {
                 stream_id: fp.stream_id.clone(),
+                // Filled by the application once its device is open.
+                device_format: None,
             });
         }
 
@@ -867,6 +869,7 @@ fn negotiate_format(caps: &EndpointCapabilities, fp: &FormatPropose) -> Message 
     // For non-PCM formats (DSD, compressed) that are in the supported list, accept
     Message::FormatAccept(FormatAccept {
         stream_id: fp.stream_id.clone(),
+        device_format: None,
     })
 }
 

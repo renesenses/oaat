@@ -135,6 +135,90 @@ pub struct FormatPropose {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FormatAccept {
     pub stream_id: String,
+    /// What the endpoint actually opened on its audio device for this
+    /// stream (RFC §5.3.1). OPTIONAL and additive: absent from endpoints that
+    /// predate it, ignored by controllers that do not know it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_format: Option<DeviceFormat>,
+}
+
+/// The format an endpoint actually opened on its audio device (RFC §5.3.1):
+/// what reaches the DAC, which may differ from the wire format (24-bit PCM
+/// widened to `S32_LE`, `DSD_U8` packed into `DSD_U32_BE`, FLAC decoded…).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceFormat {
+    /// Audio API that opened the device, as the platform names it
+    /// (`ALSA`, `CoreAudio`, `WASAPI`).
+    pub api: String,
+    /// Sample format as that API names it (`S32_LE`, `DSD_U32_BE`, `F32`).
+    pub sample_format: String,
+    /// Device frame rate as granted by the device. For `DSD_U32_BE` one
+    /// frame carries 32 DSD bits: DSD256 opens at 352 800.
+    pub sample_rate: u32,
+    pub channels: u8,
+    pub mode: DeviceMode,
+    /// Native DSD only: the DSD multiple (64, 128, 256…).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dsd_rate: Option<u16>,
+}
+
+/// How the samples reach the DAC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceMode {
+    /// PCM samples.
+    Pcm,
+    /// DSD bits written to a native DSD device format (e.g. `DSD_U32_BE`).
+    DsdNative,
+    /// DSD packed in PCM frames (DSD over PCM, DoP).
+    Dop,
+    /// A mode this version of the protocol does not know.
+    #[serde(other)]
+    Unknown,
+}
+
+impl DeviceMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeviceMode::Pcm => "pcm",
+            DeviceMode::DsdNative => "dsd_native",
+            DeviceMode::Dop => "dop",
+            DeviceMode::Unknown => "unknown",
+        }
+    }
+}
+
+impl DeviceFormat {
+    /// DSD multiple carried by a native DSD device format, from its frame
+    /// rate and the DSD bits per frame (32 for `DSD_U32_*`, 16, 8).
+    pub fn dsd_multiple(frame_rate: u32, bits_per_frame: u32) -> Option<u16> {
+        let bit_rate = u64::from(frame_rate) * u64::from(bits_per_frame);
+        if bit_rate == 0 || bit_rate % 44_100 != 0 {
+            return None;
+        }
+        u16::try_from(bit_rate / 44_100).ok()
+    }
+
+    /// One-line English summary: `ALSA → DAC: DSD_U32_BE 352.8 kHz, 2 ch (DSD256 native)`.
+    pub fn summary(&self) -> String {
+        let khz = f64::from(self.sample_rate) / 1000.0;
+        let rate = if khz.fract() == 0.0 {
+            format!("{khz:.0} kHz")
+        } else {
+            format!("{khz:.1} kHz")
+        };
+        let mode = match (self.mode, self.dsd_rate) {
+            (DeviceMode::DsdNative, Some(m)) => format!(" (DSD{m} native)"),
+            (DeviceMode::DsdNative, None) => " (DSD native)".to_string(),
+            (DeviceMode::Dop, Some(m)) => format!(" (DSD{m} DoP)"),
+            (DeviceMode::Dop, None) => " (DoP)".to_string(),
+            _ => String::new(),
+        };
+        format!(
+            "{} \u{2192} DAC: {} {rate}, {} ch{mode}",
+            self.api, self.sample_format, self.channels
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -414,6 +498,94 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    fn dsd256_alsa() -> DeviceFormat {
+        DeviceFormat {
+            api: "ALSA".into(),
+            sample_format: "DSD_U32_BE".into(),
+            sample_rate: 352_800,
+            channels: 2,
+            mode: DeviceMode::DsdNative,
+            dsd_rate: DeviceFormat::dsd_multiple(352_800, 32),
+        }
+    }
+
+    /// RFC §5.3.1 — `device_format` is additive: an accept from an endpoint
+    /// that predates it parses (no step), and an accept without it is sent
+    /// exactly as before.
+    #[test]
+    fn format_accept_without_device_format_is_unchanged() {
+        let json = r#"{"type":"format_accept","stream_id":"s1"}"#;
+        let Message::FormatAccept(fa) = serde_json::from_str::<Message>(json).unwrap() else {
+            panic!("expected FormatAccept");
+        };
+        assert!(fa.device_format.is_none());
+        assert_eq!(serde_json::to_string(&Message::FormatAccept(fa)).unwrap(), json);
+    }
+
+    #[test]
+    fn format_accept_device_format_roundtrip() {
+        let msg = Message::FormatAccept(FormatAccept {
+            stream_id: "s1".into(),
+            device_format: Some(dsd256_alsa()),
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""device_format":{"api":"ALSA","sample_format":"DSD_U32_BE","sample_rate":352800,"channels":2,"mode":"dsd_native","dsd_rate":256}"#), "{json}");
+        let Message::FormatAccept(back) = serde_json::from_str::<Message>(&json).unwrap() else {
+            panic!("expected FormatAccept");
+        };
+        assert_eq!(back.device_format, Some(dsd256_alsa()));
+    }
+
+    /// A controller built before `device_format` (its FormatAccept has only
+    /// `stream_id`) still parses the new accept: serde ignores the field.
+    #[test]
+    fn an_older_controller_ignores_device_format() {
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum OldMessage {
+            FormatAccept { stream_id: String },
+        }
+        let json = serde_json::to_string(&Message::FormatAccept(FormatAccept {
+            stream_id: "s1".into(),
+            device_format: Some(dsd256_alsa()),
+        }))
+        .unwrap();
+        let OldMessage::FormatAccept { stream_id } = serde_json::from_str(&json).unwrap();
+        assert_eq!(stream_id, "s1");
+    }
+
+    /// A mode added by a later version reads as `unknown`, not an error that
+    /// would drop the whole accept.
+    #[test]
+    fn an_unknown_device_mode_still_parses() {
+        let json = r#"{"type":"format_accept","stream_id":"s1","device_format":{"api":"ALSA","sample_format":"X","sample_rate":1,"channels":2,"mode":"from_the_future"}}"#;
+        let Message::FormatAccept(fa) = serde_json::from_str::<Message>(json).unwrap() else {
+            panic!("expected FormatAccept");
+        };
+        assert_eq!(fa.device_format.unwrap().mode, DeviceMode::Unknown);
+    }
+
+    #[test]
+    fn device_format_summary_and_dsd_multiple() {
+        assert_eq!(DeviceFormat::dsd_multiple(352_800, 32), Some(256));
+        assert_eq!(DeviceFormat::dsd_multiple(88_200, 32), Some(64));
+        assert_eq!(DeviceFormat::dsd_multiple(48_000, 32), None);
+        assert_eq!(DeviceFormat::dsd_multiple(0, 32), None);
+        assert_eq!(
+            dsd256_alsa().summary(),
+            "ALSA \u{2192} DAC: DSD_U32_BE 352.8 kHz, 2 ch (DSD256 native)"
+        );
+        let pcm = DeviceFormat {
+            api: "ALSA".into(),
+            sample_format: "S32_LE".into(),
+            sample_rate: 96_000,
+            channels: 2,
+            mode: DeviceMode::Pcm,
+            dsd_rate: None,
+        };
+        assert_eq!(pcm.summary(), "ALSA \u{2192} DAC: S32_LE 96 kHz, 2 ch");
     }
 
     #[test]

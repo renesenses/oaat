@@ -308,6 +308,42 @@ Bit-perfection constrains the entire output path, not just the wire:
 - Lossless compressed transport (FLAC) preserves the guarantee provided
   decode and delivery follow the rules above.
 
+#### 5.3.1 Device Format Report
+
+`FORMAT_ACCEPT` MAY carry `device_format`: what the Endpoint actually opened
+on its audio device for this stream, i.e. what reaches the DAC. It may differ
+from the wire format (24-bit PCM widened to a 32-bit slot, `DSD_U8` packed
+into `DSD_U32_BE`, FLAC decoded), and the granted rate may differ from the
+requested one.
+
+```json
+{
+  "type": "format_accept",
+  "stream_id": "abc123",
+  "device_format": {
+    "api": "ALSA",
+    "sample_format": "DSD_U32_BE",
+    "sample_rate": 352800,
+    "channels": 2,
+    "mode": "dsd_native",
+    "dsd_rate": 256
+  }
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `api` | Audio API that opened the device, as the platform names it (`ALSA`, `CoreAudio`, `WASAPI`). |
+| `sample_format` | Sample format as that API names it (`S16_LE`, `S32_LE`, `DSD_U32_BE`, `F32`). |
+| `sample_rate` | Device frame rate as granted. For `DSD_U32_*` one frame carries 32 DSD bits: DSD256 opens at 352800. |
+| `channels` | Channel count opened. |
+| `mode` | `pcm`, `dsd_native` (DSD bits in a native DSD sample format) or `dop` (DSD over PCM). A Controller MUST treat a value it does not know as unknown, not as an error. |
+| `dsd_rate` | OPTIONAL, `dsd_native`/`dop` only: the DSD multiple (64, 128, 256…). |
+
+The field is informational (signal path display) and strictly additive: an
+Endpoint that does not know it omits it, and a Controller that does not know
+it ignores it. Its absence means "not reported", never "PCM".
+
 ### 5.4 Channel Layouts
 
 | Name | Channels | Mapping |

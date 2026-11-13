@@ -499,6 +499,7 @@ async fn run_endpoint(
             stream_sample_rate: None,
             stream_bits: None,
             stream_channels: None,
+            device_format: None,
             track_title: None,
             track_artist: None,
             track_album: None,
@@ -839,18 +840,24 @@ async fn run_endpoint(
                                     let sr = fp.sample_rate;
                                     let bits = fp.bits_per_sample;
                                     let ch = fp.channels;
+                                    let dev_fmt = audio.device_format();
                                     status_handle.update(move |s| {
                                         s.current_device = dev_name;
+                                        s.device_format = dev_fmt;
                                         s.stream_format = Some(fmt_s);
                                         s.stream_sample_rate = Some(sr);
                                         s.stream_bits = Some(bits);
                                         s.stream_channels = Some(ch);
                                     }).await;
                                 }
+                                // What the DAC actually receives (#8677,
+                                // RFC §5.3.1), reported with the accept.
+                                let device_format = audio.device_format();
+                                let summary = device_format.as_ref().map(|f| f.summary());
                                 if daemon {
-                                    info!("audio output configured");
+                                    info!(device_format = summary.as_deref().unwrap_or("unknown"), "audio output configured");
                                 } else {
-                                    println!("Audio output configured");
+                                    println!("Audio output configured{}", summary.map(|s| format!(": {s}")).unwrap_or_default());
                                 }
                                 // Device is open: release the deferred
                                 // FormatAccept so the controller starts its
@@ -858,6 +865,7 @@ async fn run_endpoint(
                                 let _ = ctrl_tx
                                     .send(oaat_core::Message::FormatAccept(FormatAccept {
                                         stream_id: fp.stream_id.clone(),
+                                        device_format,
                                     }))
                                     .await;
                             }
@@ -1037,6 +1045,7 @@ async fn run_endpoint(
                             }
                             #[cfg(feature = "web-ui")]
                             status_handle.update(|s| {
+                                s.device_format = None;
                                 s.stream_format = None;
                                 s.stream_sample_rate = None;
                                 s.stream_bits = None;
@@ -1122,8 +1131,10 @@ async fn run_endpoint(
                                 {
                                     let dev_name = audio.current_device_name().unwrap_or("unknown").to_string();
                                     let fmt_s = format.to_string();
+                                    let dev_fmt = audio.device_format();
                                     status_handle.update(move |s| {
                                         s.current_device = dev_name;
+                                        s.device_format = dev_fmt;
                                         s.stream_format = Some(fmt_s);
                                         s.stream_sample_rate = Some(sample_rate);
                                         s.stream_channels = Some(2);
@@ -1208,6 +1219,7 @@ async fn run_endpoint(
                         status_handle.update(|s| {
                             s.connected = false;
                             s.controller_name = None;
+                            s.device_format = None;
                             s.stream_format = None;
                             s.stream_sample_rate = None;
                             s.stream_bits = None;
@@ -1249,6 +1261,7 @@ async fn run_endpoint(
                 #[cfg(feature = "web-ui")]
                 status_handle.update(|s| {
                     s.playing = false;
+                    s.device_format = None;
                 }).await;
                 if output_in_use {
                     output_in_use = false;

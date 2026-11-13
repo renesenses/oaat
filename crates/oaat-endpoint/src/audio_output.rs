@@ -25,6 +25,7 @@ use ringbuf::{
 use tracing::{error, info, warn};
 
 use oaat_core::format::AudioFormat;
+use oaat_core::message::{DeviceFormat, DeviceMode};
 
 fn ring_buffer_frames(sample_rate: u32) -> usize {
     sample_rate.max(48000) as usize
@@ -177,6 +178,8 @@ pub struct CpalOutput {
     /// them on every configure() eats the PTS scheduling lead time.
     /// `prewarm()` fills this at startup.
     cached_device: Option<(Option<String>, cpal::Device, DeviceSampleSupport)>,
+    /// What the output stream was opened with (#8677, RFC §5.3.1).
+    device_format: Option<DeviceFormat>,
     #[cfg(feature = "flac")]
     flac_stream: Option<crate::flac_decoder::FlacStreamDecoder>,
 }
@@ -238,9 +241,17 @@ impl CpalOutput {
             bit_perfect: Arc::new(AtomicU8::new(0)),
             underruns: Arc::new(AtomicU64::new(0)),
             cached_device: None,
+            device_format: None,
             #[cfg(feature = "flac")]
             flac_stream: None,
         }
+    }
+
+    /// The format the output stream was opened with for the current
+    /// stream (RFC §5.3.1): `None` before `configure()` and once stopped.
+    /// DSD reaches the device decimated to PCM on this output.
+    pub fn device_format(&self) -> Option<DeviceFormat> {
+        self.device_format.clone()
     }
 
     /// Resolve the output device by name (or default) plus its sample type
@@ -490,6 +501,19 @@ impl CpalOutput {
         stream.play().ok();
         self.stream = Some(stream);
         self.producer = Some(producer);
+        self.device_format = Some(DeviceFormat {
+            api: cpal::default_host().id().name().to_string(),
+            sample_format: match out_kind {
+                OutKind::I16 => "I16",
+                OutKind::I32 => "I32",
+                OutKind::F32 => "F32",
+            }
+            .to_string(),
+            sample_rate,
+            channels,
+            mode: DeviceMode::Pcm,
+            dsd_rate: None,
+        });
 
         info!(
             elapsed_ms = configure_started.elapsed().as_millis() as u64,
@@ -514,6 +538,7 @@ impl CpalOutput {
         self.playing.store(false, Ordering::Relaxed);
         self.stream = None;
         self.producer = None;
+        self.device_format = None;
     }
 
     /// Give up the device now (endpoint_release). Same as `stop()` here:
