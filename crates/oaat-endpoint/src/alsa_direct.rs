@@ -36,6 +36,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use oaat_core::format::AudioFormat;
+use oaat_core::message::{DeviceFormat, DeviceMode};
 use tracing::{info, warn};
 
 /// ALSA ring-buffer size requested, in microseconds. 0.5s was too small to
@@ -122,6 +123,10 @@ pub(crate) trait PcmDevice: Send {
     fn drain(&mut self);
     /// Discard what is buffered (intentional stop).
     fn discard(&mut self);
+    /// The frame rate the device granted, when it reads it back.
+    fn granted_rate(&self) -> Option<u32> {
+        None
+    }
 }
 
 pub(crate) type DeviceOpener =
@@ -159,6 +164,9 @@ pub struct AlsaDirectOutput {
     channels: u8,
     format: AudioFormat,
     device_name: Option<String>,
+    /// What the device was opened with for the current stream (#8677):
+    /// reported in FormatAccept and on the status page.
+    device_format: Option<DeviceFormat>,
     idle_close: Duration,
     open_timeout: Duration,
     shutdown_timeout: Duration,
@@ -216,6 +224,7 @@ impl AlsaDirectOutput {
             channels: 0,
             format: AudioFormat::PcmS16le,
             device_name: None,
+            device_format: None,
             idle_close: IDLE_CLOSE,
             open_timeout: OPEN_TIMEOUT,
             shutdown_timeout: SHUTDOWN_TIMEOUT,
@@ -234,6 +243,12 @@ impl AlsaDirectOutput {
     /// True while the ALSA device is open.
     pub fn device_open(&self) -> bool {
         self.shared.open.load(Ordering::Relaxed)
+    }
+
+    /// The format the ALSA device was opened with for the current stream
+    /// (RFC §5.3.1): `None` before the first `configure()` and once stopped.
+    pub fn device_format(&self) -> Option<DeviceFormat> {
+        self.device_format.clone()
     }
 
     pub fn configure(
@@ -300,6 +315,7 @@ impl AlsaDirectOutput {
         );
         self.playing.store(false, Ordering::Relaxed);
         let device = params.device.clone();
+        let requested_rate = params.rate;
         let (writer, opened) = spawn_writer(
             params,
             self.opener.clone(),
@@ -312,8 +328,14 @@ impl AlsaDirectOutput {
         // that never plays. The output stays unconfigured: the next
         // configure() starts over.
         match opened.recv_timeout(self.open_timeout) {
-            Ok(Ok(())) => {
+            Ok(Ok(granted)) => {
                 self.writer = Some(writer);
+                self.device_format = Some(opened_device_format(
+                    format,
+                    alsa_fmt,
+                    granted.unwrap_or(requested_rate),
+                    channels,
+                ));
                 Ok(())
             }
             Ok(Err(e)) => {
@@ -372,6 +394,7 @@ impl AlsaDirectOutput {
     /// playing it out.
     fn shutdown(&mut self, discard: bool) {
         self.playing.store(false, Ordering::Relaxed);
+        self.device_format = None;
         if let Some(w) = self.writer.take() {
             w.stop.store(discard, Ordering::Relaxed);
             drop(w.tx);
@@ -526,7 +549,7 @@ fn spawn_writer(
     opener: DeviceOpener,
     shared: Arc<Shared>,
     idle_close: Duration,
-) -> (Writer, Receiver<Result<(), String>>) {
+) -> (Writer, Receiver<Result<Option<u32>, String>>) {
     let (tx, rx) = std::sync::mpsc::sync_channel(WRITE_QUEUE_PAYLOADS);
     let (opened_tx, opened_rx) = std::sync::mpsc::sync_channel(1);
     let (done_tx, done) = std::sync::mpsc::sync_channel::<()>(0);
@@ -676,7 +699,7 @@ impl DeviceSlot {
 
 fn writer_loop(
     rx: Receiver<Vec<u8>>,
-    opened: SyncSender<Result<(), String>>,
+    opened: SyncSender<Result<Option<u32>, String>>,
     params: DeviceParams,
     opener: DeviceOpener,
     shared: Arc<Shared>,
@@ -693,7 +716,9 @@ fn writer_loop(
         backoff: Duration::ZERO,
     };
     // Open right away and report it: configure() waits for this (#62).
-    let first = slot.open();
+    let first = slot
+        .open()
+        .map(|()| slot.dev.as_ref().and_then(|d| d.granted_rate()));
     if let Err(e) = &first {
         warn!(device = %slot.params.device, error = %e, "ALSA device open failed");
     }
@@ -737,6 +762,8 @@ fn writer_loop(
 /// The real device: an ALSA PCM opened with the `alsa` crate.
 struct AlsaPcm {
     pcm: alsa::PCM,
+    /// Rate read back from the hw params (`set_rate` is "nearest").
+    rate: u32,
 }
 
 fn alsa_errno(e: &alsa::Error) -> i32 {
@@ -783,6 +810,10 @@ impl PcmDevice for AlsaPcm {
 
     fn discard(&mut self) {
         let _ = self.pcm.drop();
+    }
+
+    fn granted_rate(&self) -> Option<u32> {
+        (self.rate > 0).then_some(self.rate)
     }
 }
 
@@ -854,7 +885,36 @@ fn open_alsa_device(p: &DeviceParams) -> Result<Box<dyn PcmDevice>, String> {
         buffer_ms = if rate > 0 { buffer as u64 * 1000 / rate as u64 } else { 0 },
         "ALSA device opened"
     );
-    Ok(Box::new(AlsaPcm { pcm }))
+    Ok(Box::new(AlsaPcm { pcm, rate }))
+}
+
+/// What reaches the DAC (#8677, RFC §5.3.1): the ALSA format and the rate
+/// the device granted. Native DSD is written as `DSD_U32_BE`, 32 DSD bits
+/// per frame: DSD256 opens at 352 800.
+fn opened_device_format(
+    wire: AudioFormat,
+    alsa_fmt: &str,
+    rate: u32,
+    channels: u8,
+) -> DeviceFormat {
+    let dsd = wire.is_dsd() && alsa_fmt.starts_with("DSD_");
+    let dsd_bits = match alsa_fmt {
+        "DSD_U8" => 8,
+        "DSD_U16_LE" | "DSD_U16_BE" => 16,
+        _ => 32,
+    };
+    DeviceFormat {
+        api: "ALSA".into(),
+        sample_format: alsa_fmt.to_string(),
+        sample_rate: rate,
+        channels,
+        mode: if dsd { DeviceMode::DsdNative } else { DeviceMode::Pcm },
+        dsd_rate: if dsd {
+            DeviceFormat::dsd_multiple(rate, dsd_bits)
+        } else {
+            None
+        },
+    }
 }
 
 /// Device format for decoded FLAC. Same choice as the former ffmpeg pipe:
@@ -1335,6 +1395,8 @@ mod tests {
         slow_open: Option<(&'static str, Duration)>,
         /// `drain()` takes this long (a stuck device).
         slow_drain: Duration,
+        /// The rate the device reads back, when it differs from the request.
+        granted_rate: Option<u32>,
     }
 
     /// A stand-in for the ALSA PCM: records frames, plays scripted errors,
@@ -1342,6 +1404,7 @@ mod tests {
     struct FakeDevice {
         st: Arc<Mutex<FakeState>>,
         frame: usize,
+        granted_rate: Option<u32>,
     }
 
     impl PcmDevice for FakeDevice {
@@ -1373,6 +1436,9 @@ mod tests {
         }
         fn discard(&mut self) {
             self.st.lock().unwrap().discards += 1;
+        }
+        fn granted_rate(&self) -> Option<u32> {
+            self.granted_rate
         }
     }
 
@@ -1411,9 +1477,62 @@ mod tests {
             Ok(Box::new(FakeDevice {
                 st: st2.clone(),
                 frame: p.frame_bytes(),
+                granted_rate: s.granted_rate,
             }) as Box<dyn PcmDevice>)
         });
         (st, opener)
+    }
+
+    /// #8677: native DSD256 is reported as what ALSA opened — DSD_U32_BE at
+    /// 352.8 kHz frames — not as the DSD_U8 wire format.
+    #[test]
+    fn native_dsd_reports_the_opened_alsa_format_8677() {
+        let (_st, opener) = fake();
+        let mut out = AlsaDirectOutput::with_opener(opener);
+        assert_eq!(out.device_format(), None, "nothing opened yet");
+        out.configure_with_device(AudioFormat::DsdU8, 11_289_600, 2, Some("hw:CARD=DAC,DEV=0"))
+            .unwrap();
+        assert_eq!(
+            out.device_format(),
+            Some(DeviceFormat {
+                api: "ALSA".into(),
+                sample_format: "DSD_U32_BE".into(),
+                sample_rate: 352_800,
+                channels: 2,
+                mode: DeviceMode::DsdNative,
+                dsd_rate: Some(256),
+            })
+        );
+        out.stop();
+        assert_eq!(out.device_format(), None, "stopped: nothing is open");
+    }
+
+    /// #8677: 24-bit PCM is widened to S32_LE, and the rate is the one the
+    /// device granted (`set_rate` is "nearest"), not the one asked for.
+    #[test]
+    fn pcm_reports_the_widened_format_and_the_granted_rate_8677() {
+        let (st, opener) = fake();
+        let mut out = AlsaDirectOutput::with_opener(opener);
+        out.configure(AudioFormat::PcmS24le, 96_000, 2).unwrap();
+        let f = out.device_format().unwrap();
+        assert_eq!((f.sample_format.as_str(), f.sample_rate, f.channels), ("S32_LE", 96_000, 2));
+        assert_eq!((f.mode, f.dsd_rate), (DeviceMode::Pcm, None));
+        st.lock().unwrap().granted_rate = Some(88_200);
+        out.configure(AudioFormat::PcmS24le, 96_000, 2).unwrap();
+        assert_eq!(out.device_format().unwrap().sample_rate, 88_200);
+    }
+
+    /// #8677: a refused open reports nothing (the endpoint answers
+    /// FormatReject, no device format to show).
+    #[test]
+    fn a_refused_open_reports_no_device_format_8677() {
+        let (st, opener) = fake();
+        st.lock().unwrap().refuse_format = Some("DSD_U32_BE");
+        let mut out = AlsaDirectOutput::with_opener(opener);
+        out.configure(AudioFormat::PcmS16le, 44_100, 2).unwrap();
+        assert!(out.device_format().is_some());
+        assert!(out.configure(AudioFormat::DsdU8, 2_822_400, 2).is_err());
+        assert_eq!(out.device_format(), None);
     }
 
     fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
