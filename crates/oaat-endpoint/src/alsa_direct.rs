@@ -889,31 +889,34 @@ fn open_alsa_device(p: &DeviceParams) -> Result<Box<dyn PcmDevice>, String> {
 }
 
 /// What reaches the DAC (#8677, RFC §5.3.1): the ALSA format and the rate
-/// the device granted. Native DSD is written as `DSD_U32_BE`, 32 DSD bits
-/// per frame: DSD256 opens at 352 800.
+/// the device granted. Native DSD is written in a `DSD_*` format, 32 DSD
+/// bits per frame for `DSD_U32_*`: DSD256 opens at 352 800. A DSD stream
+/// written in a PCM format is DoP (16 DSD bits per carrier frame).
 fn opened_device_format(
     wire: AudioFormat,
     alsa_fmt: &str,
     rate: u32,
     channels: u8,
 ) -> DeviceFormat {
-    let dsd = wire.is_dsd() && alsa_fmt.starts_with("DSD_");
-    let dsd_bits = match alsa_fmt {
-        "DSD_U8" => 8,
-        "DSD_U16_LE" | "DSD_U16_BE" => 16,
-        _ => 32,
+    let (mode, dsd_rate) = if !wire.is_dsd() {
+        (DeviceMode::Pcm, None)
+    } else if alsa_fmt.starts_with("DSD_") {
+        let bits = match alsa_fmt {
+            "DSD_U8" => 8,
+            "DSD_U16_LE" | "DSD_U16_BE" => 16,
+            _ => 32,
+        };
+        (DeviceMode::DsdNative, DeviceFormat::dsd_multiple(rate, bits))
+    } else {
+        (DeviceMode::Dop, DeviceFormat::dsd_multiple(rate, 16))
     };
     DeviceFormat {
         api: "ALSA".into(),
         sample_format: alsa_fmt.to_string(),
         sample_rate: rate,
         channels,
-        mode: if dsd { DeviceMode::DsdNative } else { DeviceMode::Pcm },
-        dsd_rate: if dsd {
-            DeviceFormat::dsd_multiple(rate, dsd_bits)
-        } else {
-            None
-        },
+        mode,
+        dsd_rate,
     }
 }
 
@@ -1520,6 +1523,20 @@ mod tests {
         st.lock().unwrap().granted_rate = Some(88_200);
         out.configure(AudioFormat::PcmS24le, 96_000, 2).unwrap();
         assert_eq!(out.device_format().unwrap().sample_rate, 88_200);
+    }
+
+    /// #8677: the mode follows what is written — native DSD formats, DSD
+    /// carried in PCM frames (DoP), plain PCM.
+    #[test]
+    fn device_mode_follows_the_opened_format_8677() {
+        let native = opened_device_format(AudioFormat::DsdU8, "DSD_U32_BE", 176_400, 2);
+        assert_eq!((native.mode, native.dsd_rate), (DeviceMode::DsdNative, Some(128)));
+        let u8_native = opened_device_format(AudioFormat::DsdU8, "DSD_U8", 352_800, 2);
+        assert_eq!(u8_native.dsd_rate, Some(64));
+        let dop = opened_device_format(AudioFormat::DsdU8, "S32_LE", 176_400, 2);
+        assert_eq!((dop.mode, dop.dsd_rate), (DeviceMode::Dop, Some(64)));
+        let pcm = opened_device_format(AudioFormat::PcmS24le, "S32_LE", 176_400, 2);
+        assert_eq!((pcm.mode, pcm.dsd_rate), (DeviceMode::Pcm, None));
     }
 
     /// #8677: a refused open reports nothing (the endpoint answers
