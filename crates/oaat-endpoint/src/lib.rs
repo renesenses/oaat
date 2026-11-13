@@ -1,4 +1,6 @@
 #[cfg(target_os = "linux")]
+mod dsd_alsa;
+#[cfg(target_os = "linux")]
 pub mod alsa_direct;
 #[cfg(target_os = "linux")]
 pub mod alsa_mixer;
