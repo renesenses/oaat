@@ -105,6 +105,8 @@ pub struct FecReceiver {
     group_size: u8,
     recovered: u64,
     lost: u64,
+    /// Last observed sequence for packets sent without FEC.
+    last_plain_seq: Option<u16>,
 }
 
 impl FecReceiver {
@@ -117,6 +119,7 @@ impl FecReceiver {
             group_size: 0,
             recovered: 0,
             lost: 0,
+            last_plain_seq: None,
         }
     }
 
@@ -137,15 +140,32 @@ impl FecReceiver {
         // mid-stream).
         if header.fec_group_size == 0 && !header.flags.contains(PacketFlags::FEC) {
             let mut out = self.flush();
+            // Without parity we cannot recover a gap, but we can report it.
+            // Reset at the first packet of a new stream/session; ignore
+            // backward/out-of-order packets instead of counting huge gaps.
+            if header.flags.contains(PacketFlags::FIRST_PACKET) {
+                self.last_plain_seq = None;
+            }
+            if let Some(prev) = self.last_plain_seq {
+                let delta = header.sequence.wrapping_sub(prev);
+                if delta > 1 && delta < 0x8000 {
+                    self.lost += (delta - 1) as u64;
+                }
+            }
+            if self.last_plain_seq.map_or(true, |prev| {
+                let delta = header.sequence.wrapping_sub(prev);
+                delta > 0 && delta < 0x8000
+            }) {
+                self.last_plain_seq = Some(header.sequence);
+            }
             out.push((header, payload));
             return out;
         }
 
+        self.last_plain_seq = None;
         if header.flags.contains(PacketFlags::FEC) {
             // Parity packet: sequence follows the group's last data packet.
-            let base = header
-                .sequence
-                .wrapping_sub(header.fec_group_size as u16);
+            let base = header.sequence.wrapping_sub(header.fec_group_size as u16);
             if self.base_seq == Some(base) {
                 self.parity = Some((header.fec_len_xor, payload));
                 return self.try_complete();
@@ -250,10 +270,7 @@ impl FecReceiver {
             version: h0.version,
             flags: PacketFlags::empty(),
             format: h0.format,
-            sequence: self
-                .base_seq
-                .unwrap_or(0)
-                .wrapping_add(idx as u16),
+            sequence: self.base_seq.unwrap_or(0).wrapping_add(idx as u16),
             stream_id: h0.stream_id,
             pts_ns: pts,
             sample_offset: offset,
@@ -292,6 +309,19 @@ impl Default for FecReceiver {
 mod tests {
     use super::*;
     use crate::format::AudioFormat;
+
+    #[test]
+    fn no_fec_sequence_gap_is_reported() {
+        let mut rx = FecReceiver::new();
+        let mut first = header(10, 0, 0, 4);
+        first.flags = PacketFlags::FIRST_PACKET;
+        rx.feed(first, vec![0; 4]);
+        rx.feed(header(13, 0, 0, 4), vec![0; 4]);
+        assert_eq!(rx.lost(), 2);
+        assert_eq!(rx.recovered(), 0);
+        rx.feed(header(12, 0, 0, 4), vec![0; 4]);
+        assert_eq!(rx.lost(), 2);
+    }
 
     fn header(seq: u16, group: u8, index: u8, payload_len: u16) -> AudioPacketHeader {
         AudioPacketHeader {
@@ -341,9 +371,18 @@ mod tests {
         let payloads: Vec<Vec<u8>> = (0..4u8).map(|i| vec![i; 100]).collect();
 
         // Deliver out of order: 1, 0, 3, 2
-        assert!(rx.feed(header(11, 4, 1, 100), payloads[1].clone()).is_empty());
-        assert!(rx.feed(header(10, 4, 0, 100), payloads[0].clone()).is_empty());
-        assert!(rx.feed(header(13, 4, 3, 100), payloads[3].clone()).is_empty());
+        assert!(
+            rx.feed(header(11, 4, 1, 100), payloads[1].clone())
+                .is_empty()
+        );
+        assert!(
+            rx.feed(header(10, 4, 0, 100), payloads[0].clone())
+                .is_empty()
+        );
+        assert!(
+            rx.feed(header(13, 4, 3, 100), payloads[3].clone())
+                .is_empty()
+        );
         let out = rx.feed(header(12, 4, 2, 100), payloads[2].clone());
 
         assert_eq!(out.len(), 4);
@@ -361,9 +400,15 @@ mod tests {
         let payloads = vec![vec![0xAA; 100], vec![0xBB; 120], vec![0xCC; 90]];
         let parity = encode_group(&payloads);
 
-        assert!(rx.feed(header(20, 3, 0, 100), payloads[0].clone()).is_empty());
+        assert!(
+            rx.feed(header(20, 3, 0, 100), payloads[0].clone())
+                .is_empty()
+        );
         // packet index 1 (seq 21, 120 bytes) lost
-        assert!(rx.feed(header(22, 3, 2, 90), payloads[2].clone()).is_empty());
+        assert!(
+            rx.feed(header(22, 3, 2, 90), payloads[2].clone())
+                .is_empty()
+        );
         let out = rx.feed(
             parity_header(23, 3, parity.len_xor, parity.payload.len() as u16),
             parity.payload,
@@ -386,15 +431,22 @@ mod tests {
         let payloads = vec![vec![1u8; 50], vec![2u8; 50], vec![3u8; 50], vec![4u8; 50]];
         let parity = encode_group(&payloads);
 
-        assert!(rx.feed(header(30, 4, 0, 50), payloads[0].clone()).is_empty());
+        assert!(
+            rx.feed(header(30, 4, 0, 50), payloads[0].clone())
+                .is_empty()
+        );
         // packets 1 and 2 lost
-        assert!(rx.feed(header(33, 4, 3, 50), payloads[3].clone()).is_empty());
-        assert!(rx
-            .feed(
+        assert!(
+            rx.feed(header(33, 4, 3, 50), payloads[3].clone())
+                .is_empty()
+        );
+        assert!(
+            rx.feed(
                 parity_header(34, 4, parity.len_xor, parity.payload.len() as u16),
                 parity.payload,
             )
-            .is_empty());
+            .is_empty()
+        );
 
         // Next group starts: previous group flushes with 2 lost.
         let out = rx.feed(header(35, 4, 0, 50), vec![9u8; 50]);
@@ -423,7 +475,10 @@ mod tests {
         let payloads = vec![vec![1u8; 50], vec![2u8; 50]];
         let parity = encode_group(&payloads);
 
-        assert!(rx.feed(header(65535, 2, 0, 50), payloads[0].clone()).is_empty());
+        assert!(
+            rx.feed(header(65535, 2, 0, 50), payloads[0].clone())
+                .is_empty()
+        );
         // packet at seq 0 (index 1) lost; parity at seq 1
         let out = rx.feed(
             parity_header(1, 2, parity.len_xor, parity.payload.len() as u16),

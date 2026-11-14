@@ -31,7 +31,11 @@ fn capabilities() -> EndpointCapabilities {
 /// sends the release), its control address and its event channel.
 async fn spawn_endpoint(
     endpoint_id: &str,
-) -> (mpsc::Sender<Message>, SocketAddr, mpsc::Receiver<EndpointEvent>) {
+) -> (
+    mpsc::Sender<Message>,
+    SocketAddr,
+    mpsc::Receiver<EndpointEvent>,
+) {
     let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let control_addr = tcp.local_addr().unwrap();
     drop(tcp);
@@ -102,6 +106,10 @@ fn stats() -> Message {
         packets_recovered: 0,
         bit_perfect: true,
         underruns: 0,
+        arq_requested: 0,
+        arq_recovered: 0,
+        arq_timeout: 0,
+        jitter_buffer_ms: 0,
     })
 }
 

@@ -46,11 +46,7 @@ async fn reserve_endpoint_ports() -> (SocketAddr, SocketAddr, SocketAddr) {
     (control, audio, clock)
 }
 
-fn endpoint_config(
-    control: SocketAddr,
-    audio: SocketAddr,
-    clock: SocketAddr,
-) -> EndpointConfig {
+fn endpoint_config(control: SocketAddr, audio: SocketAddr, clock: SocketAddr) -> EndpointConfig {
     EndpointConfig {
         endpoint_id: "test-ep-pts".into(),
         endpoint_name: "PTS Test Endpoint".into(),
@@ -87,7 +83,9 @@ async fn fec_parity_packets_never_reach_the_audio_path() {
         clock_port: 0,
         tls: false,
     };
-    let mut endpoint = ConnectedEndpoint::connect(&ctrl_config, control).await.unwrap();
+    let mut endpoint = ConnectedEndpoint::connect(&ctrl_config, control)
+        .await
+        .unwrap();
 
     // Drain the Connected event.
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
@@ -99,15 +97,36 @@ async fn fec_parity_packets_never_reach_the_audio_path() {
     let data = vec![0x11u8; 320];
     let parity = vec![0xEEu8; 320];
     endpoint
-        .send_audio(1, AudioFormat::PcmS16le, 1_000, 0, &data, PacketFlags::FIRST_PACKET)
+        .send_audio(
+            1,
+            AudioFormat::PcmS16le,
+            1_000,
+            0,
+            &data,
+            PacketFlags::FIRST_PACKET,
+        )
         .await
         .unwrap();
     endpoint
-        .send_audio(1, AudioFormat::PcmS16le, 1_000, 0, &parity, PacketFlags::FEC)
+        .send_audio(
+            1,
+            AudioFormat::PcmS16le,
+            1_000,
+            0,
+            &parity,
+            PacketFlags::FEC,
+        )
         .await
         .unwrap();
     endpoint
-        .send_audio(1, AudioFormat::PcmS16le, 2_000, 80, &data, PacketFlags::empty())
+        .send_audio(
+            1,
+            AudioFormat::PcmS16le,
+            2_000,
+            80,
+            &data,
+            PacketFlags::empty(),
+        )
         .await
         .unwrap();
 
@@ -167,7 +186,9 @@ async fn fec_recovers_lost_packet_through_endpoint_transport() {
         clock_port: 0,
         tls: false,
     };
-    let _endpoint = ConnectedEndpoint::connect(&ctrl_config, control).await.unwrap();
+    let _endpoint = ConnectedEndpoint::connect(&ctrl_config, control)
+        .await
+        .unwrap();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
         .await
         .unwrap()
@@ -206,15 +227,27 @@ async fn fec_recovers_lost_packet_through_endpoint_transport() {
         buf
     };
 
-    sock.send_to(&send(0, 0, 0, PacketFlags::empty(), payloads[0].clone()), audio)
-        .await
-        .unwrap();
-    // seq 1 (index 1, 80 bytes) intentionally NOT sent — simulated loss
-    sock.send_to(&send(2, 2, 0, PacketFlags::empty(), payloads[2].clone()), audio)
-        .await
-        .unwrap();
     sock.send_to(
-        &send(3, 0, parity.len_xor, PacketFlags::FEC, parity.payload.clone()),
+        &send(0, 0, 0, PacketFlags::empty(), payloads[0].clone()),
+        audio,
+    )
+    .await
+    .unwrap();
+    // seq 1 (index 1, 80 bytes) intentionally NOT sent — simulated loss
+    sock.send_to(
+        &send(2, 2, 0, PacketFlags::empty(), payloads[2].clone()),
+        audio,
+    )
+    .await
+    .unwrap();
+    sock.send_to(
+        &send(
+            3,
+            0,
+            parity.len_xor,
+            PacketFlags::FEC,
+            parity.payload.clone(),
+        ),
         audio,
     )
     .await
@@ -239,7 +272,11 @@ async fn fec_recovers_lost_packet_through_endpoint_transport() {
         assert_eq!(*p, payloads[i]);
         assert!(!h.flags.contains(PacketFlags::FEC));
     }
-    assert_eq!(received[1].1.len(), 80, "recovered packet must keep its exact length");
+    assert_eq!(
+        received[1].1.len(),
+        80,
+        "recovered packet must keep its exact length"
+    );
     // PTS of the recovered packet is interpolated exactly (uniform spacing).
     assert_eq!(received[1].0.pts_ns, 1_000_000);
 }
@@ -270,7 +307,9 @@ async fn stream_stats_flow_from_endpoint_app_to_controller() {
         clock_port: 0,
         tls: false,
     };
-    let mut endpoint = ConnectedEndpoint::connect(&ctrl_config, control).await.unwrap();
+    let mut endpoint = ConnectedEndpoint::connect(&ctrl_config, control)
+        .await
+        .unwrap();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
         .await
         .unwrap()
@@ -288,14 +327,21 @@ async fn stream_stats_flow_from_endpoint_app_to_controller() {
             packets_recovered: 3,
             bit_perfect: true,
             underruns: 2,
+            arq_requested: 0,
+            arq_recovered: 0,
+            arq_timeout: 0,
+            jitter_buffer_ms: 0,
         }))
         .await
         .unwrap();
 
-    let resp = tokio::time::timeout(std::time::Duration::from_secs(2), endpoint.response_rx.recv())
-        .await
-        .expect("timed out waiting for stream stats")
-        .unwrap();
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        endpoint.response_rx.recv(),
+    )
+    .await
+    .expect("timed out waiting for stream stats")
+    .unwrap();
     match resp {
         EndpointResponse::StreamStats(ss) => {
             assert_eq!(ss.stream_id, "stats-stream");
@@ -315,8 +361,9 @@ async fn endpoint_clock_bootstraps_against_controller_responder() {
     init_tracing();
 
     // Controller-side clock responder (the piece announced in Hello).
-    let (responder_port, _responder) =
-        ClockResponder::spawn("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let (responder_port, _responder) = ClockResponder::spawn("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
 
     let (control, audio, clock_addr) = reserve_endpoint_ports().await;
     let ep_config = endpoint_config(control, audio, clock_addr);
@@ -341,7 +388,9 @@ async fn endpoint_clock_bootstraps_against_controller_responder() {
         clock_port: responder_port,
         tls: false,
     };
-    let _endpoint = ConnectedEndpoint::connect(&ctrl_config, control).await.unwrap();
+    let _endpoint = ConnectedEndpoint::connect(&ctrl_config, control)
+        .await
+        .unwrap();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
         .await
         .unwrap()
@@ -397,7 +446,9 @@ async fn truncated_udp_packet_is_dropped() {
         clock_port: 0,
         tls: false,
     };
-    let _endpoint = ConnectedEndpoint::connect(&ctrl_config, control).await.unwrap();
+    let _endpoint = ConnectedEndpoint::connect(&ctrl_config, control)
+        .await
+        .unwrap();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
         .await
         .unwrap()
@@ -440,7 +491,10 @@ async fn truncated_udp_packet_is_dropped() {
         .unwrap();
 
     if let EndpointEvent::AudioPacket { header, payload } = event {
-        assert_eq!(header.sequence, 1, "truncated packet (seq 0) must be dropped");
+        assert_eq!(
+            header.sequence, 1,
+            "truncated packet (seq 0) must be dropped"
+        );
         assert_eq!(payload, good_payload);
     } else {
         panic!("expected AudioPacket event");

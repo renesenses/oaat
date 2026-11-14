@@ -45,13 +45,30 @@ use tracing::{info, warn};
 /// slack to ride out jitter without a dropout. ALSA clamps to the hardware
 /// maximum, which some drivers cap in BYTES: the request that yields 2s at
 /// S16/48k grants only 1s at S32/44.1k (#7).
-const ALSA_BUFFER_TIME_US: u32 = 2_000_000;
+const ALSA_BUFFER_TIME_US: u32 = 500_000;
 
 /// Requested ALSA period. With a byte-capped driver the buffer is granted as
 /// a whole number of periods, so coarse periods forfeit up to one period of
 /// capacity (observed on the I-Sabre ES9038Q2M: 2 × 500ms granted where the
 /// cap allowed ~1.1s, #7). Finer periods claim the cap almost exactly.
-const ALSA_PERIOD_TIME_US: u32 = 125_000;
+const ALSA_PERIOD_TIME_US: u32 = 25_000;
+
+/// Environment overrides are read when the ALSA device is opened.
+/// GP_OAAT_ALSA_BUFFER_US and GP_OAAT_ALSA_PERIOD_US are microseconds.
+fn alsa_buffer_us() -> u32 {
+    std::env::var("GP_OAAT_ALSA_BUFFER_US")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|v| (100_000..=4_000_000).contains(v))
+        .unwrap_or(ALSA_BUFFER_TIME_US)
+}
+fn alsa_period_us() -> u32 {
+    std::env::var("GP_OAAT_ALSA_PERIOD_US")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|v| (5_000..=250_000).contains(v))
+        .unwrap_or(ALSA_PERIOD_TIME_US)
+}
 
 /// Payloads queued between `write_audio()` and the writer thread. With
 /// typical payloads of a few KiB this is about 1 MiB, the userspace slack
@@ -94,7 +111,11 @@ pub(crate) struct DeviceParams {
 
 impl DeviceParams {
     fn frame_bytes(&self) -> usize {
-        let sample = if self.format == "S16_LE" { 2 } else { 4 };
+        let sample = match self.format {
+            "S16_LE" | "DSD_U16_LE" | "DSD_U16_BE" => 2,
+            "DSD_U8" => 1,
+            _ => 4,
+        };
         sample * self.channels.max(1) as usize
     }
 }
@@ -148,9 +169,14 @@ struct Writer {
     done: Receiver<()>,
 }
 
+/// Injectable DSD capability probe. Production checks the actual ALSA hw device;
+/// tests may supply a deterministic probe without requiring physical DACs.
+type DsdFormatProbe = Arc<dyn Fn(&str, &str, u32, u8) -> Result<bool, String> + Send + Sync>;
+
 pub struct AlsaDirectOutput {
     writer: Option<Writer>,
     opener: DeviceOpener,
+    dsd_probe: DsdFormatProbe,
     shared: Arc<Shared>,
     playing: Arc<AtomicBool>,
     volume: Arc<AtomicU32>,
@@ -158,6 +184,8 @@ pub struct AlsaDirectOutput {
     sample_rate: u32,
     channels: u8,
     format: AudioFormat,
+    dsd_device_format: Option<&'static str>,
+    pcm_s16_expanded: bool,
     device_name: Option<String>,
     idle_close: Duration,
     open_timeout: Duration,
@@ -201,13 +229,21 @@ impl AlsaDirectOutput {
     }
 
     pub fn new() -> Self {
-        Self::with_opener(Arc::new(open_alsa_device))
+        Self::with_opener_and_dsd_probe(Arc::new(open_alsa_device), Arc::new(supports_dsd_format))
     }
 
+    /// Test constructor: the mock opener is accompanied by a mock capability
+    /// probe, so no real ALSA card is queried during unit tests.
+    #[cfg(test)]
     pub(crate) fn with_opener(opener: DeviceOpener) -> Self {
+        Self::with_opener_and_dsd_probe(opener, Arc::new(|_, fmt, _, _| Ok(fmt == "DSD_U32_BE")))
+    }
+
+    fn with_opener_and_dsd_probe(opener: DeviceOpener, dsd_probe: DsdFormatProbe) -> Self {
         Self {
             writer: None,
             opener,
+            dsd_probe,
             shared: Arc::new(Shared::default()),
             playing: Arc::new(AtomicBool::new(false)),
             volume: Arc::new(AtomicU32::new(1000)),
@@ -215,6 +251,8 @@ impl AlsaDirectOutput {
             sample_rate: 0,
             channels: 0,
             format: AudioFormat::PcmS16le,
+            dsd_device_format: None,
+            pcm_s16_expanded: false,
             device_name: None,
             idle_close: IDLE_CLOSE,
             open_timeout: OPEN_TIMEOUT,
@@ -254,6 +292,8 @@ impl AlsaDirectOutput {
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.stop();
         self.format = format;
+        self.dsd_device_format = None;
+        self.pcm_s16_expanded = false;
         self.sample_rate = sample_rate;
         self.channels = channels;
         self.device_name = device_name.map(|s| s.to_string());
@@ -279,11 +319,23 @@ impl AlsaDirectOutput {
             {
                 self.flac_stream = None;
             }
-            alsa_format_and_rate(format, sample_rate)
-                .ok_or_else(|| format!("unsupported format for ALSA direct: {format}"))?
+            if format.is_dsd() {
+                let bit_rate =
+                    dsd_wire_bit_rate(format, sample_rate).ok_or("invalid DSD sample rate")?;
+                let selected =
+                    select_dsd_format_with(&device, bit_rate, channels, |dev, fmt, rate, ch| {
+                        (self.dsd_probe)(dev, fmt, rate, ch)
+                    })
+                    .map_err(|e| format!("native DSD negotiation failed: {e}"))?;
+                self.dsd_device_format = Some(selected);
+                (selected, bit_rate / dsd_format_width(selected))
+            } else {
+                alsa_format_and_rate(format, sample_rate)
+                    .ok_or_else(|| format!("unsupported format for ALSA direct: {format}"))?
+            }
         };
 
-        let params = DeviceParams {
+        let mut params = DeviceParams {
             device,
             format: alsa_fmt,
             rate: alsa_rate,
@@ -301,7 +353,7 @@ impl AlsaDirectOutput {
         self.playing.store(false, Ordering::Relaxed);
         let device = params.device.clone();
         let (writer, opened) = spawn_writer(
-            params,
+            params.clone(),
             self.opener.clone(),
             self.shared.clone(),
             self.idle_close,
@@ -317,9 +369,45 @@ impl AlsaDirectOutput {
                 Ok(())
             }
             Ok(Err(e)) => {
-                // The thread returns right after reporting the failure.
                 let _ = writer.handle.join();
-                Err(e.into())
+                // Keep the original S16_LE path whenever the DAC accepts it.
+                // Only a format-negotiation failure triggers a lossless S32_LE
+                // retry. Other failures (busy, disconnected, etc.) propagate.
+                if format == AudioFormat::PcmS16le
+                    && params.format == "S16_LE"
+                    && (e.contains("S16_LE")
+                        && (e.contains("Invalid argument") || e.contains("EINVAL")))
+                {
+                    params.format = "S32_LE";
+                    info!(device = %params.device, "ALSA S16_LE unsupported; retrying lossless S32_LE expansion");
+                    let (fallback_writer, fallback_opened) = spawn_writer(
+                        params,
+                        self.opener.clone(),
+                        self.shared.clone(),
+                        self.idle_close,
+                    );
+                    match fallback_opened.recv_timeout(self.open_timeout) {
+                        Ok(Ok(())) => {
+                            self.pcm_s16_expanded = true;
+                            self.writer = Some(fallback_writer);
+                            Ok(())
+                        }
+                        Ok(Err(fallback_error)) => {
+                            let _ = fallback_writer.handle.join();
+                            Err(format!(
+                                "S16_LE failed: {e}; S32_LE fallback failed: {fallback_error}"
+                            )
+                            .into())
+                        }
+                        Err(_) => {
+                            fallback_writer.stop.store(true, Ordering::Relaxed);
+                            drop(fallback_writer.tx);
+                            Err(format!("S16_LE failed: {e}; S32_LE fallback timed out").into())
+                        }
+                    }
+                } else {
+                    Err(e.into())
+                }
             }
             Err(_) => {
                 warn!(
@@ -339,6 +427,10 @@ impl AlsaDirectOutput {
     }
 
     pub fn play(&self) {
+        if self.writer.is_none() {
+            warn!("ALSA play requested without a configured device; audio remains stopped");
+            return;
+        }
         self.playing.store(true, Ordering::Relaxed);
         info!("audio output started (ALSA direct)");
     }
@@ -452,12 +544,26 @@ impl AlsaDirectOutput {
                 .unwrap_or(0);
             let bytes = match self.format {
                 // DSD is bit-perfect: ignore software volume (DAC volume only).
-                AudioFormat::DsdU8 => pack_dsd_u8_to_u32_be(data, self.channels),
-                AudioFormat::DsdU32le => dsd_u32le_to_be(data),
+                AudioFormat::DsdU8 | AudioFormat::DsdU16le | AudioFormat::DsdU32le => {
+                    let Some(dst) = self.dsd_device_format else {
+                        return 0;
+                    };
+                    repack_dsd(data, self.channels, self.format, dst)
+                }
+                AudioFormat::PcmS16le if self.pcm_s16_expanded && unity => expand_s16_to_s32(data),
+                AudioFormat::PcmS16le if self.pcm_s16_expanded => {
+                    expand_s16_to_s32(&apply_volume(self.format, data, vol))
+                }
                 AudioFormat::PcmS24le if unity => pad_s24_to_s32(data),
                 AudioFormat::PcmS24le => pad_s24_to_s32(&apply_volume(self.format, data, vol)),
                 _ if unity => data.to_vec(),
                 _ => apply_volume(self.format, data, vol),
+            };
+            let frames = if self.format.is_dsd() {
+                let width = self.dsd_device_format.map(dsd_format_width).unwrap_or(32) as usize / 8;
+                bytes.len() / (width * self.channels.max(1) as usize)
+            } else {
+                frames
             };
             (bytes, frames)
         };
@@ -663,7 +769,10 @@ impl DeviceSlot {
                             let total = self.shared.underruns.fetch_add(1, Ordering::Relaxed) + 1;
                             warn!(total, "ALSA underrun, recovered");
                         }
-                        _ => info!(?e, "ALSA resume after pause or suspend, not counted as underrun"),
+                        _ => info!(
+                            ?e,
+                            "ALSA resume after pause or suspend, not counted as underrun"
+                        ),
                     }
                     if let Err(e) = dev.recover(&e) {
                         return self.fail(&format!("recovery failed: {e:?}"));
@@ -710,7 +819,10 @@ fn writer_loop(
             Ok(d) => d,
             Err(RecvTimeoutError::Timeout) => {
                 if slot.dev.is_some() {
-                    info!(idle_ms = idle_close.as_millis() as u64, "no audio, ALSA device closed until the next stream");
+                    info!(
+                        idle_ms = idle_close.as_millis() as u64,
+                        "no audio, ALSA device closed until the next stream"
+                    );
                     slot.close(true);
                 }
                 continue;
@@ -793,6 +905,10 @@ fn alsa_format(name: &str) -> Option<alsa::pcm::Format> {
         "S24_LE" => Format::S24LE,
         "S32_LE" => Format::S32LE,
         "FLOAT_LE" => Format::FloatLE,
+        "DSD_U8" => Format::DSDU8,
+        "DSD_U16_LE" => Format::DSDU16LE,
+        "DSD_U16_BE" => Format::DSDU16BE,
+        "DSD_U32_LE" => Format::DSDU32LE,
         "DSD_U32_BE" => Format::DSDU32BE,
         _ => return None,
     })
@@ -817,9 +933,9 @@ fn open_alsa_device(p: &DeviceParams) -> Result<Box<dyn PcmDevice>, String> {
             .map_err(|e| err("channels", e))?;
         hwp.set_rate(p.rate, ValueOr::Nearest)
             .map_err(|e| err("rate", e))?;
-        hwp.set_period_time_near(ALSA_PERIOD_TIME_US, ValueOr::Nearest)
+        hwp.set_period_time_near(alsa_period_us(), ValueOr::Nearest)
             .map_err(|e| err("period time", e))?;
-        hwp.set_buffer_time_near(ALSA_BUFFER_TIME_US, ValueOr::Nearest)
+        hwp.set_buffer_time_near(alsa_buffer_us(), ValueOr::Nearest)
             .map_err(|e| err("buffer time", e))?;
         pcm.hw_params(&hwp).map_err(|e| err("apply hw params", e))?;
     }
@@ -840,6 +956,12 @@ fn open_alsa_device(p: &DeviceParams) -> Result<Box<dyn PcmDevice>, String> {
         pcm.sw_params(&swp).map_err(|e| err("apply sw params", e))?;
     }
     if rate != p.rate {
+        if p.format.starts_with("DSD_") {
+            return Err(format!(
+                "{}: DSD rate mismatch: requested {}, granted {}",
+                p.device, p.rate, rate
+            ));
+        }
         warn!(requested = p.rate, granted = rate, "ALSA rate is not exact");
     }
     // What `aplay -v` used to print: exposes a driver that clamps the
@@ -891,6 +1013,16 @@ fn flac_samples_to_device(samples: &[f32], channels: u8, vol: f32) -> Vec<u8> {
 /// every ALSA hardware device accepts — unlike raw S24_LE, which DACs such as
 /// the I-Sabre ES9038Q2M reject. Bit-perfect: the low byte is zero-filled and
 /// the sign bit is carried naturally by the original MSB (chunk[2]).
+/// Lossless left-justified expansion: signed S16_LE -> signed S32_LE.
+/// The original 16 significant bits remain unchanged; the low 16 bits are zero.
+fn expand_s16_to_s32(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() / 2 * 4);
+    for sample in data.chunks_exact(2) {
+        out.extend_from_slice(&[0, 0, sample[0], sample[1]]);
+    }
+    out
+}
+
 fn pad_s24_to_s32(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() / 3 * 4);
     for chunk in data.as_chunks::<3>().0 {
@@ -1064,16 +1196,142 @@ pub(crate) fn resolve_device_name(requested: Option<&str>) -> String {
     "default".to_string()
 }
 
+/// Preference preserves the tested Holo Audio U32_BE path. Other DACs
+/// automatically use their own native DSD representation.
+const DSD_ALSA_FORMATS: [&str; 5] = [
+    "DSD_U32_BE",
+    "DSD_U32_LE",
+    "DSD_U16_BE",
+    "DSD_U16_LE",
+    "DSD_U8",
+];
+
+fn dsd_format_width(name: &str) -> u32 {
+    match name {
+        "DSD_U8" => 8,
+        "DSD_U16_BE" | "DSD_U16_LE" => 16,
+        _ => 32,
+    }
+}
+
+fn dsd_wire_bit_rate(format: AudioFormat, rate: u32) -> Option<u32> {
+    rate.checked_mul(match format {
+        AudioFormat::DsdU8 => 1,
+        AudioFormat::DsdU16le => 1,
+        AudioFormat::DsdU32le => 32,
+        _ => return None,
+    })
+}
+
+/// Probe a single format and exact bit rate without starting playback.
+fn supports_dsd_format(
+    device: &str,
+    format: &str,
+    bit_rate: u32,
+    channels: u8,
+) -> Result<bool, String> {
+    use alsa::pcm::{Access, HwParams};
+    use alsa::{Direction, PCM};
+    let pcm =
+        PCM::new(device, Direction::Playback, true).map_err(|e| format!("{device}: open: {e}"))?;
+    let hwp = HwParams::any(&pcm).map_err(|e| e.to_string())?;
+    if hwp.set_access(Access::RWInterleaved).is_err() {
+        return Ok(false);
+    }
+    if hwp
+        .set_format(alsa_format(format).ok_or("unknown DSD format")?)
+        .is_err()
+    {
+        return Ok(false);
+    }
+    if hwp.set_channels(channels as u32).is_err() {
+        return Ok(false);
+    }
+    let width = dsd_format_width(format);
+    if bit_rate % width != 0 {
+        return Ok(false);
+    }
+    Ok(hwp.test_rate(bit_rate / width).is_ok())
+}
+
+fn select_dsd_format_with(
+    device: &str,
+    bit_rate: u32,
+    channels: u8,
+    mut probe: impl FnMut(&str, &str, u32, u8) -> Result<bool, String>,
+) -> Result<&'static str, String> {
+    for format in DSD_ALSA_FORMATS {
+        if probe(device, format, bit_rate, channels)? {
+            return Ok(format);
+        }
+    }
+    Err(format!(
+        "{device} refuses all five native DSD ALSA formats at {bit_rate} bit/s"
+    ))
+}
+
+fn select_dsd_format(device: &str, bit_rate: u32, channels: u8) -> Result<&'static str, String> {
+    select_dsd_format_with(device, bit_rate, channels, supports_dsd_format)
+}
+
+/// Convert wire DSD to the selected ALSA packing. DSD_U8 on the wire is
+/// byte-interleaved and LSB-first (DSF). For 16/32-bit wire words the byte
+/// order is little-endian, while each byte's DSD bits are already MSB-first.
+/// The ALSA output is MSB-first in time, with word byte order determined by
+/// the selected ALSA endianness. No PCM conversion takes place.
+fn repack_dsd(data: &[u8], channels: u8, source: AudioFormat, target: &str) -> Vec<u8> {
+    let ch = channels.max(1) as usize;
+    let source_width = match source {
+        AudioFormat::DsdU8 => 1,
+        AudioFormat::DsdU16le => 2,
+        AudioFormat::DsdU32le => 4,
+        _ => return Vec::new(),
+    };
+    let target_width = (dsd_format_width(target) / 8) as usize;
+    let source_frame = source_width * ch;
+    let target_frame = target_width * ch;
+    let usable = data.len() / source_frame * source_frame;
+    let mut per_channel = vec![Vec::with_capacity(usable / ch); ch];
+    for frame in data[..usable].chunks_exact(source_frame) {
+        for c in 0..ch {
+            let word = &frame[c * source_width..(c + 1) * source_width];
+            for &byte in word {
+                per_channel[c].push(if source == AudioFormat::DsdU8 {
+                    byte.reverse_bits()
+                } else {
+                    byte
+                });
+            }
+        }
+    }
+    let frames = per_channel[0].len() / target_width;
+    let mut out = Vec::with_capacity(frames * target_frame);
+    for f in 0..frames {
+        for channel in &per_channel {
+            let word = &channel[f * target_width..(f + 1) * target_width];
+            if target.ends_with("_LE") {
+                out.extend(word.iter().rev());
+            } else {
+                out.extend_from_slice(word);
+            }
+        }
+    }
+    out
+}
+
 /// DSD multipliers the endpoint can announce, lowest first (RFC §5.6
 /// defines them up to DSD512).
 const DSD_MULTIPLIERS: [u16; 4] = [64, 128, 256, 512];
 
 /// What the logs say when no native DSD is announced: the server then
 /// converts DSD to PCM (#62).
-const DSD_TO_PCM: &str = "native DSD not supported by device, DSD will be converted to PCM by the server";
+#[cfg(test)]
+const DSD_TO_PCM: &str =
+    "native DSD not supported by device, DSD will be converted to PCM by the server";
 
 /// Why the DSD probe returned no rates.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) enum DsdProbeError {
     /// The `hw:` device opened and refused DSD_U32_BE stereo interleaved
     /// (`set_format` or `set_channels` failed): it has no native DSD in the
@@ -1086,6 +1344,7 @@ pub(crate) enum DsdProbeError {
 /// ALSA DSD_U32_BE frame rate of a DSD multiplier: the bit rate
 /// (multiplier × 44.1 kHz) over 32 bits per frame, as `alsa_format_and_rate`
 /// opens it (DSD64 → 88 200).
+#[cfg(test)]
 fn dsd_u32_rate(multiplier: u16) -> u32 {
     multiplier as u32 * 44_100 / 32
 }
@@ -1106,6 +1365,7 @@ fn dsd_u32_rate(multiplier: u16) -> u32 {
 ///   costs native DSD until the bridge restarts with the DAC available;
 /// - the device is not a `hw:` one (`default`): plug devices cannot carry
 ///   DSD_U32_BE.
+#[cfg(test)]
 pub(crate) fn announced_dsd_max(
     device_name: Option<&str>,
     probe: impl FnOnce(&str, &[u32]) -> Result<Vec<u32>, DsdProbeError>,
@@ -1158,6 +1418,7 @@ pub(crate) fn announced_dsd_max(
 /// device is opened non-blocking and closed on return. A device that cannot
 /// be opened is [`DsdProbeError::Unavailable`]; one that opens and refuses
 /// the format is [`DsdProbeError::Refused`].
+#[cfg(test)]
 fn probe_dsd_rates(device: &str, rates: &[u32]) -> Result<Vec<u32>, DsdProbeError> {
     use alsa::pcm::{Access, Format, HwParams};
     use alsa::{Direction, PCM};
@@ -1185,7 +1446,25 @@ impl AlsaDirectOutput {
     /// accepts; `None` (no native DSD, the server converts to PCM) when the
     /// device refuses DSD or cannot be probed. See [`announced_dsd_max`].
     pub fn dsd_max_multiplier(device_name: Option<&str>) -> Option<u16> {
-        announced_dsd_max(device_name, probe_dsd_rates)
+        let device = dsd_hw_device(&resolve_device_name(device_name));
+        if !device.starts_with("hw:") {
+            return None;
+        }
+        let mut highest = None;
+        for &multiplier in &DSD_MULTIPLIERS {
+            let bit_rate = multiplier as u32 * 44_100;
+            match select_dsd_format(&device, bit_rate, 2) {
+                Ok(format) => {
+                    info!(device = %device, multiplier, alsa_format = format, "native DSD supported");
+                    highest = Some(multiplier);
+                }
+                Err(error) => {
+                    warn!(device = %device, multiplier, %error, "DSD rate not available");
+                    break;
+                }
+            }
+        }
+        highest
     }
 }
 
@@ -1216,6 +1495,7 @@ fn format_to_alsa(format: AudioFormat) -> Option<&'static str> {
 /// Input layout: `L0 R0 L1 R1 L2 R2 L3 R3 ...` (one byte = 8 DSD bits).
 /// Output layout: 4-byte big-endian words per channel, bits MSB-first in time
 /// (each input byte is bit-reversed; XMOS `bitrev=0` expects app-side order).
+#[cfg(test)]
 fn pack_dsd_u8_to_u32_be(data: &[u8], channels: u8) -> Vec<u8> {
     let ch = channels.max(1) as usize;
     let frame = 4 * ch; // 4 bytes/channel → one DSD_U32 frame
@@ -1233,6 +1513,7 @@ fn pack_dsd_u8_to_u32_be(data: &[u8], channels: u8) -> Vec<u8> {
 }
 
 /// Byte-swap DSD_U32LE words into DSD_U32_BE.
+#[cfg(test)]
 fn dsd_u32le_to_be(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len());
     for chunk in data.as_chunks::<4>().0 {
@@ -1403,7 +1684,9 @@ mod tests {
                 ));
             }
             if s.fail_opens > 0 {
-                s.fail_opens = s.fail_opens.saturating_sub(if s.fail_opens == usize::MAX { 0 } else { 1 });
+                s.fail_opens =
+                    s.fail_opens
+                        .saturating_sub(if s.fail_opens == usize::MAX { 0 } else { 1 });
                 return Err("No such device".into());
             }
             let mark = s.written.len();
@@ -1454,12 +1737,22 @@ mod tests {
         assert!(!out.device_open(), "device still open after stop()");
         let st = st.lock().unwrap();
         let p = st.params.clone().unwrap();
-        assert_eq!((p.device.as_str(), p.format, p.rate, p.channels), ("hw:1,0", "S32_LE", 44_100, 2));
-        assert_eq!(st.written.len(), expected.len(), "every decoded frame reaches the device");
+        assert_eq!(
+            (p.device.as_str(), p.format, p.rate, p.channels),
+            ("hw:1,0", "S32_LE", 44_100, 2)
+        );
+        assert_eq!(
+            st.written.len(),
+            expected.len(),
+            "every decoded frame reaches the device"
+        );
         assert!(st.written == expected, "decoded PCM must be bit-exact");
         assert_eq!(st.open_marks.len(), 1);
         assert_eq!(st.closes, 1, "stop() must close the device");
-        assert_eq!(st.drains, 1, "stop() plays out the queue (end of track not cut)");
+        assert_eq!(
+            st.drains, 1,
+            "stop() plays out the queue (end of track not cut)"
+        );
     }
 
     /// #45: the device is lost mid-stream (DAC unplugged). It is reopened
@@ -1484,7 +1777,10 @@ mod tests {
         let after = &st.written[st.open_marks[1]..];
         assert!(!after.is_empty(), "audio must resume after the reopen");
         let tail = &expected[expected.len() - 4096..];
-        assert!(st.written.ends_with(tail), "decoding went on to the end of the stream");
+        assert!(
+            st.written.ends_with(tail),
+            "decoding went on to the end of the stream"
+        );
         assert_eq!(out.underrun_count(), 0);
     }
 
@@ -1505,7 +1801,10 @@ mod tests {
         }
         out.stop();
         let st = st.lock().unwrap();
-        assert!(st.written == sent, "S16 passes bit-exact, nothing lost on xrun");
+        assert!(
+            st.written == sent,
+            "S16 passes bit-exact, nothing lost on xrun"
+        );
         assert_eq!(st.recovers, 1);
         assert_eq!(st.open_marks.len(), 1, "an xrun does not reopen the device");
         assert_eq!(out.underrun_count(), 1);
@@ -1593,7 +1892,10 @@ mod tests {
             sleep(Duration::from_millis(10));
         }
         let n = st.lock().unwrap().open_attempts;
-        assert!((3..=6).contains(&n), "bounded retries, got {n} attempts in ~3 s");
+        assert!(
+            (3..=6).contains(&n),
+            "bounded retries, got {n} attempts in ~3 s"
+        );
         // The device comes back: playback resumes by itself.
         st.lock().unwrap().fail_opens = 0;
         let end = Instant::now() + Duration::from_secs(5);
@@ -1615,28 +1917,69 @@ mod tests {
     /// FormatReject) instead of accepting a stream that cannot play, keeps no
     /// writer behind, and the next PCM stream plays.
     #[test]
+    fn pcm_s16_uses_s32_fallback_only_when_rejected() {
+        let (st, opener) = fake();
+        st.lock().unwrap().refuse_format = Some("S16_LE");
+        let mut out = AlsaDirectOutput::with_opener(opener);
+        out.configure_with_device(AudioFormat::PcmS16le, 44_100, 2, Some("hw:CARD=TEST,DEV=0"))
+            .expect("S32_LE fallback should open");
+        assert!(out.pcm_s16_expanded);
+        assert_eq!(st.lock().unwrap().params.as_ref().unwrap().format, "S32_LE");
+        out.play();
+        assert_eq!(out.write_audio(&[0x34, 0x12, 0xff, 0x7f]), 1);
+        out.stop();
+        let state = st.lock().unwrap();
+        assert_eq!(state.written, vec![0, 0, 0x34, 0x12, 0, 0, 0xff, 0x7f]);
+    }
+
+    #[test]
+    fn pcm_s16_expansion_preserves_signed_samples() {
+        assert_eq!(
+            expand_s16_to_s32(&[0x00, 0x80, 0xff, 0x7f, 0x34, 0x12]),
+            vec![0, 0, 0x00, 0x80, 0, 0, 0xff, 0x7f, 0, 0, 0x34, 0x12]
+        );
+    }
+
+    #[test]
     fn un_format_refuse_par_le_peripherique_fait_echouer_configure() {
         let (st, opener) = fake();
         st.lock().unwrap().refuse_format = Some("DSD_U32_BE");
         let mut out = AlsaDirectOutput::with_opener(opener);
         let t0 = Instant::now();
         let err = out
-            .configure_with_device(AudioFormat::DsdU8, 2_822_400, 2, Some("hw:CARD=DAC52052082,DEV=0"))
+            .configure_with_device(
+                AudioFormat::DsdU8,
+                2_822_400,
+                2,
+                Some("hw:CARD=DAC52052082,DEV=0"),
+            )
             .expect_err("a refused DSD format must fail configure()");
         assert!(t0.elapsed() < Duration::from_secs(1), "reported at once");
         assert!(err.to_string().contains("DSD_U32_BE"), "{err}");
         assert!(!out.device_open());
         out.play();
-        assert_eq!(out.write_audio(&[0x69u8; 8 * 64]), 0, "nothing queued for a refused stream");
+        assert_eq!(
+            out.write_audio(&[0x69u8; 8 * 64]),
+            0,
+            "nothing queued for a refused stream"
+        );
         out.stop();
 
-        out.configure_with_device(AudioFormat::PcmS16le, 44_100, 2, Some("hw:CARD=DAC52052082,DEV=0"))
-            .expect("the next PCM stream opens");
+        out.configure_with_device(
+            AudioFormat::PcmS16le,
+            44_100,
+            2,
+            Some("hw:CARD=DAC52052082,DEV=0"),
+        )
+        .expect("the next PCM stream opens");
         out.play();
         assert_eq!(out.write_audio(&[1u8; 441 * 4]), 441);
         out.stop();
         let st = st.lock().unwrap();
-        assert_eq!(st.open_attempts, 2, "one refused open, one PCM open, no retry loop");
+        assert_eq!(
+            st.open_attempts, 2,
+            "one refused open, one PCM open, no retry loop"
+        );
         assert_eq!(st.written, vec![1u8; 441 * 4]);
         assert_eq!(st.params.as_ref().unwrap().format, "S16_LE");
     }
@@ -1654,7 +1997,11 @@ mod tests {
         let err = out
             .configure_with_device(AudioFormat::DsdU8, 2_822_400, 2, Some("hw:1,0"))
             .expect_err("an open that does not complete must fail configure()");
-        assert!(t0.elapsed() < Duration::from_secs(1), "waited {:?}", t0.elapsed());
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "waited {:?}",
+            t0.elapsed()
+        );
         assert!(err.to_string().contains("did not complete"), "{err}");
         out.stop();
         out.configure_with_device(AudioFormat::PcmS16le, 44_100, 2, Some("hw:1,0"))
@@ -1678,7 +2025,11 @@ mod tests {
         out.write_audio(&[0u8; 480 * 4]);
         let t0 = Instant::now();
         out.stop();
-        assert!(t0.elapsed() < Duration::from_secs(1), "stop() took {:?}", t0.elapsed());
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "stop() took {:?}",
+            t0.elapsed()
+        );
         out.configure(AudioFormat::PcmS16le, 48_000, 2).unwrap();
         out.release();
     }
@@ -1691,7 +2042,9 @@ mod tests {
         out.configure(AudioFormat::PcmS16le, 48_000, 2).unwrap();
         out.play();
         out.flush();
-        wait_until("reopen after flush", || st.lock().unwrap().open_marks.len() == 2);
+        wait_until("reopen after flush", || {
+            st.lock().unwrap().open_marks.len() == 2
+        });
         out.stop();
         let st = st.lock().unwrap();
         assert_eq!(st.discards, 1);
@@ -1822,6 +2175,52 @@ mod tests {
             alsa_format_and_rate(AudioFormat::DsdU8, 5_644_800),
             Some(("DSD_U32_BE", 176_400))
         );
+    }
+
+    #[test]
+    fn dsd_all_alsa_formats_stereo_packing() {
+        let src = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        let l = [0x80, 0xC0, 0xA0, 0xE0];
+        let r = [0x40, 0x20, 0x60, 0x10];
+        assert_eq!(
+            repack_dsd(&src, 2, AudioFormat::DsdU8, "DSD_U8"),
+            vec![0x80, 0x40, 0xC0, 0x20, 0xA0, 0x60, 0xE0, 0x10]
+        );
+        assert_eq!(
+            repack_dsd(&src, 2, AudioFormat::DsdU8, "DSD_U16_BE"),
+            vec![l[0], l[1], r[0], r[1], l[2], l[3], r[2], r[3]]
+        );
+        assert_eq!(
+            repack_dsd(&src, 2, AudioFormat::DsdU8, "DSD_U16_LE"),
+            vec![l[1], l[0], r[1], r[0], l[3], l[2], r[3], r[2]]
+        );
+        assert_eq!(
+            repack_dsd(&src, 2, AudioFormat::DsdU8, "DSD_U32_BE"),
+            vec![l[0], l[1], l[2], l[3], r[0], r[1], r[2], r[3]]
+        );
+        assert_eq!(
+            repack_dsd(&src, 2, AudioFormat::DsdU8, "DSD_U32_LE"),
+            vec![l[3], l[2], l[1], l[0], r[3], r[2], r[1], r[0]]
+        );
+    }
+
+    #[test]
+    fn dsd_rates_are_based_on_output_width() {
+        assert_eq!(
+            dsd_wire_bit_rate(AudioFormat::DsdU8, 2_822_400),
+            Some(2_822_400)
+        );
+        assert_eq!(
+            dsd_wire_bit_rate(AudioFormat::DsdU16le, 2_822_400),
+            Some(2_822_400)
+        );
+        assert_eq!(
+            dsd_wire_bit_rate(AudioFormat::DsdU32le, 88_200),
+            Some(2_822_400)
+        );
+        assert_eq!(2_822_400 / dsd_format_width("DSD_U8"), 352_800);
+        assert_eq!(2_822_400 / dsd_format_width("DSD_U16_LE"), 176_400);
+        assert_eq!(2_822_400 / dsd_format_width("DSD_U32_BE"), 88_200);
     }
 
     #[test]
@@ -2085,6 +2484,27 @@ mod tests {
         out.stop();
     }
 
+    #[test]
+    fn multiformat_probe_selects_u16_le_when_only_that_format_is_supported() {
+        let mut attempted = Vec::new();
+        let selected = select_dsd_format_with("hw:mock", 2_822_400, 2, |_, fmt, _, _| {
+            attempted.push(fmt.to_owned());
+            Ok(fmt == "DSD_U16_LE")
+        })
+        .unwrap();
+        assert_eq!(selected, "DSD_U16_LE");
+        assert_eq!(
+            attempted,
+            ["DSD_U32_BE", "DSD_U32_LE", "DSD_U16_BE", "DSD_U16_LE"]
+        );
+    }
+
+    #[test]
+    fn multiformat_probe_rejects_when_all_formats_are_unsupported() {
+        let result = select_dsd_format_with("hw:mock", 2_822_400, 2, |_, _, _, _| Ok(false));
+        assert!(result.is_err());
+    }
+
     // -- Native DSD rates announced (dsd_max_rate) --
 
     /// A probe that accepts the given multipliers' DSD_U32_BE rates and
@@ -2169,10 +2589,16 @@ mod tests {
                 ))
             })
         });
-        assert_eq!(max, None, "a DAC that refuses DSD must not announce native DSD");
+        assert_eq!(
+            max, None,
+            "a DAC that refuses DSD must not announce native DSD"
+        );
         assert!(logs.contains("WARN"), "{logs}");
         assert!(logs.contains(DSD_TO_PCM), "{logs}");
-        assert!(logs.contains("Invalid argument"), "the ALSA error is logged: {logs}");
+        assert!(
+            logs.contains("Invalid argument"),
+            "the ALSA error is logged: {logs}"
+        );
         assert!(!logs.contains("dsd_max=64"), "{logs}");
     }
 
@@ -2192,7 +2618,11 @@ mod tests {
         assert_eq!(max, None);
         assert!(logs.contains("WARN") && logs.contains(DSD_TO_PCM), "{logs}");
         assert!(logs.contains("busy"), "the probe error is logged: {logs}");
-        assert!(logs.contains("could not run"), "{logs}");
+        assert!(
+            logs.contains("the DSD probe could not run")
+                && logs.contains("restart tune-bridge with the DAC free"),
+            "{logs}"
+        );
     }
 
     #[test]
@@ -2238,6 +2668,6 @@ mod tests {
             max = AlsaDirectOutput::dsd_max_multiplier(Some("plughw:CARD=OaatAbsentCard,DEV=0"))
         });
         assert_eq!(max, None);
-        assert!(logs.contains("could not run"), "{logs}");
+        assert!(logs.contains("DSD rate not available"), "{logs}");
     }
 }
