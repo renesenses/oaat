@@ -1,5 +1,7 @@
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
@@ -346,7 +348,12 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
             audio_port,
             clock_port,
             buffer_size_ms,
-            features: vec![FEATURE_ENDPOINT_RELEASE.into()],
+            features: vec![
+                FEATURE_ENDPOINT_RELEASE.into(),
+                "gp_arq_v1".into(),
+                "gp_jitter_v1".into(),
+                "gp_adaptive_v1".into(),
+            ],
         });
         writer.write_all(&FrameCodec::encode(&ack)).await?;
 
@@ -375,8 +382,17 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
 
         // Spawn audio receiver (abort handle stored for cleanup)
         let audio_tx = event_tx.clone();
+        let arq = hello.features.iter().any(|f| f == "gp_arq_v1");
+        let jitter_ms = hello
+            .features
+            .iter()
+            .find_map(|f| f.strip_prefix("gp_jitter_ms="))
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0)
+            .min(250);
+        let adaptive = hello.features.iter().any(|f| f == "gp_adaptive_v1") && jitter_ms > 0;
         let audio_handle = tokio::spawn(async move {
-            Self::audio_receive_loop(audio_socket, audio_tx, clock).await;
+            Self::audio_receive_loop(audio_socket, audio_tx, clock, arq, jitter_ms, adaptive).await;
         });
 
         // Abort background tasks on any exit path
@@ -735,50 +751,80 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
         socket: Arc<UdpSocket>,
         event_tx: mpsc::Sender<EndpointEvent>,
         clock: Arc<SharedClock>,
+        arq: bool,
+        jitter_ms: u32,
+        adaptive: bool,
     ) {
-        let mut buf = vec![0u8; AUDIO_HEADER_SIZE + oaat_core::MAX_AUDIO_PAYLOAD];
-        // Reorders within FEC groups, recovers single losses from parity and
-        // emits packets in order. Packets without FEC pass through directly.
+        let mut buf = vec![0u8; AUDIO_HEADER_SIZE + oaat_core::MAX_AUDIO_PAYLOAD + 4];
         let mut fec_rx = oaat_core::fec::FecReceiver::new();
         let mut last_recovered: u64 = 0;
         let mut last_lost: u64 = 0;
+        let mut reliable = if arq || jitter_ms > 0 {
+            Some(ReliabilityReceiver::new(
+                arq,
+                jitter_ms.max(if arq { 50 } else { 0 }),
+                adaptive,
+            ))
+        } else {
+            None
+        };
         loop {
-            let n = match socket.recv(&mut buf).await {
-                Ok(n) => n,
+            // No periodic timer in the original/default receive path.
+            let received = if reliable.is_some() {
+                match tokio::time::timeout(Duration::from_millis(5), socket.recv_from(&mut buf))
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        if let Some(ref mut r) = reliable {
+                            r.drain(&event_tx, &clock).await;
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                socket.recv_from(&mut buf).await
+            };
+            let (n, peer) = match received {
+                Ok(v) => v,
                 Err(e) => {
                     error!(error = %e, "audio recv error");
                     break;
                 }
             };
-            if n < AUDIO_HEADER_SIZE {
+            // Retransmissions are explicitly marked, so they bypass FEC's
+            // already-flushed group state and enter the optional reorder queue.
+            let retransmitted = n >= 4 && &buf[..4] == b"GPAR";
+            let offset = if retransmitted { 4 } else { 0 };
+            if n < offset + AUDIO_HEADER_SIZE {
                 continue;
             }
             let header_bytes: &[u8; AUDIO_HEADER_SIZE] =
-                buf[..AUDIO_HEADER_SIZE].try_into().unwrap();
+                buf[offset..offset + AUDIO_HEADER_SIZE].try_into().unwrap();
             let header = match AudioPacketHeader::decode(header_bytes) {
                 Ok(h) => h,
                 Err(_) => continue,
             };
-            let actual_payload_len = n - AUDIO_HEADER_SIZE;
+            let actual_payload_len = n - offset - AUDIO_HEADER_SIZE;
             if actual_payload_len != header.payload_len as usize {
-                warn!(
-                    seq = header.sequence,
-                    expected = header.payload_len,
-                    actual = actual_payload_len,
-                    "truncated UDP packet, dropping",
-                );
+                warn!(seq = header.sequence, "truncated UDP packet, dropping");
                 continue;
             }
-            let payload = buf[AUDIO_HEADER_SIZE..n].to_vec();
-
-            // Flush the group on stream end so trailing packets are not
-            // held back waiting for a group that will never complete.
+            let payload = buf[offset + AUDIO_HEADER_SIZE..n].to_vec();
+            if retransmitted {
+                if let Some(ref mut r) = reliable {
+                    if !header.flags.contains(PacketFlags::FEC) {
+                        r.retransmit(header, payload);
+                        r.drain(&event_tx, &clock).await;
+                    }
+                }
+                continue;
+            }
             let last_packet = header.flags.contains(PacketFlags::LAST_PACKET);
             let mut deliverable = fec_rx.feed(header, payload);
             if last_packet {
                 deliverable.extend(fec_rx.flush());
             }
-
             if fec_rx.recovered() != last_recovered {
                 last_recovered = fec_rx.recovered();
                 info!(total = last_recovered, "packet recovered from FEC parity");
@@ -788,13 +834,177 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
                 warn!(total = last_lost, "packet lost beyond FEC recovery");
             }
             clock.set_link_stats(fec_rx.lost(), fec_rx.recovered());
-
-            for (header, payload) in deliverable {
-                let _ = event_tx
-                    .send(EndpointEvent::AudioPacket { header, payload })
-                    .await;
+            if let Some(ref mut r) = reliable {
+                for (header, payload) in deliverable {
+                    r.feed(header, payload, &socket, peer).await;
+                }
+                r.drain(&event_tx, &clock).await;
+            } else {
+                for (header, payload) in deliverable {
+                    let _ = event_tx
+                        .send(EndpointEvent::AudioPacket { header, payload })
+                        .await;
+                }
             }
         }
+    }
+}
+
+/// Optional bounded reorder window. The upstream path does not construct
+/// this object. Packets are never interpolated or modified.
+struct ReliabilityReceiver {
+    arq: bool,
+    adaptive: bool,
+    base_ms: u32,
+    delay_ms: u32,
+    pending: BTreeMap<u64, (Instant, AudioPacketHeader, Vec<u8>)>,
+    missing: HashMap<u16, Instant>,
+    last_header: Option<AudioPacketHeader>,
+    last_emitted_offset: Option<u64>,
+    current_stream: Option<u32>,
+    requested: u64,
+    recovered: u64,
+    timeout: u64,
+    last_adjust: Instant,
+    recent_timeouts: u64,
+}
+
+impl ReliabilityReceiver {
+    fn new(arq: bool, base_ms: u32, adaptive: bool) -> Self {
+        Self {
+            arq,
+            adaptive,
+            base_ms,
+            delay_ms: base_ms,
+            pending: BTreeMap::new(),
+            missing: HashMap::new(),
+            last_header: None,
+            last_emitted_offset: None,
+            current_stream: None,
+            requested: 0,
+            recovered: 0,
+            timeout: 0,
+            last_adjust: Instant::now(),
+            recent_timeouts: 0,
+        }
+    }
+
+    async fn feed(
+        &mut self,
+        header: AudioPacketHeader,
+        payload: Vec<u8>,
+        socket: &UdpSocket,
+        peer: SocketAddr,
+    ) {
+        if self.arq {
+            if let Some(prev) = self.last_header {
+                let gap = header.sequence.wrapping_sub(prev.sequence);
+                if gap > 1 && gap <= 64 && prev.stream_id == header.stream_id {
+                    let base = header.sequence.wrapping_sub(header.fec_index as u16);
+                    for i in 1..gap {
+                        let missing_seq = prev.sequence.wrapping_add(i);
+                        // The parity datagram between consecutive FEC groups
+                        // is not audio and must not be requested.
+                        if header.fec_group_size > 0 && missing_seq == base.wrapping_sub(1) {
+                            continue;
+                        }
+                        if prev.fec_group_size > 0
+                            && prev.fec_index + 1 == prev.fec_group_size
+                            && missing_seq == prev.sequence.wrapping_add(1)
+                        {
+                            continue;
+                        }
+                        if self.missing.contains_key(&missing_seq) {
+                            continue;
+                        }
+                        let mut nack = [0u8; 6];
+                        nack[..4].copy_from_slice(b"GPAN");
+                        nack[4..].copy_from_slice(&missing_seq.to_be_bytes());
+                        if socket.send_to(&nack, peer).await.is_ok() {
+                            self.missing.insert(missing_seq, Instant::now());
+                            self.requested += 1;
+                        }
+                    }
+                }
+            }
+            if self.last_header.map_or(true, |h| {
+                let delta = header.sequence.wrapping_sub(h.sequence);
+                delta > 0 && delta < 0x8000
+            }) {
+                self.last_header = Some(header);
+            }
+        }
+        self.enqueue(header, payload);
+    }
+
+    fn retransmit(&mut self, header: AudioPacketHeader, payload: Vec<u8>) {
+        if self.missing.remove(&header.sequence).is_some() {
+            self.recovered += 1;
+            self.enqueue(header, payload);
+        }
+    }
+
+    fn enqueue(&mut self, header: AudioPacketHeader, payload: Vec<u8>) {
+        if self.current_stream != Some(header.stream_id) {
+            self.pending.clear();
+            self.missing.clear();
+            self.last_emitted_offset = None;
+            self.current_stream = Some(header.stream_id);
+        }
+        if self
+            .last_emitted_offset
+            .is_some_and(|offset| header.sample_offset <= offset)
+        {
+            return; // Too late: never replay an already-consumed position.
+        }
+        if self.pending.len() >= 4096 {
+            return;
+        }
+        self.pending
+            .entry(header.sample_offset)
+            .or_insert((Instant::now(), header, payload));
+    }
+
+    async fn drain(&mut self, events: &mpsc::Sender<EndpointEvent>, clock: &SharedClock) {
+        let now = Instant::now();
+        let timeout = Duration::from_millis(self.delay_ms as u64);
+        let expired: Vec<u16> = self
+            .missing
+            .iter()
+            .filter(|(_, sent)| now.duration_since(**sent) >= timeout)
+            .map(|(seq, _)| *seq)
+            .collect();
+        for seq in expired {
+            self.missing.remove(&seq);
+            self.timeout += 1;
+            self.recent_timeouts += 1;
+        }
+        if self.adaptive && now.duration_since(self.last_adjust) >= Duration::from_secs(5) {
+            if self.recent_timeouts > 0 {
+                self.delay_ms = (self.delay_ms + 20).min(250);
+            } else if self.delay_ms > self.base_ms {
+                self.delay_ms = self.delay_ms.saturating_sub(10).max(self.base_ms);
+            }
+            self.recent_timeouts = 0;
+            self.last_adjust = now;
+        }
+        while let Some((&offset, (arrived, _, _))) = self.pending.first_key_value() {
+            if now.duration_since(*arrived) < Duration::from_millis(self.delay_ms as u64) {
+                break;
+            }
+            let Some((_, header, payload)) = self.pending.remove(&offset) else {
+                break;
+            };
+            self.last_emitted_offset = Some(offset);
+            if events
+                .send(EndpointEvent::AudioPacket { header, payload })
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        clock.set_arq_stats(self.requested, self.recovered, self.timeout, self.delay_ms);
     }
 }
 

@@ -217,6 +217,14 @@ pub struct StreamStats {
     /// playback (#28). Absent from older endpoints (defaults to 0).
     #[serde(default)]
     pub underruns: u64,
+    #[serde(default)]
+    pub arq_requested: u64,
+    #[serde(default)]
+    pub arq_recovered: u64,
+    #[serde(default)]
+    pub arq_timeout: u64,
+    #[serde(default)]
+    pub jitter_buffer_ms: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

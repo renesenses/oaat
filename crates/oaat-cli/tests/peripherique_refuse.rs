@@ -52,7 +52,7 @@ impl Bridge {
         let log = std::fs::File::create(home.join("endpoint.log")).unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_tune-bridge"))
             .args(["endpoint", "--name", &format!("oaat-62-{tag}")])
-            .args(["--port", &port.to_string(), "--no-web-ui", "--dsd"])
+            .args(["--port", &port.to_string(), "--no-web-ui", "--dsd", "auto"])
             .args(["--audio-device", DEVICE])
             .env("HOME", &home)
             .env(
@@ -88,10 +88,13 @@ impl Bridge {
             clock_port: 0,
             tls: false,
         };
-        tokio::time::timeout(Duration::from_secs(5), ConnectedEndpoint::connect(&cfg, self.addr))
-            .await
-            .expect("connect timed out")
-            .expect("connect failed")
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            ConnectedEndpoint::connect(&cfg, self.addr),
+        )
+        .await
+        .expect("connect timed out")
+        .expect("connect failed")
     }
 }
 
@@ -173,7 +176,11 @@ async fn stream_pcm(ep: &mut ConnectedEndpoint, secs: f64) {
     let payload = vec![0u8; chunk];
     let t0 = Instant::now();
     for i in 0..n {
-        let flags = if i == 0 { PacketFlags::FIRST_PACKET } else { PacketFlags::empty() };
+        let flags = if i == 0 {
+            PacketFlags::FIRST_PACKET
+        } else {
+            PacketFlags::empty()
+        };
         ep.send_audio(1, AudioFormat::PcmS24le, 0, 0, &payload, flags)
             .await
             .unwrap();
@@ -199,10 +206,7 @@ async fn un_dac_qui_refuse_le_dsd_n_annonce_aucun_dsd_natif() {
         caps.formats
     );
     let log = bridge.log();
-    assert!(
-        log.contains("native DSD not supported by device, DSD will be converted to PCM by the server"),
-        "{log}"
-    );
+    assert!(log.contains("DSD rate not available"), "{log}");
     assert!(!log.contains("native DSD capability enabled"), "{log}");
 
     match propose(&bridge, &mut ep, dsd64("dsd-1")).await {
@@ -234,10 +238,15 @@ async fn une_ouverture_refusee_en_session_est_signalee_et_le_pcm_suivant_joue() 
     let t0 = Instant::now();
     match propose(&bridge, &mut ep, dsd64("dsd-1")).await {
         Answer::Reject(reason) => assert!(
-            reason.contains("DSD_U32_BE"),
+            reason.contains("native DSD negotiation failed")
+                && reason.contains("hw:CARD=FakeDac,DEV=0")
+                && reason.contains("refuses all five native DSD ALSA formats"),
             "the reason carries the device error: {reason}"
         ),
-        other => panic!("the refused open must be reported, got {other:?}\n{}", bridge.log()),
+        other => panic!(
+            "the refused open must be reported, got {other:?}\n{}",
+            bridge.log()
+        ),
     }
     assert!(
         t0.elapsed() < Duration::from_secs(4),
@@ -247,7 +256,10 @@ async fn une_ouverture_refusee_en_session_est_signalee_et_le_pcm_suivant_joue() 
 
     match propose(&bridge, &mut ep, pcm("pcm-1")).await {
         Answer::Accept => {}
-        other => panic!("next PCM stream must be accepted, got {other:?}\n{}", bridge.log()),
+        other => panic!(
+            "next PCM stream must be accepted, got {other:?}\n{}",
+            bridge.log()
+        ),
     }
     ep.send_play("pcm-1").await.unwrap();
     stream_pcm(&mut ep, 1.0).await;
@@ -259,7 +271,10 @@ async fn une_ouverture_refusee_en_session_est_signalee_et_le_pcm_suivant_joue() 
     let mut ep = bridge.connect().await;
     match propose(&bridge, &mut ep, pcm("pcm-2")).await {
         Answer::Accept => {}
-        other => panic!("PCM after reconnect must be accepted, got {other:?}\n{}", bridge.log()),
+        other => panic!(
+            "PCM after reconnect must be accepted, got {other:?}\n{}",
+            bridge.log()
+        ),
     }
     ep.send_play("pcm-2").await.unwrap();
     stream_pcm(&mut ep, 0.5).await;
@@ -271,5 +286,8 @@ async fn une_ouverture_refusee_en_session_est_signalee_et_le_pcm_suivant_joue() 
         .lines()
         .filter(|l| l.contains("ALSA device opened") && l.contains("S32_LE"))
         .count();
-    assert!(opened_s32 >= 2, "both PCM streams opened the device:\n{log}");
+    assert!(
+        opened_s32 >= 2,
+        "both PCM streams opened the device:\n{log}"
+    );
 }

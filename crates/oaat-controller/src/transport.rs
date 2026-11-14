@@ -1,3 +1,4 @@
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -11,7 +12,7 @@ use oaat_core::message::*;
 use oaat_core::wire::{AUDIO_HEADER_SIZE, AudioPacketHeader, ClockSyncPacket, ClockSyncType};
 use oaat_core::{Message, OaatError, PROTOCOL_VERSION};
 
-use crate::clock::{ClockMeasurement, SharedTimeSource, MonotonicTimeSource};
+use crate::clock::{ClockMeasurement, MonotonicTimeSource, SharedTimeSource};
 
 #[derive(Clone)]
 pub struct ControllerConfig {
@@ -44,6 +45,9 @@ pub struct ConnectedEndpoint {
     pub(crate) clock_state: Arc<Mutex<ClockState>>,
     pub(crate) time_source: SharedTimeSource,
     sequence: u16,
+    fec_encoder: Option<oaat_core::fec::FecEncoder>,
+    arq_cache: Option<Arc<std::sync::Mutex<ArqCache>>>,
+    arq_task: Option<tokio::task::JoinHandle<()>>,
     pub response_rx: mpsc::Receiver<EndpointResponse>,
     /// `endpoint_release` (RFC §7.3.1): the endpoint gave up its audio
     /// output. Kept apart from `response_rx`, which carries replies to the
@@ -57,6 +61,9 @@ pub struct ConnectedEndpoint {
 impl Drop for ConnectedEndpoint {
     fn drop(&mut self) {
         self.reader_task.abort();
+        if let Some(task) = self.arq_task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -249,12 +256,17 @@ impl ConnectedEndpoint {
                                         drift_us = ss.drift_us,
                                         lost = ss.packets_lost,
                                         recovered = ss.packets_recovered,
-                                        bit_perfect = ss.bit_perfect,
+                                        underruns = ss.underruns,
+                                        arq_requested = ss.arq_requested,
+                                        arq_recovered = ss.arq_recovered,
+                                        arq_timeout = ss.arq_timeout,
+                                        jitter_buffer_ms = ss.jitter_buffer_ms,
+                                        bit_perfect_path = ss.bit_perfect,
+                                        stream_integrity_ok = ss.packets_lost <= ss.arq_recovered && ss.arq_timeout == 0 && ss.underruns == 0,
                                         "endpoint stream stats"
                                     );
-                                    let _ = response_tx
-                                        .send(EndpointResponse::StreamStats(ss))
-                                        .await;
+                                    let _ =
+                                        response_tx.send(EndpointResponse::StreamStats(ss)).await;
                                 }
                                 Message::EndpointRelease(er) => {
                                     info!(
@@ -290,10 +302,24 @@ impl ConnectedEndpoint {
             clock_state: Arc::new(Mutex::new(ClockState::new())),
             time_source,
             sequence: 0,
+            fec_encoder: None,
+            arq_cache: None,
+            arq_task: None,
             response_rx,
             release_rx,
             reader_task,
         })
+    }
+
+    /// True once the TCP control-plane reader has terminated. UDP send_to()
+    /// alone cannot detect a remote endpoint restart.
+    pub fn is_disconnected(&self) -> bool {
+        self.reader_task.is_finished()
+    }
+
+    /// Mark the current session unusable after a transport write failure.
+    pub fn disconnect_reader(&self) {
+        self.reader_task.abort();
     }
 
     pub async fn send_message(&mut self, msg: &Message) -> Result<(), OaatError> {
@@ -312,6 +338,29 @@ impl ConnectedEndpoint {
         channel_layout: oaat_core::ChannelLayout,
         bits_per_sample: u8,
     ) -> Result<(), OaatError> {
+        self.propose_format_with_dsd_rate(
+            stream_id,
+            format,
+            sample_rate,
+            channels,
+            channel_layout,
+            bits_per_sample,
+            None,
+        )
+        .await
+    }
+
+    /// Explicit DSD multiplier (64/128/256/512); None preserves PCM behavior.
+    pub async fn propose_format_with_dsd_rate(
+        &mut self,
+        stream_id: &str,
+        format: oaat_core::AudioFormat,
+        sample_rate: u32,
+        channels: u8,
+        channel_layout: oaat_core::ChannelLayout,
+        bits_per_sample: u8,
+        dsd_rate: Option<u16>,
+    ) -> Result<(), OaatError> {
         let msg = Message::FormatPropose(FormatPropose {
             stream_id: stream_id.to_owned(),
             format,
@@ -319,9 +368,50 @@ impl ConnectedEndpoint {
             channels,
             channel_layout,
             bits_per_sample,
-            dsd_rate: None,
+            dsd_rate,
         });
         self.send_message(&msg).await
+    }
+
+    /// Enable XOR parity FEC for this connection. One parity datagram is sent
+    /// after each group of `group_size` audio datagrams.
+    pub fn enable_fec(&mut self, group_size: u8) {
+        self.fec_encoder = Some(oaat_core::fec::FecEncoder::new(group_size));
+    }
+
+    /// Enable optional selective retransmission. The cache is bounded and
+    /// receives NACKs on the controller's existing audio UDP socket.
+    pub fn enable_arq(&mut self) {
+        if self.arq_cache.is_some() {
+            return;
+        }
+        let cache = Arc::new(std::sync::Mutex::new(ArqCache::default()));
+        let socket = self.audio_socket.clone();
+        let peer = self.audio_target;
+        let shared = cache.clone();
+        self.arq_task = Some(tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            loop {
+                let Ok((n, source)) = socket.recv_from(&mut buf).await else {
+                    break;
+                };
+                if source != peer || n != 6 || &buf[..4] != b"GPAN" {
+                    continue;
+                }
+                let seq = u16::from_be_bytes([buf[4], buf[5]]);
+                let packet = shared
+                    .lock()
+                    .ok()
+                    .and_then(|cache| cache.packets.get(&seq).cloned());
+                if let Some(packet) = packet {
+                    let mut reply = Vec::with_capacity(4 + packet.len());
+                    reply.extend_from_slice(b"GPAR");
+                    reply.extend_from_slice(&packet);
+                    let _ = socket.send_to(&reply, peer).await;
+                }
+            }
+        }));
+        self.arq_cache = Some(cache);
     }
 
     pub async fn send_audio(
@@ -333,6 +423,17 @@ impl ConnectedEndpoint {
         payload: &[u8],
         flags: oaat_core::PacketFlags,
     ) -> Result<(), OaatError> {
+        // End-of-stream is not part of a FEC group; flush the last partial
+        // group at the receiver using LAST_PACKET as before.
+        let use_fec = !payload.is_empty();
+        let (fec_group_size, fec_index) = if use_fec {
+            self.fec_encoder
+                .as_ref()
+                .map(|fec| (fec.group_size(), fec.next_index()))
+                .unwrap_or((0, 0))
+        } else {
+            (0, 0)
+        };
         let header = AudioPacketHeader {
             version: AudioPacketHeader::CURRENT_VERSION,
             flags,
@@ -342,8 +443,8 @@ impl ConnectedEndpoint {
             pts_ns,
             sample_offset,
             payload_len: payload.len() as u16,
-            fec_group_size: 0,
-            fec_index: 0,
+            fec_group_size,
+            fec_index,
             fec_len_xor: 0,
         };
         self.sequence = self.sequence.wrapping_add(1);
@@ -355,6 +456,46 @@ impl ConnectedEndpoint {
         buf[AUDIO_HEADER_SIZE..].copy_from_slice(payload);
 
         self.audio_socket.send_to(&buf, self.audio_target).await?;
+        if let Some(cache) = &self.arq_cache {
+            if let Ok(mut cache) = cache.lock() {
+                cache.insert(header.sequence, buf);
+            }
+        }
+
+        // Parity packets consume sequence numbers, just like Zone's FEC
+        // implementation. Keep the encoder state on this connection only.
+        if use_fec
+            && let Some(ref mut fec) = self.fec_encoder
+            && let Some(parity) = fec.feed(payload)
+        {
+            let parity_header = AudioPacketHeader {
+                version: AudioPacketHeader::CURRENT_VERSION,
+                flags: oaat_core::PacketFlags::FEC,
+                format,
+                sequence: self.sequence,
+                stream_id,
+                pts_ns,
+                sample_offset,
+                payload_len: parity.payload.len() as u16,
+                fec_group_size,
+                fec_index: 0,
+                fec_len_xor: parity.len_xor,
+            };
+            self.sequence = self.sequence.wrapping_add(1);
+            let mut parity_buf = vec![0u8; AUDIO_HEADER_SIZE + parity.payload.len()];
+            let mut parity_hdr_buf = [0u8; AUDIO_HEADER_SIZE];
+            parity_header.encode(&mut parity_hdr_buf);
+            parity_buf[..AUDIO_HEADER_SIZE].copy_from_slice(&parity_hdr_buf);
+            parity_buf[AUDIO_HEADER_SIZE..].copy_from_slice(&parity.payload);
+            self.audio_socket
+                .send_to(&parity_buf, self.audio_target)
+                .await?;
+            if let Some(cache) = &self.arq_cache {
+                if let Ok(mut cache) = cache.lock() {
+                    cache.insert(parity_header.sequence, parity_buf);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -467,5 +608,40 @@ impl ConnectedEndpoint {
     /// Returns `false` once the endpoint has disconnected or the reader errored out.
     pub fn is_reader_alive(&self) -> bool {
         !self.reader_task.is_finished()
+    }
+}
+
+/// Bounded retransmission cache: 4096 datagrams, no unbounded allocations.
+#[derive(Default)]
+struct ArqCache {
+    packets: HashMap<u16, Vec<u8>>,
+    order: VecDeque<u16>,
+}
+impl ArqCache {
+    fn insert(&mut self, seq: u16, packet: Vec<u8>) {
+        if !self.packets.contains_key(&seq) {
+            self.order.push_back(seq);
+        }
+        self.packets.insert(seq, packet);
+        while self.order.len() > 4096 {
+            if let Some(old) = self.order.pop_front() {
+                self.packets.remove(&old);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod gp_arq_tests {
+    use super::*;
+    #[test]
+    fn cache_bounded_and_wrap_safe() {
+        let mut cache = ArqCache::default();
+        for i in 0..5000u32 {
+            cache.insert(i as u16, vec![i as u8]);
+        }
+        assert_eq!(cache.packets.len(), 4096);
+        assert!(cache.packets.get(&0).is_none());
+        assert!(cache.packets.get(&4999).is_some());
     }
 }

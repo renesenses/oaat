@@ -2,7 +2,7 @@ use std::f64::consts::PI;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -14,18 +14,24 @@ use oaat_core::wire::PacketFlags;
 use oaat_endpoint::discovery::EndpointAnnouncement;
 use oaat_endpoint::sync::{PtsTracker, SharedClock};
 use oaat_endpoint::transport::{PlaybackCommand, VolumeCommand};
+#[cfg(feature = "web-ui")]
+use oaat_endpoint::web_ui;
 #[cfg(target_os = "linux")]
 use oaat_endpoint::{AlsaDirectOutput, EndpointConfig, EndpointEvent, EndpointTransport};
 #[cfg(not(target_os = "linux"))]
 use oaat_endpoint::{CpalOutput, EndpointConfig, EndpointEvent, EndpointTransport};
-#[cfg(feature = "web-ui")]
-use oaat_endpoint::web_ui;
 
 mod config;
+mod file_audio;
 use config::EndpointFileConfig;
 
 const PID_FILE: &str = "/tmp/tune-bridge.pid";
 const DEFAULT_WEB_UI_PORT: u16 = 9741;
+
+/// Compute the remaining pacing time without panicking when the sender is late.
+fn remaining_pacing_time(expected: Duration, elapsed: Duration) -> Duration {
+    expected.saturating_sub(elapsed)
+}
 
 #[derive(Parser)]
 #[command(
@@ -38,6 +44,16 @@ const DEFAULT_WEB_UI_PORT: u16 = 9741;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum DsdMode {
+    /// Probe the ALSA device and enable native DSD only when supported (default)
+    Auto,
+    /// Require native DSD; exit if ALSA does not support it
+    On,
+    /// Do not advertise or enable native DSD
+    Off,
 }
 
 #[derive(Subcommand)]
@@ -71,10 +87,18 @@ enum Command {
         /// Web UI port (default: 9741, or [web_ui] port)
         #[arg(long)]
         web_port: Option<u16>,
-        /// Advertise native DSD and play via ALSA DSD_U32_BE (USB DACs).
-        /// Opt-in: without this flag (or config dsd=true) behaviour is unchanged.
-        #[arg(long)]
-        dsd: bool,
+        /// Native DSD policy: auto (default), on (require support), off (disable).
+        /// Current ALSA backend supports DSD_U32_BE only.
+        #[arg(long, value_enum, default_value_t = DsdMode::Auto)]
+        dsd: DsdMode,
+        /// ALSA buffer target in milliseconds (100..=4000; default 500).
+        /// Overrides GP_OAAT_ALSA_BUFFER_US.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(100..=4000))]
+        alsa_buffer_ms: Option<u32>,
+        /// ALSA period target in milliseconds (5..=250; default 25).
+        /// Overrides GP_OAAT_ALSA_PERIOD_US.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(5..=250))]
+        alsa_period_ms: Option<u32>,
     },
 
     /// Start an OAAT controller and stream audio (file or sine wave)
@@ -85,7 +109,7 @@ enum Command {
         /// Connect directly to this address instead of using mDNS
         #[arg(short, long)]
         target: Option<SocketAddr>,
-        /// Audio file to stream (WAV or FLAC)
+        /// Audio file to stream (WAV, FLAC or DSF)
         #[arg(short, long)]
         file: Option<String>,
         /// Sine wave frequency in Hz (used when no --file)
@@ -97,6 +121,19 @@ enum Command {
         /// Enable TLS 1.3 on the control channel (TOFU client)
         #[arg(long)]
         tls: bool,
+        /// XOR FEC parity: one recovery packet per N audio packets (2..=16).
+        /// Disabled by default; works with --file and the sine generator.
+        #[arg(long, value_parser = clap::value_parser!(u8).range(2..=16))]
+        fec: Option<u8>,
+        /// Opt-in UDP selective retransmission (requires updated endpoint).
+        #[arg(long)]
+        arq: bool,
+        /// Opt-in receiver reordering delay (ms; 0 keeps upstream behavior).
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=250))]
+        jitter_buffer_ms: u32,
+        /// Opt-in adaptive jitter buffer (requires --jitter-buffer-ms > 0).
+        #[arg(long, requires = "jitter_buffer_ms")]
+        adaptive_buffer: bool,
     },
 
     /// Multi-room: stream synchronized audio to multiple endpoints
@@ -157,11 +194,30 @@ fn system_hostname() -> String {
 
 fn main() {
     let cli = Cli::parse();
+    // Configure environment before Tokio creates worker threads.
+    if let Command::Endpoint {
+        alsa_buffer_ms,
+        alsa_period_ms,
+        ..
+    } = &cli.command
+    {
+        if let Some(ms) = alsa_buffer_ms {
+            unsafe { std::env::set_var("GP_OAAT_ALSA_BUFFER_US", (ms * 1000).to_string()) };
+        }
+        if let Some(ms) = alsa_period_ms {
+            unsafe { std::env::set_var("GP_OAAT_ALSA_PERIOD_US", (ms * 1000).to_string()) };
+        }
+    }
 
     // Daemon mode must fork BEFORE the tokio runtime exists: fork() only copies
     // the calling thread, so a child forked under #[tokio::main] has no worker
     // threads (no control port, hung web UI, SIGTERM ignored) (#52).
-    if let Command::Endpoint { daemon: true, list_devices: false, .. } = &cli.command {
+    if let Command::Endpoint {
+        daemon: true,
+        list_devices: false,
+        ..
+    } = &cli.command
+    {
         daemonize();
     }
 
@@ -210,6 +266,8 @@ async fn run(cli: Cli) {
             no_web_ui,
             web_port,
             dsd,
+            alsa_buffer_ms: _,
+            alsa_period_ms: _,
         } => {
             if list_devices {
                 #[cfg(not(target_os = "linux"))]
@@ -218,7 +276,11 @@ async fn run(cli: Cli) {
                     let default = oaat_endpoint::CpalOutput::default_device_name();
                     println!("Available audio output devices:\n");
                     for d in &devices {
-                        let marker = if Some(d.as_str()) == default.as_deref() { " (default)" } else { "" };
+                        let marker = if Some(d.as_str()) == default.as_deref() {
+                            " (default)"
+                        } else {
+                            ""
+                        };
                         println!("  {d}{marker}");
                     }
                     if devices.is_empty() {
@@ -238,8 +300,14 @@ async fn run(cli: Cli) {
                     println!("\nUsable names for --audio-device:");
                     for d in &devices {
                         if let Some(card) = d.split(':').next()
-                            && card.strip_prefix("card ").or_else(|| card.strip_prefix("carte ")).is_some()
-                            && let Some(short_name) = d.split(':').nth(1).and_then(|s| s.split_whitespace().next())
+                            && card
+                                .strip_prefix("card ")
+                                .or_else(|| card.strip_prefix("carte "))
+                                .is_some()
+                            && let Some(short_name) = d
+                                .split(':')
+                                .nth(1)
+                                .and_then(|s| s.split_whitespace().next())
                         {
                             println!("  sysdefault:CARD={short_name}");
                         }
@@ -270,19 +338,42 @@ async fn run(cli: Cli) {
             let ep_port = port.unwrap_or(file_config.endpoint.port);
 
             // Audio device: CLI > config > auto-detect USB DAC
-            let ep_audio_device = audio_device.or(file_config.endpoint.audio_device).or_else(|| {
-                #[cfg(not(target_os = "linux"))]
-                { CpalOutput::auto_detect_usb_dac() }
-                #[cfg(target_os = "linux")]
-                { AlsaDirectOutput::auto_detect_usb_dac() }
-            });
+            let ep_audio_device =
+                audio_device
+                    .or(file_config.endpoint.audio_device)
+                    .or_else(|| {
+                        #[cfg(not(target_os = "linux"))]
+                        {
+                            CpalOutput::auto_detect_usb_dac()
+                        }
+                        #[cfg(target_os = "linux")]
+                        {
+                            AlsaDirectOutput::auto_detect_usb_dac()
+                        }
+                    });
 
             let ep_tls = tls || file_config.endpoint.tls;
             let ep_web_port = web_port.unwrap_or(file_config.web_ui.port);
             let ep_web_ui = !no_web_ui && file_config.web_ui.enabled;
             let ep_web_addr = SocketAddr::new(file_config.web_ui.bind, ep_web_port);
-            // CLI --dsd ORs with config [capabilities] dsd = true
-            let ep_dsd = dsd || file_config.capabilities.dsd;
+            // CLI DSD policy takes precedence over legacy [capabilities] dsd.
+            // Auto probes ALSA regardless of the legacy opt-in setting.
+            let ep_dsd = dsd != DsdMode::Off;
+            if dsd == DsdMode::On {
+                #[cfg(target_os = "linux")]
+                if AlsaDirectOutput::dsd_max_multiplier(ep_audio_device.as_deref()).is_none() {
+                    eprintln!(
+                        "DSD mode 'on' requires native ALSA DSD support; device rejected DSD_U32_BE"
+                    );
+                    std::process::exit(2);
+                }
+            }
+            info!(
+                dsd_mode = ?dsd,
+                alsa_buffer_us = ?std::env::var("GP_OAAT_ALSA_BUFFER_US").ok(),
+                alsa_period_us = ?std::env::var("GP_OAAT_ALSA_PERIOD_US").ok(),
+                "endpoint audio policy"
+            );
 
             run_endpoint(
                 ep_name,
@@ -312,11 +403,24 @@ async fn run(cli: Cli) {
             freq,
             duration,
             tls,
+            fec,
+            arq,
+            jitter_buffer_ms,
+            adaptive_buffer,
         } => {
+            if adaptive_buffer && jitter_buffer_ms == 0 {
+                eprintln!("--adaptive-buffer requires --jitter-buffer-ms greater than zero");
+                return;
+            }
+            let reliability = ReliabilityOptions {
+                arq,
+                jitter_buffer_ms,
+                adaptive_buffer,
+            };
             if let Some(ref path) = file {
-                run_controller_file(name, target, path, tls).await
+                run_controller_file(name, target, path, tls, fec, reliability).await
             } else {
-                run_controller(name, target, freq, duration, tls).await
+                run_controller(name, target, freq, duration, tls, fec, reliability).await
             }
         }
         Command::Multiroom {
@@ -333,7 +437,13 @@ async fn run(cli: Cli) {
 fn load_or_create_endpoint_id(name: &str) -> String {
     let slug: String = name
         .chars()
-        .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
         .collect();
     let id_file = std::path::PathBuf::from(format!("/var/tmp/oaat-{slug}.id"));
 
@@ -383,14 +493,19 @@ async fn run_endpoint(
     let available_devices;
     {
         #[cfg(target_os = "linux")]
-        { available_devices = AlsaDirectOutput::list_devices(); }
+        {
+            available_devices = AlsaDirectOutput::list_devices();
+        }
         #[cfg(not(target_os = "linux"))]
-        { available_devices = CpalOutput::list_devices(); }
+        {
+            available_devices = CpalOutput::list_devices();
+        }
         for (i, dname) in available_devices.iter().enumerate() {
             info!(index = i, device = %dname, "audio_device_available");
         }
         #[cfg(target_os = "linux")]
-        let default_name = AlsaDirectOutput::default_device_name().unwrap_or_else(|| "(none)".into());
+        let default_name =
+            AlsaDirectOutput::default_device_name().unwrap_or_else(|| "(none)".into());
         #[cfg(not(target_os = "linux"))]
         let default_name = CpalOutput::default_device_name().unwrap_or_else(|| "(none)".into());
         info!(default = %default_name, "audio_device_default");
@@ -468,7 +583,14 @@ async fn run_endpoint(
         endpoint_id: endpoint_id.clone(),
         capabilities: mdns_caps,
         channels_max: caps_config.channels_max,
-        volume_type: Some(if dac_config.hardware_volume { "hw" } else { "sw" }.into()),
+        volume_type: Some(
+            if dac_config.hardware_volume {
+                "hw"
+            } else {
+                "sw"
+            }
+            .into(),
+        ),
         model: None,
         vendor: Some("MozAIk Labs".into()),
         firmware: Some(env!("CARGO_PKG_VERSION").into()),
@@ -692,6 +814,7 @@ async fn run_endpoint(
                 // Periodic health report to the controller (RFC §6.6/§7.3).
                 if started && servo_ticks.is_multiple_of(5) && !current_stream_id.is_empty() {
                     let (lost, recovered) = clock.link_stats();
+                    let (arq_requested, arq_recovered, arq_timeout, jitter_buffer_ms) = clock.arq_stats();
                     let drift_us = if let (Some(t), Some(frames)) = (tracker.as_ref(), audio.content_position()) {
                         let now = if tracker_is_controller_domain {
                             clock.local_to_controller(now_ns())
@@ -713,6 +836,7 @@ async fn run_endpoint(
                             packets_recovered: recovered,
                             bit_perfect: audio.bit_perfect_path(),
                             underruns: audio.underrun_count(),
+                            arq_requested, arq_recovered, arq_timeout, jitter_buffer_ms,
                         }))
                         .await;
                 }
@@ -1296,7 +1420,11 @@ impl HookRunner {
             .name("hooks".into())
             .spawn(move || {
                 for event in rx {
-                    let cmd = if event == "start" { &on_start } else { &on_stop };
+                    let cmd = if event == "start" {
+                        &on_start
+                    } else {
+                        &on_stop
+                    };
                     let Some(cmd) = cmd else { continue };
                     match std::process::Command::new("/bin/sh")
                         .arg("-c")
@@ -1320,12 +1448,37 @@ impl HookRunner {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ReliabilityOptions {
+    arq: bool,
+    jitter_buffer_ms: u32,
+    adaptive_buffer: bool,
+}
+
+impl ReliabilityOptions {
+    fn features(self) -> Vec<String> {
+        let mut features = Vec::new();
+        if self.arq {
+            features.push("gp_arq_v1".to_owned());
+        }
+        if self.jitter_buffer_ms > 0 {
+            features.push(format!("gp_jitter_ms={}", self.jitter_buffer_ms));
+        }
+        if self.adaptive_buffer {
+            features.push("gp_adaptive_v1".to_owned());
+        }
+        features
+    }
+}
+
 async fn run_controller(
     name: String,
     target: Option<SocketAddr>,
     freq: f64,
     duration: u64,
     tls: bool,
+    fec: Option<u8>,
+    reliability: ReliabilityOptions,
 ) {
     let controller_id = uuid::Uuid::new_v4().to_string();
     let endpoint_addr = match target {
@@ -1357,7 +1510,11 @@ async fn run_controller(
     let config = ControllerConfig {
         controller_id,
         controller_name: name.clone(),
-        features: vec![oaat_core::message::FEATURE_ENDPOINT_RELEASE.into()],
+        features: {
+            let mut f = vec![oaat_core::message::FEATURE_ENDPOINT_RELEASE.into()];
+            f.extend(reliability.features());
+            f
+        },
         clock_port,
         tls,
     };
@@ -1371,6 +1528,19 @@ async fn run_controller(
         }
     };
 
+    if reliability.arq && !endpoint.info.features.iter().any(|f| f == "gp_arq_v1") {
+        eprintln!("Endpoint does not support GP ARQ; update the endpoint binary");
+        return;
+    }
+    if reliability.jitter_buffer_ms > 0
+        && !endpoint.info.features.iter().any(|f| f == "gp_jitter_v1")
+    {
+        eprintln!("Endpoint does not support GP jitter buffer; update the endpoint binary");
+        return;
+    }
+    if reliability.arq {
+        endpoint.enable_arq();
+    }
     println!(
         "Connected to '{}' ({})",
         endpoint.info.endpoint_name, endpoint.info.endpoint_id
@@ -1381,6 +1551,11 @@ async fn run_controller(
         endpoint.info.capabilities.pcm_max_bits,
         endpoint.info.capabilities.channels_max
     );
+
+    if let Some(group_size) = fec {
+        endpoint.enable_fec(group_size);
+        println!("FEC enabled: 1 parity packet per {group_size} data packets");
+    }
 
     // Clock sync
     println!("\nClock sync...");
@@ -1443,7 +1618,10 @@ async fn run_controller(
         // endpoint_release (RFC §7.3.1): the endpoint gave up its output,
         // pause here instead of streaming into the void.
         if let Ok(r) = endpoint.release_rx.try_recv() {
-            println!("\nEndpoint released its output ({:?}), stream paused.", r.reason);
+            println!(
+                "\nEndpoint released its output ({:?}), stream paused.",
+                r.reason
+            );
             return;
         }
         let chunk = samples_per_packet.min((total_samples - sample_offset) as usize);
@@ -1473,8 +1651,9 @@ async fn run_controller(
         let expected =
             Duration::from_nanos((sample_offset as f64 / sample_rate as f64 * 1e9) as u64);
         let elapsed = start.elapsed();
-        if expected > elapsed {
-            tokio::time::sleep(expected - elapsed).await;
+        let remaining = remaining_pacing_time(expected, elapsed);
+        if !remaining.is_zero() {
+            tokio::time::sleep(remaining).await;
         }
 
         if sample_offset.is_multiple_of(sample_rate as u64) || sample_offset >= total_samples {
@@ -1554,8 +1733,8 @@ async fn run_controller(
             payload.extend_from_slice(&sample.to_le_bytes());
         }
 
-        let pts_ns = start_ns
-            + ((sample_offset + sample_offset2) as f64 / sample_rate as f64 * 1e9) as u64;
+        let pts_ns =
+            start_ns + ((sample_offset + sample_offset2) as f64 / sample_rate as f64 * 1e9) as u64;
         let flags = if sample_offset2 == 0 {
             PacketFlags::FIRST_PACKET
         } else {
@@ -1579,8 +1758,9 @@ async fn run_controller(
         let expected =
             Duration::from_nanos((sample_offset2 as f64 / sample_rate as f64 * 1e9) as u64);
         let elapsed = start2.elapsed();
-        if expected > elapsed {
-            tokio::time::sleep(expected - elapsed).await;
+        let remaining = remaining_pacing_time(expected, elapsed);
+        if !remaining.is_zero() {
+            tokio::time::sleep(remaining).await;
         }
 
         if sample_offset2.is_multiple_of(sample_rate as u64) || sample_offset2 >= total_samples2 {
@@ -1610,213 +1790,240 @@ async fn run_controller(
     );
 }
 
-async fn run_controller_file(name: String, target: Option<SocketAddr>, path: &str, tls: bool) {
-    let file_data = std::fs::read(path).unwrap_or_else(|e| {
-        eprintln!("Cannot read {path}: {e}");
-        std::process::exit(1);
-    });
-
-    let is_wav =
-        file_data.len() > 44 && &file_data[0..4] == b"RIFF" && &file_data[8..12] == b"WAVE";
-    if !is_wav {
-        eprintln!("Only WAV files are supported for now (got: {path})");
-        std::process::exit(1);
-    }
-
-    // Parse WAV header
-    let channels = u16::from_le_bytes([file_data[22], file_data[23]]) as u8;
-    let sample_rate =
-        u32::from_le_bytes([file_data[24], file_data[25], file_data[26], file_data[27]]);
-    let bits_per_sample = u16::from_le_bytes([file_data[34], file_data[35]]) as u8;
-
-    // Find data chunk
-    let mut data_offset = 12;
-    let mut data_len = 0usize;
-    while data_offset + 8 < file_data.len() {
-        let chunk_id = &file_data[data_offset..data_offset + 4];
-        let chunk_size = u32::from_le_bytes([
-            file_data[data_offset + 4],
-            file_data[data_offset + 5],
-            file_data[data_offset + 6],
-            file_data[data_offset + 7],
-        ]) as usize;
-        if chunk_id == b"data" {
-            data_offset += 8;
-            data_len = chunk_size.min(file_data.len() - data_offset);
-            break;
-        }
-        data_offset += 8 + chunk_size;
-        if !chunk_size.is_multiple_of(2) {
-            data_offset += 1;
-        }
-    }
-
-    if data_len == 0 {
-        eprintln!("No data chunk found in WAV file");
-        std::process::exit(1);
-    }
-
-    let pcm_data = &file_data[data_offset..data_offset + data_len];
-    let bytes_per_sample = (bits_per_sample as usize / 8) * channels as usize;
-    let total_samples = data_len / bytes_per_sample;
-    let duration_s = total_samples as f64 / sample_rate as f64;
-
-    let format = match bits_per_sample {
-        16 => AudioFormat::PcmS16le,
-        24 => AudioFormat::PcmS24le,
-        32 => AudioFormat::PcmS32le,
-        _ => {
-            eprintln!("Unsupported bit depth: {bits_per_sample}");
-            std::process::exit(1);
+async fn run_controller_file(
+    name: String,
+    target: Option<SocketAddr>,
+    path: &str,
+    tls: bool,
+    fec: Option<u8>,
+    reliability: ReliabilityOptions,
+) {
+    use file_audio::AudioFile;
+    let mut source = match AudioFile::open(path) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Cannot open audio file {path}: {e}");
+            return;
         }
     };
-
-    let filename = std::path::Path::new(path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(path);
-
-    println!("File: {path}");
-    println!("  {format} {sample_rate}Hz {channels}ch {bits_per_sample}bit");
-    println!("  Duration: {duration_s:.1}s ({total_samples} samples)\n");
-
-    // Connect
+    let spec = source.spec().clone();
+    println!(
+        "File: {path}\n  {} {}Hz {}ch\n  Duration: {:.1}s",
+        spec.format,
+        spec.rate,
+        spec.channels,
+        spec.duration_s()
+    );
     let controller_id = uuid::Uuid::new_v4().to_string();
     let endpoint_addr = match target {
-        Some(addr) => {
-            println!("Connecting directly to {addr}...");
-            addr
-        }
+        Some(addr) => addr,
         None => {
-            println!("Discovering OAAT endpoints via mDNS...");
             let discovery = ControllerDiscovery::new().expect("failed to create mDNS");
             match discovery.find_first(Duration::from_secs(10)) {
-                Some(ep) => {
-                    println!("Found endpoint '{}' at {}", ep.name, ep.addr);
-                    ep.addr
-                }
+                Some(ep) => ep.addr,
                 None => {
-                    eprintln!("No OAAT endpoints found. Use --target to connect directly.");
+                    eprintln!("No OAAT endpoints found. Use --target.");
                     return;
                 }
             }
         }
     };
-
     let config = ControllerConfig {
         controller_id,
         controller_name: name,
-        features: vec![],
+        features: reliability.features(),
         clock_port: spawn_clock_responder().await,
         tls,
     };
+    // A fresh endpoint instance has no knowledge of the previous stream.
+    // Always repeat handshake, clock sync, format, metadata and PLAY.
+    async fn open_file_session(
+        config: &ControllerConfig,
+        addr: SocketAddr,
+        spec: &file_audio::Spec,
+        filename: &str,
+        fec: Option<u8>,
+        arq: bool,
+    ) -> Result<ConnectedEndpoint, String> {
+        let mut ep = ConnectedEndpoint::connect(config, addr)
+            .await
+            .map_err(|e| format!("connect: {e}"))?;
+        if let Err(e) = ep.clock_sync_bootstrap().await {
+            warn!(error = %e, "clock sync failed");
+        }
+        if arq && !ep.info.features.iter().any(|f| f == "gp_arq_v1") {
+            return Err("endpoint does not support GP ARQ; update endpoint binary".into());
+        }
+        if config
+            .features
+            .iter()
+            .any(|f| f.starts_with("gp_jitter_ms="))
+            && !ep.info.features.iter().any(|f| f == "gp_jitter_v1")
+        {
+            return Err("endpoint does not support GP jitter; update endpoint binary".into());
+        }
+        if let Some(group_size) = fec {
+            ep.enable_fec(group_size);
+        }
+        if arq {
+            ep.enable_arq();
+        }
+        ep.propose_format_with_dsd_rate(
+            "file-stream",
+            spec.format,
+            spec.rate,
+            spec.channels,
+            if spec.channels == 2 {
+                ChannelLayout::Stereo
+            } else {
+                ChannelLayout::Mono
+            },
+            spec.bits,
+            spec.dsd_multiplier,
+        )
+        .await
+        .map_err(|e| format!("format: {e}"))?;
+        ep.send_metadata(TrackMetadata {
+            title: filename.to_string(),
+            artist: "OAAT File Player".into(),
+            album: String::new(),
+            duration_ms: (spec.duration_s() * 1000.0) as u64,
+            artwork_url: None,
+            format: Some(format!("{} {}Hz", spec.format, spec.rate)),
+        })
+        .await
+        .map_err(|e| format!("metadata: {e}"))?;
+        ep.send_play("file-stream")
+            .await
+            .map_err(|e| format!("play: {e}"))?;
+        Ok(ep)
+    }
 
-    let mut endpoint = match ConnectedEndpoint::connect(&config, endpoint_addr).await {
+    if let Some(group_size) = fec {
+        println!("FEC enabled: 1 parity packet per {group_size} data packets");
+    } else {
+        println!("FEC disabled (use --fec 8 to test parity recovery)");
+    }
+    let stream_id = "file-stream";
+    let filename = std::path::Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(path);
+    let mut endpoint = match open_file_session(
+        &config,
+        endpoint_addr,
+        &spec,
+        filename,
+        fec,
+        reliability.arq,
+    )
+    .await
+    {
         Ok(ep) => ep,
         Err(e) => {
             eprintln!("Connection failed: {e}");
             return;
         }
     };
-
-    println!(
-        "Connected to '{}' ({})\n",
-        endpoint.info.endpoint_name, endpoint.info.endpoint_id
-    );
-
-    // Clock sync
-    if let Err(e) = endpoint.clock_sync_bootstrap().await {
-        warn!(error = %e, "clock sync failed");
-    }
-
-    let stream_id = "file-stream";
-    endpoint
-        .propose_format(
-            stream_id,
-            format,
-            sample_rate,
-            channels,
-            ChannelLayout::Stereo,
-            bits_per_sample,
-        )
-        .await
-        .unwrap();
-
-    endpoint
-        .send_metadata(TrackMetadata {
-            title: filename.to_string(),
-            artist: "OAAT File Player".into(),
-            album: String::new(),
-            duration_ms: (duration_s * 1000.0) as u64,
-            artwork_url: None,
-            format: Some(format!("PCM {bits_per_sample}/{}", sample_rate / 1000)),
-        })
-        .await
-        .unwrap();
-
-    endpoint.send_play(stream_id).await.unwrap();
-    println!("Streaming {filename}...\n");
-
-    let samples_per_packet = 360;
-    let packet_bytes = samples_per_packet * bytes_per_sample;
-    let mut offset = 0usize;
-    let mut sample_offset: u64 = 0;
-    let start = std::time::Instant::now();
+    let mut start_ns = now_ns() + 500_000_000;
+    let mut start = std::time::Instant::now();
+    let mut frame_offset = 0u64;
+    let mut first = true;
+    let mut session_start_frame = 0u64;
     let mut last_print = 0u64;
-    // Absolute PTS: frame 0 hits the DAC 200 ms from now (RFC §6.4).
-    let start_ns = now_ns() + 200_000_000;
-
-    while offset < data_len {
-        let chunk_bytes = packet_bytes.min(data_len - offset);
-        let chunk_samples = chunk_bytes / bytes_per_sample;
-        let payload = &pcm_data[offset..offset + chunk_bytes];
-
-        let pts_ns = start_ns + (sample_offset as f64 / sample_rate as f64 * 1e9) as u64;
-        let flags = if offset == 0 {
-            PacketFlags::FIRST_PACKET
-        } else {
-            PacketFlags::empty()
+    // Keep the signal handlers polled throughout streaming, pacing, network I/O
+    // and reconnect attempts. Dropping the streaming future cancels any wait.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("failed to register SIGTERM handler");
+    let interrupted = tokio::select! {
+        _ = tokio::signal::ctrl_c() => true,
+        _ = sigterm.recv() => true,
+        _ = async {
+    loop {
+        let payload = match source.next_packet(4096) {
+            Ok(Some(p)) => p,
+            Ok(None) => break,
+            Err(e) => { eprintln!("Read error: {e}"); break; }
         };
-
-        endpoint
-            .send_audio(1, format, pts_ns, sample_offset, payload, flags)
-            .await
-            .unwrap();
-
-        offset += chunk_bytes;
-        sample_offset += chunk_samples as u64;
-
-        // Real-time pacing: sleep until the audio clock catches up
-        let expected =
-            Duration::from_nanos((sample_offset as f64 / sample_rate as f64 * 1e9) as u64);
-        let elapsed = start.elapsed();
-        if expected > elapsed {
-            tokio::time::sleep(expected - elapsed).await;
+        let frames = payload.len() / spec.frame_bytes();
+        if frames == 0 { continue; }
+        // A remote reboot closes TCP but does not necessarily make UDP send_to fail.
+        // Keep the current payload and its frame offset until a live session exists.
+        loop {
+            if endpoint.is_disconnected() {
+                eprintln!("Endpoint disconnected at frame {frame_offset}; pausing stream");
+                let mut attempt = 0u64;
+                loop {
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    match open_file_session(&config, endpoint_addr, &spec, filename, fec, reliability.arq).await {
+                        Ok(ep) => {
+                            endpoint = ep;
+                            first = true;
+                            // Rebase timestamps and pacing on the remaining part
+                            // of the file; never catch up by skipping audio.
+                            start_ns = now_ns() + 500_000_000;
+                            start = std::time::Instant::now();
+                            session_start_frame = frame_offset;
+                            eprintln!("Endpoint reconnected after {attempt} attempt(s); resuming at frame {frame_offset}");
+                            break;
+                        }
+                        Err(e) => eprintln!("Reconnect attempt {attempt} failed: {e}"),
+                    }
+                }
+            }
+            let pts_ns = start_ns + spec.elapsed_ns(frame_offset - session_start_frame);
+            let flags = if first { PacketFlags::FIRST_PACKET } else { PacketFlags::empty() };
+            match endpoint.send_audio(1, spec.format, pts_ns, frame_offset, &payload, flags).await {
+                Ok(()) => {
+                    // A concurrent TCP disconnect may be observed just after UDP
+                    // succeeds; no per-packet playback acknowledgement exists.
+                    first = false;
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("Audio send failed (retrying after reconnect): {e}");
+                    // Force a new session rather than advancing the file.
+                    endpoint.disconnect_reader();
+                }
+            }
         }
-
-        let secs = sample_offset / sample_rate as u64;
-        let total_secs = duration_s as u64;
-        if secs >= last_print + 5 || offset >= data_len {
-            last_print = secs;
-            let pct = (offset as f64 / data_len as f64 * 100.0) as u32;
-            println!("  {secs}s / {total_secs}s ({pct}%)");
+        frame_offset += frames as u64;
+        let expected = Duration::from_nanos(spec.elapsed_ns(frame_offset - session_start_frame));
+        let remaining = remaining_pacing_time(expected, start.elapsed());
+        if !remaining.is_zero() {
+            tokio::time::sleep(remaining).await;
+        }
+        let secs = spec.elapsed_ns(frame_offset) / 1_000_000_000;
+        if secs >= last_print + 5 {
+            println!("  {secs}s / {:.0}s", spec.duration_s()); last_print = secs;
         }
     }
-
-    endpoint
-        .send_audio(
-            1,
-            format,
-            start_ns + (sample_offset as f64 / sample_rate as f64 * 1e9) as u64,
-            sample_offset,
-            &[],
-            PacketFlags::LAST_PACKET,
+        } => false,
+    };
+    if interrupted {
+        eprintln!("Shutdown requested; stopping file stream at frame {frame_offset}");
+    } else {
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            endpoint.send_audio(
+                1,
+                spec.format,
+                start_ns + spec.elapsed_ns(frame_offset - session_start_frame),
+                frame_offset,
+                &[],
+                PacketFlags::LAST_PACKET,
+            ),
         )
-        .await
-        .unwrap();
-
-    endpoint.send_stop(stream_id).await.unwrap();
-    println!("\nDone. {sample_offset} samples sent ({duration_s:.1}s).");
+        .await;
+    }
+    // Never let a stuck control connection prevent Ctrl+C / SIGTERM exit.
+    let _ = tokio::time::timeout(Duration::from_secs(2), endpoint.send_stop(stream_id)).await;
+    if interrupted {
+        println!("Stopped. {} frames transmitted.", frame_offset);
+    } else {
+        println!("Done. {} frames transmitted.", frame_offset);
+    }
 }
 
 async fn run_multiroom(
@@ -1948,8 +2155,9 @@ async fn run_multiroom(
         let expected =
             Duration::from_nanos((sample_offset as f64 / sample_rate as f64 * 1e9) as u64);
         let elapsed = start.elapsed();
-        if expected > elapsed {
-            tokio::time::sleep(expected - elapsed).await;
+        let remaining = remaining_pacing_time(expected, elapsed);
+        if !remaining.is_zero() {
+            tokio::time::sleep(remaining).await;
         }
 
         if sample_offset.is_multiple_of(sample_rate as u64) || sample_offset >= total_samples {
@@ -1984,7 +2192,11 @@ fn now_ns() -> u64 {
 /// ephemeral one. Returns 0 (announced as "no responder") if binding fails.
 async fn spawn_clock_responder() -> u16 {
     match ClockResponder::spawn(
-        (std::net::Ipv4Addr::UNSPECIFIED, oaat_core::DEFAULT_CLOCK_PORT).into(),
+        (
+            std::net::Ipv4Addr::UNSPECIFIED,
+            oaat_core::DEFAULT_CLOCK_PORT,
+        )
+            .into(),
     )
     .await
     {
@@ -2025,4 +2237,46 @@ fn run_discover(timeout: u64) {
     }
 
     let _ = discovery.shutdown();
+}
+
+#[cfg(test)]
+mod timing_regression_tests {
+    use super::remaining_pacing_time;
+    use std::time::Duration;
+
+    #[test]
+    fn returns_remaining_time_when_ahead_of_schedule() {
+        assert_eq!(
+            remaining_pacing_time(Duration::from_millis(100), Duration::from_millis(40)),
+            Duration::from_millis(60)
+        );
+    }
+
+    #[test]
+    fn returns_zero_at_deadline() {
+        assert_eq!(
+            remaining_pacing_time(Duration::from_millis(100), Duration::from_millis(100)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn returns_zero_when_late_instead_of_panicking() {
+        assert_eq!(
+            remaining_pacing_time(Duration::from_millis(100), Duration::from_millis(150)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn handles_zero_and_maximum_duration() {
+        assert_eq!(
+            remaining_pacing_time(Duration::ZERO, Duration::from_nanos(1)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            remaining_pacing_time(Duration::MAX, Duration::ZERO),
+            Duration::MAX
+        );
+    }
 }
