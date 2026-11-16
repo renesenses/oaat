@@ -367,8 +367,21 @@ impl AlsaDirectOutput {
     /// pipe did, so the end of a track is not cut), then release the device.
     /// When this returns the ALSA device is closed. Nothing is reopened until
     /// the next `configure()`.
+    /// Stop once the queued audio has played, so the end of a track is not
+    /// cut. For a stream the controller closed with `LAST_PACKET`, where
+    /// the queue is the tail of the track. Any other stop is the user's:
+    /// see [`Self::stop_now`].
     pub fn stop(&mut self) {
         self.shutdown(false);
+    }
+
+    /// Stop now, dropping what is queued: "stop and flush buffer"
+    /// (RFC §6.4), and what the 500 ms of the TCP-drop rule need.
+    ///
+    /// Playing the queue out costs the whole ALSA buffer — 2 s on a
+    /// Raspberry Pi — between the user's click and silence.
+    pub fn stop_now(&mut self) {
+        self.shutdown(true);
     }
 
     /// Give up the device now (endpoint_release): unlike `stop()`, queued
@@ -1513,6 +1526,28 @@ mod tests {
         let tail = &expected[expected.len() - 4096..];
         assert!(st.written.ends_with(tail), "decoding went on to the end of the stream");
         assert_eq!(out.underrun_count(), 0);
+    }
+
+    /// `stop_now` is "stop and flush buffer" (RFC §6.4): the queue goes,
+    /// so the sound ends with the click instead of playing out the ~2 s
+    /// the device holds. Its counterpart, `stop()`, is covered by
+    /// `flac_is_decoded_in_process_and_stop_releases_the_device`.
+    #[test]
+    fn stop_now_drops_what_is_queued() {
+        let (st, opener) = fake();
+        let mut out = AlsaDirectOutput::with_opener(opener);
+        out.configure(AudioFormat::PcmS16le, 48_000, 2).unwrap();
+        out.play();
+        for _ in 0..40 {
+            out.write_audio(&[0u8; 480 * 4]);
+        }
+        out.stop_now();
+        let st = st.lock().unwrap();
+        assert_eq!(
+            (st.discards, st.drains),
+            (1, 0),
+            "stop_now must discard the queued audio, not play it out"
+        );
     }
 
     /// An underrun is recovered in place with `prepare`: the device is not

@@ -613,6 +613,7 @@ async fn run_endpoint(
     //        controller clock domain (absolute PTS) or local domain (fallback).
     let mut armed = false;
     let mut started = false;
+    let mut fin_de_flux = FinDeFlux::default();
     let mut start_deadline: Option<tokio::time::Instant> = None;
     let mut tracker: Option<PtsTracker> = None;
     let mut tracker_is_controller_domain = false;
@@ -835,6 +836,7 @@ async fn run_endpoint(
                         // configure() tears down the stream: reset scheduling state.
                         armed = false;
                         started = false;
+                        fin_de_flux.nouveau_flux();
                         start_deadline = None;
                         tracker = None;
                         last_drift = 0;
@@ -890,6 +892,7 @@ async fn run_endpoint(
                         // Sampled before writing this packet (in frames):
                         // needed to relate this packet's PTS to the ring head.
                         let buffered_frames_before = audio.buffer_level() as u64;
+                        fin_de_flux.paquet(header.flags);
                         if !payload.is_empty() && !released {
                             audio.write_audio(&payload);
                         }
@@ -1033,7 +1036,16 @@ async fn run_endpoint(
                                     total_bytes as f64 / 1024.0
                                 );
                             }
-                            audio.stop();
+                            // A stream closed with LAST_PACKET ends on its
+                            // own tail; any other stop is the user's, and
+                            // waiting out the buffer put ~2 s between the
+                            // click and silence.
+                            if fin_de_flux.flux_termine() {
+                                audio.stop();
+                            } else {
+                                audio.stop_now();
+                            }
+                            fin_de_flux.nouveau_flux();
                             armed = false;
                             started = false;
                             start_deadline = None;
@@ -1205,7 +1217,13 @@ async fn run_endpoint(
                         }
                     }
                     EndpointEvent::Disconnected => {
-                        audio.stop();
+                        // "If it drops, the Endpoint MUST stop playback
+                        // within 500 ms" (RFC §4.2): playing the queue out
+                        // took the whole buffer, ~2 s on a Raspberry Pi.
+                        // A controller that tears the session down without
+                        // sending `stop` lands here, so this is the path a
+                        // user's stop takes with such a controller.
+                        audio.stop_now();
                         connected = false;
                         released = false;
                         if output_in_use {
@@ -1274,7 +1292,7 @@ async fn run_endpoint(
             }
             _ = &mut sigint => {
                 info!("Tune Bridge shutting down gracefully");
-                audio.stop();
+                audio.stop_now();
                 mdns_keepalive.stop();
                 let _ = mdns.shutdown();
                 remove_pid_file();
@@ -1282,7 +1300,7 @@ async fn run_endpoint(
             }
             _ = sigterm.recv() => {
                 info!("Tune Bridge shutting down gracefully (SIGTERM)");
-                audio.stop();
+                audio.stop_now();
                 mdns_keepalive.stop();
                 let _ = mdns.shutdown();
                 remove_pid_file();
@@ -2035,4 +2053,75 @@ fn run_discover(timeout: u64) {
     }
 
     let _ = discovery.shutdown();
+}
+
+/// Whether the controller has closed the current stream with `LAST_PACKET`,
+/// which decides what a `stop` means: play out the tail of the track, or
+/// flush it (RFC §6.4, "stop and flush buffer").
+///
+/// Only the LAST packet counts, not any earlier one. In gapless the
+/// controller closes a track with `LAST_PACKET` and keeps streaming the
+/// next one on the same stream: a flag merely set once would still be set
+/// mid-next-track, and the user's stop would wait out the whole buffer.
+#[derive(Default)]
+struct FinDeFlux {
+    termine: bool,
+}
+
+impl FinDeFlux {
+    /// A new negotiation: nothing closed yet.
+    fn nouveau_flux(&mut self) {
+        self.termine = false;
+    }
+
+    /// An audio packet arrived.
+    fn paquet(&mut self, flags: PacketFlags) {
+        self.termine = flags.contains(PacketFlags::LAST_PACKET);
+    }
+
+    /// The stream ended on its own: a `stop` plays out what is queued.
+    fn flux_termine(&self) -> bool {
+        self.termine
+    }
+}
+
+#[cfg(test)]
+mod fin_de_flux_tests {
+    use super::*;
+
+    #[test]
+    fn seul_le_dernier_paquet_compte() {
+        let mut f = FinDeFlux::default();
+        assert!(!f.flux_termine(), "rien n'a encore été envoyé");
+        f.paquet(PacketFlags::FIRST_PACKET);
+        f.paquet(PacketFlags::empty());
+        assert!(!f.flux_termine(), "le flux est en cours : stop doit vider");
+        f.paquet(PacketFlags::LAST_PACKET);
+        assert!(
+            f.flux_termine(),
+            "le flux est clos : stop doit jouer la fin"
+        );
+    }
+
+    #[test]
+    fn le_gapless_rouvre_le_flux() {
+        let mut f = FinDeFlux::default();
+        f.paquet(PacketFlags::LAST_PACKET);
+        // La piste suivante enchaîne sur le même flux, sans renégociation.
+        f.paquet(PacketFlags::empty());
+        assert!(
+            !f.flux_termine(),
+            "après un enchaînement gapless, un stop utilisateur doit vider, pas attendre"
+        );
+        f.paquet(PacketFlags::LAST_PACKET);
+        assert!(f.flux_termine());
+    }
+
+    #[test]
+    fn une_renegociation_rouvre_le_flux() {
+        let mut f = FinDeFlux::default();
+        f.paquet(PacketFlags::LAST_PACKET);
+        f.nouveau_flux();
+        assert!(!f.flux_termine());
+    }
 }
