@@ -522,6 +522,13 @@ impl CpalOutput {
         self.stop();
     }
 
+    /// Stop now, dropping what is queued (RFC §6.4). Same as `stop()`
+    /// here: cpal's ring is a few tens of milliseconds, so there is no
+    /// tail to play out either way.
+    pub fn stop_now(&mut self) {
+        self.stop();
+    }
+
     /// True between `play()` and `pause()`/`stop()`/`release()`.
     pub fn is_playing(&self) -> bool {
         self.playing.load(Ordering::Relaxed)
