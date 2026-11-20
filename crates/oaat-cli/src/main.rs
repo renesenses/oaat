@@ -408,10 +408,8 @@ async fn run_endpoint(
     if caps_config.flac {
         formats.push(AudioFormat::Flac);
     }
-    // Highest native DSD rate announced: what the hw: device accepts in
-    // DSD_U32_BE (probed once, here). None when the device refuses DSD or
-    // cannot be probed: no DSD format is announced and the server converts
-    // DSD to PCM (#62).
+    // Raw DSD on the wire; Linux selects a probed native ALSA format or
+    // a DoP carrier on the explicitly DSD-enabled DAC. Re-probed at open.
     let dsd_max: Option<u16> = if enable_dsd {
         #[cfg(target_os = "linux")]
         let max = AlsaDirectOutput::dsd_max_multiplier(audio_device.as_deref());
@@ -423,7 +421,7 @@ async fn run_endpoint(
             formats.push(AudioFormat::DsdU32le);
             info!(
                 dsd_max = max,
-                "native DSD capability enabled (ALSA DSD_U32_BE)"
+                "DSD capability enabled (probed output transport)"
             );
         }
         max

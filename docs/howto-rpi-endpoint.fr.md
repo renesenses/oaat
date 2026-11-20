@@ -645,3 +645,19 @@ Rien dans ce guide ne demande la moindre autorisation.
 ---
 
 *Guide rédigé par MozAIk Labs — dernière mise à jour : septembre 2026*
+
+### DSD sous Linux : formats natifs et DoP
+
+Activez `--dsd` ou `[capabilities] dsd = true` seulement pour un DAC dont la
+compatibilité DSD/DoP est connue. La sonde ALSA vérifie les formats et les
+cadences exactes, pas la capacité du DAC à reconnaître les marqueurs DoP.
+Le pont essaie DSD_U32_BE/LE, DSD_U16_BE/LE et DSD_U8 sur le périphérique
+`hw:`. Pour une cadence sans format natif accepté, il propose le DoP via
+S32_LE ou S24_LE : DSD64 exige 176,4 kHz, DSD128 352,8 kHz, DSD256 705,6 kHz.
+Un DAC occupé ou absent ne reçoit aucune capacité DSD supposée. Les formats
+sont sondés de nouveau à l'ouverture ; une cadence différente est refusée.
+Le journal indique le transport choisi. Le flux OAAT reste du DSD brut,
+converti en mots ALSA ou en DoP par le pont, sans volume logiciel.
+
+Les tests automatiques utilisent un périphérique factice. La lecture réelle
+sur le RME ADI-2 et les autres DAC reste à vérifier après publication.

@@ -696,3 +696,18 @@ Nothing in this guide requires permission from anyone.
 ---
 
 *Written by MozAIk Labs — last updated: September 2026*
+
+### Linux DSD: native formats and DoP
+
+Enable `--dsd` or `[capabilities] dsd = true` only for a DAC known to support
+DSD/DoP. ALSA probing checks exact formats and rates, not whether the DAC
+recognizes DoP markers. The bridge tries DSD_U32_BE/LE, DSD_U16_BE/LE and
+DSD_U8 on the raw `hw:` device. If no native format accepts a rate, it offers
+DoP through S32_LE or S24_LE: DSD64 needs 176.4 kHz, DSD128 352.8 kHz and
+DSD256 705.6 kHz. An absent or busy device never gets guessed DSD support.
+Formats are probed again at open; a different granted rate is rejected.
+The log names the chosen transport. OAAT still carries raw DSD; the bridge
+packs native ALSA words or DoP without software volume.
+
+Automated tests use a fake device. Real playback on the RME ADI-2 and other
+DACs remains to be checked after publication.
