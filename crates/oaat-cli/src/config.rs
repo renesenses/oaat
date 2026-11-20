@@ -23,8 +23,9 @@ use tracing::info;
 /// [dac]
 /// # hardware_volume = false
 /// # card = 0
-/// # Start once this many milliseconds are buffered. Absent: the DAC starts
-/// # only when the granted buffer is full (~2 s), which is the jitter reserve.
+/// # Linux/ALSA only (cpal ignores it). Milliseconds buffered before the
+/// # DAC starts. Absent: the DAC starts only when the granted buffer is
+/// # full (~2 s), which is the jitter reserve.
 /// # start_threshold_ms = 500
 ///
 /// [logging]
@@ -168,6 +169,7 @@ pub struct DacSection {
     ///          "minimum phase fast", "linear phase slow", "linear phase fast", "apodizing fast"
     pub fir_filter: Option<String>,
     /// Milliseconds of audio buffered before the DAC starts.
+    /// Linux/ALSA only: cpal endpoints ignore it.
     ///
     /// Absent: start once the granted ALSA buffer is full (~2 s). That buffer
     /// is the only jitter reserve — there is no PTS schedule and no drift

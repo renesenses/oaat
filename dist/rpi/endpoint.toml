@@ -13,8 +13,9 @@ flac = true
 [dac]
 # Use hardware volume control via ALSA mixer (recommended for I2S DACs)
 hardware_volume = true
-# Milliseconds buffered before the DAC starts. Leave unset to start only
-# once the granted buffer is full (~2 s): that is the jitter reserve.
+# Linux/ALSA only (a cpal endpoint ignores this). Milliseconds buffered
+# before the DAC starts. Leave unset to start only once the granted
+# buffer is full (~2 s): that is the jitter reserve.
 # start_threshold_ms = 500
 # ALSA card number
 card = 0

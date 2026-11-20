@@ -53,21 +53,32 @@ const ALSA_BUFFER_TIME_US: u32 = 2_000_000;
 /// cap allowed ~1.1s, #7). Finer periods claim the cap almost exactly.
 const ALSA_PERIOD_TIME_US: u32 = 125_000;
 
-/// Start threshold in frames. `None` is the whole granted buffer: with no
-/// PTS schedule and no drift servo, that buffer is the only jitter reserve,
-/// and a controller pacing in real time does not refill it past the level
-/// it had when the DAC started. A configured value is rounded up to whole
-/// periods and never exceeds the granted buffer.
+/// Start threshold in frames. Linux/ALSA only: cpal does not use it.
+///
+/// `None` is the whole granted buffer: with no PTS schedule and no drift
+/// servo, that buffer is the only jitter reserve, and a controller pacing
+/// in real time does not refill it past the level it had when the DAC
+/// started. A configured value is rounded up to whole periods and never
+/// exceeds the granted buffer.
 fn start_threshold_frames(start_us: Option<u64>, rate: u32, buffer: u64, period: u64) -> u64 {
     let Some(start_us) = start_us else {
         return buffer.max(1);
     };
-    let wanted = rate as u64 * start_us / 1_000_000;
+    let wanted = (rate as u64).saturating_mul(start_us) / 1_000_000;
     let period = period.max(1);
-    wanted
-        .div_ceil(period)
-        .saturating_mul(period)
-        .clamp(1, buffer.max(1))
+    let rounded = wanted.div_ceil(period).saturating_mul(period);
+    let cap = buffer.max(1);
+    let threshold = rounded.clamp(1, cap);
+    if rounded < 1 || rounded > cap {
+        warn!(
+            configured_us = start_us,
+            wanted_frames = rounded,
+            granted_frames = cap,
+            applied_frames = threshold,
+            "ALSA start threshold clamped"
+        );
+    }
+    threshold
 }
 
 /// Payloads queued between `write_audio()` and the writer thread. With
@@ -903,14 +914,14 @@ fn open_alsa_device(p: &DeviceParams) -> Result<Box<dyn PcmDevice>, String> {
             hwp.get_period_size().unwrap_or(0),
         )
     };
+    let threshold = start_threshold_frames(
+        p.start_threshold_us,
+        rate,
+        buffer as u64,
+        period as u64,
+    );
     {
         let swp = pcm.sw_params_current().map_err(|e| err("sw params", e))?;
-        let threshold = start_threshold_frames(
-            p.start_threshold_us,
-            rate,
-            buffer as u64,
-            period as u64,
-        );
         swp.set_start_threshold(threshold as alsa::pcm::Frames)
             .map_err(|e| err("start threshold", e))?;
         swp.set_avail_min(period.max(1))
@@ -1435,6 +1446,11 @@ mod tests {
         );
         // Degenerate values stay valid for ALSA.
         assert_eq!(start_threshold_frames(Some(0), 0, 0, 0), 1);
+        assert_eq!(
+            start_threshold_frames(Some(u64::MAX), u32::MAX, 1_000, 100),
+            1_000,
+            "rate × durée ne doit pas déborder avant le plafonnement"
+        );
     }
     use std::sync::Mutex;
     use std::thread::sleep;
