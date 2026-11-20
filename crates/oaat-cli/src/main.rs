@@ -591,7 +591,16 @@ async fn run_endpoint(
     });
 
     #[cfg(target_os = "linux")]
-    let mut audio = AlsaDirectOutput::new();
+    let mut audio = {
+        let mut audio = AlsaDirectOutput::new();
+        // Absent in endpoint.toml: start when the granted buffer is full.
+        let start_us = dac_config.start_threshold_ms.map(|ms| ms.saturating_mul(1000));
+        if let Some(ms) = dac_config.start_threshold_ms {
+            info!(start_threshold_ms = ms, "ALSA start threshold set from endpoint.toml");
+        }
+        audio.set_start_threshold_us(start_us);
+        audio
+    };
     #[cfg(not(target_os = "linux"))]
     let mut audio = CpalOutput::new();
     let mut packet_count: u64 = 0;

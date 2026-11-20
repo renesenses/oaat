@@ -53,6 +53,34 @@ const ALSA_BUFFER_TIME_US: u32 = 2_000_000;
 /// cap allowed ~1.1s, #7). Finer periods claim the cap almost exactly.
 const ALSA_PERIOD_TIME_US: u32 = 125_000;
 
+/// Start threshold in frames. Linux/ALSA only: cpal does not use it.
+///
+/// `None` is the whole granted buffer: with no PTS schedule and no drift
+/// servo, that buffer is the only jitter reserve, and a controller pacing
+/// in real time does not refill it past the level it had when the DAC
+/// started. A configured value is rounded up to whole periods and never
+/// exceeds the granted buffer.
+fn start_threshold_frames(start_us: Option<u64>, rate: u32, buffer: u64, period: u64) -> u64 {
+    let Some(start_us) = start_us else {
+        return buffer.max(1);
+    };
+    let wanted = (rate as u64).saturating_mul(start_us) / 1_000_000;
+    let period = period.max(1);
+    let rounded = wanted.div_ceil(period).saturating_mul(period);
+    let cap = buffer.max(1);
+    let threshold = rounded.clamp(1, cap);
+    if rounded < 1 || rounded > cap {
+        warn!(
+            configured_us = start_us,
+            wanted_frames = rounded,
+            granted_frames = cap,
+            applied_frames = threshold,
+            "ALSA start threshold clamped"
+        );
+    }
+    threshold
+}
+
 /// Payloads queued between `write_audio()` and the writer thread. With
 /// typical payloads of a few KiB this is about 1 MiB, the userspace slack
 /// the enlarged `aplay` pipe used to give (#7): bursts are absorbed with
@@ -90,6 +118,9 @@ pub(crate) struct DeviceParams {
     pub format: &'static str,
     pub rate: u32,
     pub channels: u8,
+    /// Audio to buffer before the DAC starts, in microseconds.
+    /// `None` starts only once the granted buffer is full.
+    pub start_threshold_us: Option<u64>,
 }
 
 impl DeviceParams {
@@ -159,6 +190,7 @@ pub struct AlsaDirectOutput {
     channels: u8,
     format: AudioFormat,
     device_name: Option<String>,
+    start_threshold_us: Option<u64>,
     idle_close: Duration,
     open_timeout: Duration,
     shutdown_timeout: Duration,
@@ -204,6 +236,13 @@ impl AlsaDirectOutput {
         Self::with_opener(Arc::new(open_alsa_device))
     }
 
+    /// Buffer this much audio before the DAC starts. `None` waits until the
+    /// granted buffer is full, which is the default: that buffer is the only
+    /// jitter reserve.
+    pub fn set_start_threshold_us(&mut self, start_us: Option<u64>) {
+        self.start_threshold_us = start_us;
+    }
+
     pub(crate) fn with_opener(opener: DeviceOpener) -> Self {
         Self {
             writer: None,
@@ -216,6 +255,7 @@ impl AlsaDirectOutput {
             channels: 0,
             format: AudioFormat::PcmS16le,
             device_name: None,
+            start_threshold_us: None,
             idle_close: IDLE_CLOSE,
             open_timeout: OPEN_TIMEOUT,
             shutdown_timeout: SHUTDOWN_TIMEOUT,
@@ -288,6 +328,7 @@ impl AlsaDirectOutput {
             format: alsa_fmt,
             rate: alsa_rate,
             channels,
+            start_threshold_us: self.start_threshold_us,
         };
         info!(
             device = %params.device,
@@ -873,9 +914,15 @@ fn open_alsa_device(p: &DeviceParams) -> Result<Box<dyn PcmDevice>, String> {
             hwp.get_period_size().unwrap_or(0),
         )
     };
+    let threshold = start_threshold_frames(
+        p.start_threshold_us,
+        rate,
+        buffer as u64,
+        period as u64,
+    );
     {
         let swp = pcm.sw_params_current().map_err(|e| err("sw params", e))?;
-        swp.set_start_threshold(buffer.max(1))
+        swp.set_start_threshold(threshold as alsa::pcm::Frames)
             .map_err(|e| err("start threshold", e))?;
         swp.set_avail_min(period.max(1))
             .map_err(|e| err("avail min", e))?;
@@ -900,6 +947,7 @@ fn open_alsa_device(p: &DeviceParams) -> Result<Box<dyn PcmDevice>, String> {
         buffer_frames = buffer,
         period_frames = period,
         buffer_ms = if rate > 0 { buffer as u64 * 1000 / rate as u64 } else { 0 },
+        start_ms = if rate > 0 { threshold * 1000 / rate as u64 } else { 0 },
         "ALSA device opened"
     );
     Ok(Box::new(AlsaPcm {
@@ -1378,6 +1426,32 @@ fn apply_volume(format: AudioFormat, data: &[u8], vol: f32) -> Vec<u8> {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    #[test]
+    fn start_threshold_defaults_to_the_whole_buffer() {
+        assert_eq!(start_threshold_frames(None, 44_100, 88_200, 5_513), 88_200);
+    }
+
+    #[test]
+    fn start_threshold_is_the_configured_time_in_whole_periods() {
+        // SMSL at 44.1 kHz, 0.5 s: 88200-frame buffer, 5513-frame periods.
+        assert_eq!(
+            start_threshold_frames(Some(500_000), 44_100, 88_200, 5_513),
+            5_513 * 4
+        );
+        // Never above the granted buffer (byte-capped driver, #7).
+        assert_eq!(
+            start_threshold_frames(Some(500_000), 192_000, 48_000, 24_000),
+            48_000
+        );
+        // Degenerate values stay valid for ALSA.
+        assert_eq!(start_threshold_frames(Some(0), 0, 0, 0), 1);
+        assert_eq!(
+            start_threshold_frames(Some(u64::MAX), u32::MAX, 1_000, 100),
+            1_000,
+            "rate × durée ne doit pas déborder avant le plafonnement"
+        );
+    }
     use std::sync::Mutex;
     use std::thread::sleep;
 
