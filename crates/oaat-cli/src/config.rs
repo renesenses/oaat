@@ -20,6 +20,13 @@ use tracing::info;
 /// # dsd = false
 /// # flac = false
 ///
+/// [dac]
+/// # hardware_volume = false
+/// # card = 0
+/// # Start once this many milliseconds are buffered. Absent: the DAC starts
+/// # only when the granted buffer is full (~2 s), which is the jitter reserve.
+/// # start_threshold_ms = 500
+///
 /// [logging]
 /// level = "info"
 ///
@@ -160,6 +167,14 @@ pub struct DacSection {
     /// Options: "brick wall", "corrected minimum phase fast", "minimum phase slow",
     ///          "minimum phase fast", "linear phase slow", "linear phase fast", "apodizing fast"
     pub fir_filter: Option<String>,
+    /// Milliseconds of audio buffered before the DAC starts.
+    ///
+    /// Absent: start once the granted ALSA buffer is full (~2 s). That buffer
+    /// is the only jitter reserve — there is no PTS schedule and no drift
+    /// servo, and a controller pacing in real time does not refill it. Set
+    /// this (for example `500`) only when the controller sends a lead of at
+    /// least (buffer − threshold).
+    pub start_threshold_ms: Option<u64>,
 }
 
 impl Default for LoggingSection {
@@ -262,6 +277,14 @@ level = "debug"
         assert!(cfg.capabilities.dsd);
         assert!(cfg.capabilities.flac);
         assert_eq!(cfg.logging.level, "debug");
+        assert!(cfg.dac.start_threshold_ms.is_none());
+    }
+
+    #[test]
+    fn start_threshold_is_optional() {
+        let cfg: EndpointFileConfig = toml::from_str("[dac]\nstart_threshold_ms = 500\n").unwrap();
+        assert_eq!(cfg.dac.start_threshold_ms, Some(500));
+        assert!(EndpointFileConfig::default().dac.start_threshold_ms.is_none());
     }
 
     #[test]
