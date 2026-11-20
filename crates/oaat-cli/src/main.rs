@@ -2047,7 +2047,7 @@ fn run_discover(timeout: u64) {
 
 /// Whether the controller has closed the current stream with `LAST_PACKET`,
 /// which decides what a `stop` means: play out the tail of the track, or
-/// flush it (RFC §6.4, "stop and flush buffer").
+/// flush it (RFC §7.3, "stop and flush buffer").
 ///
 /// Only the LAST packet counts, not any earlier one. In gapless the
 /// controller closes a track with `LAST_PACKET` and keeps streaming the

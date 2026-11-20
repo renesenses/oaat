@@ -348,20 +348,17 @@ impl AlsaDirectOutput {
         self.shared.pause_gen.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Intentional stop: play out what is queued (as closing the `aplay`
-    /// pipe did, so the end of a track is not cut), then release the device.
-    /// When this returns the ALSA device is closed. Nothing is reopened until
-    /// the next `configure()`.
     /// Stop once the queued audio has played, so the end of a track is not
     /// cut. For a stream the controller closed with `LAST_PACKET`, where
     /// the queue is the tail of the track. Any other stop is the user's:
-    /// see [`Self::stop_now`].
+    /// see [`Self::stop_now`]. When this returns the ALSA device is closed.
+    /// Nothing is reopened until the next `configure()`.
     pub fn stop(&mut self) {
         self.shutdown(false);
     }
 
     /// Stop now, dropping what is queued: "stop and flush buffer"
-    /// (RFC §6.4), and what the 500 ms of the TCP-drop rule need.
+    /// (RFC §7.3). The 500 ms bound is the TCP-drop rule (RFC §2.4).
     ///
     /// Playing the queue out costs the whole ALSA buffer — 2 s on a
     /// Raspberry Pi — between the user's click and silence.
@@ -1576,7 +1573,7 @@ mod tests {
         assert_eq!(out.underrun_count(), 0);
     }
 
-    /// `stop_now` is "stop and flush buffer" (RFC §6.4): the queue goes,
+    /// `stop_now` is "stop and flush buffer" (RFC §7.3): the queue goes,
     /// so the sound ends with the click instead of playing out the ~2 s
     /// the device holds. Its counterpart, `stop()`, is covered by
     /// `flac_is_decoded_in_process_and_stop_releases_the_device`.

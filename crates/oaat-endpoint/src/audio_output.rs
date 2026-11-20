@@ -522,9 +522,9 @@ impl CpalOutput {
         self.stop();
     }
 
-    /// Stop now, dropping what is queued (RFC §6.4). Same as `stop()`
-    /// here: cpal's ring is a few tens of milliseconds, so there is no
-    /// tail to play out either way.
+    /// Stop now, dropping what is queued (RFC §7.3). Same as `stop()`
+    /// here: cpal drops the stream, and its ring (`ring_buffer_frames`,
+    /// about one second) is not played out either way.
     pub fn stop_now(&mut self) {
         self.stop();
     }
