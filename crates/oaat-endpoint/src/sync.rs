@@ -25,6 +25,10 @@ pub struct SharedClock {
     /// (FEC receiver) and read by the application for stream_stats reports.
     packets_lost: AtomicU64,
     packets_recovered: AtomicU64,
+    arq_requested: AtomicU64,
+    arq_recovered: AtomicU64,
+    arq_timeout: AtomicU64,
+    jitter_buffer_ms: AtomicU64,
 }
 
 impl SharedClock {
@@ -36,6 +40,10 @@ impl SharedClock {
             bootstrapped: AtomicBool::new(false),
             packets_lost: AtomicU64::new(0),
             packets_recovered: AtomicU64::new(0),
+            arq_requested: AtomicU64::new(0),
+            arq_recovered: AtomicU64::new(0),
+            arq_timeout: AtomicU64::new(0),
+            jitter_buffer_ms: AtomicU64::new(0),
         }
     }
 
@@ -50,6 +58,23 @@ impl SharedClock {
         (
             self.packets_lost.load(Ordering::Acquire),
             self.packets_recovered.load(Ordering::Acquire),
+        )
+    }
+
+    pub fn set_arq_stats(&self, requested: u64, recovered: u64, timeout: u64, jitter_ms: u32) {
+        self.arq_requested.store(requested, Ordering::Release);
+        self.arq_recovered.store(recovered, Ordering::Release);
+        self.arq_timeout.store(timeout, Ordering::Release);
+        self.jitter_buffer_ms
+            .store(jitter_ms as u64, Ordering::Release);
+    }
+
+    pub fn arq_stats(&self) -> (u64, u64, u64, u32) {
+        (
+            self.arq_requested.load(Ordering::Acquire),
+            self.arq_recovered.load(Ordering::Acquire),
+            self.arq_timeout.load(Ordering::Acquire),
+            self.jitter_buffer_ms.load(Ordering::Acquire) as u32,
         )
     }
 
