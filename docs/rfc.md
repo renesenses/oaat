@@ -437,8 +437,8 @@ The ring-head correction matters: UDP audio can outrun the TCP `play`
 command, so the first packet observed *after* `play` is not necessarily the
 first packet of the stream. Anchoring on the buffer head makes all endpoints
 of a zone converge on the same absolute instant regardless of when each one
-armed. Measured on a LAN reference implementation: 38–880 µs start skew
-between two endpoints.
+armed. Start-skew figures will be published once they have been validated
+end to end on real hardware.
 
 Fallbacks: if the clock is not bootstrapped or the PTS is implausible
 (relative timestamps from a legacy controller), the Endpoint starts
@@ -921,8 +921,8 @@ Zone Manager with event system, dynamic join/leave during playback, per-device v
 
 ### Phase 5.5: Sync & Resilience (v0.3) ✅
 Endpoint-initiated clock sync with mandatory controller responder,
-PTS-scheduled playback start (measured 38–880 µs start skew between two
-LAN endpoints), content-position drift servo (fine skip/dup, jump resync,
+PTS-scheduled playback start (skew figures to be published after
+end-to-end hardware validation), content-position drift servo (fine skip/dup, jump resync,
 timeline rebase), deferred FormatAccept (device readiness), FEC fully
 specified on the wire and implemented end-to-end (reorder + single-loss
 recovery with exact length restoration), bit-perfect native-format output
