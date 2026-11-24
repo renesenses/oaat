@@ -12,9 +12,10 @@ Roon's proprietary RAAT. It provides:
 
 - **Bit-perfect audio** — PCM up to 768 kHz / 32-bit, native DSD up to DSD512,
   native-format output path (exact integer passthrough at unity volume)
-- **Multi-room sync** — PTS-scheduled playback start (measured 38–880 µs skew
-  between endpoints) held by a continuous drift servo; PTP-inspired,
-  endpoint-initiated clock sync
+- **Multi-room sync** — PTS-scheduled playback start held by a continuous
+  drift servo; PTP-inspired, endpoint-initiated clock sync. Sample-accurate
+  synchronisation is a design goal; figures will be published after
+  end-to-end hardware validation
 - **Loss resilience** — XOR FEC with in-order delivery and exact-length
   single-loss recovery (Wi-Fi)
 - **Format negotiation** — accept/counter/reject; the accept is sent when the
@@ -71,7 +72,7 @@ tune-bridge endpoint --name "Living Room DAC"
 # Terminal 2: stream a 440Hz sine wave
 tune-bridge controller --target 127.0.0.1:9740 --freq 440 --duration 5
 
-# Multi-room, PTS-scheduled (sub-millisecond start skew), with FEC
+# Multi-room, PTS-scheduled start, with FEC
 tune-bridge multiroom 192.168.1.10:9740 192.168.1.11:9740 --duration 10 --fec 8
 
 # Discover endpoints / test conformance
@@ -89,7 +90,7 @@ oaat-test 192.168.1.50:9740
 | Gapless playback (same format + reformat) | Done |
 | Multi-room zones, dynamic join/leave, per-device volume | Done |
 | Endpoint-initiated clock sync + controller responder | Done |
-| PTS-scheduled playback start (38–880 µs measured skew) | Done |
+| PTS-scheduled playback start | Done |
 | Drift servo (content position, jump resync, rebase) | Done |
 | FEC end-to-end (XOR parity, exact-length recovery) | Done |
 | Bit-perfect native-format output path | Done |
@@ -109,7 +110,7 @@ oaat-test 192.168.1.50:9740
 | Implementation license | Apache 2.0** | Proprietary | Varies | Apple | BSD |
 | Bit-perfect | Yes | Yes | Depends | No | Yes |
 | DSD native | Yes | Yes | DoP only | No | DoP |
-| Multi-room sync | < 1 ms (measured) | < 1 ms | None | Apple | Limited |
+| Multi-room sync | Yes (figures pending hardware validation) | < 1 ms | None | Apple | Limited |
 | Gapless | Yes | Yes | Unreliable | Yes | Yes |
 | Format negotiation | Auto | Auto | Manual | Fixed | Limited |
 | Open source | Yes | No | Yes | Reverse-eng | Yes |
